@@ -1,8 +1,4 @@
-"""
-investMITRA — NSE Bhavcopy Flow
-Runs via GitHub Actions (market_data.yml) AND Prefect Cloud.
-"""
-
+"""investMITRA — NSE Bhavcopy Flow (GitHub Actions + Prefect)"""
 from __future__ import annotations
 import logging
 import os
@@ -21,25 +17,33 @@ def ingest_nse_bhavcopy(target_date: date = None):
         date_str = os.getenv("TRADE_DATE", "")
         target_date = date.fromisoformat(date_str) if date_str else date.today()
 
+    if target_date.weekday() >= 5:
+        logger.info("Weekend — no NSE data for %s. Skipping.", target_date)
+        return
+
     logger.info("NSE Bhavcopy ingestion for %s", target_date)
     connector = NSEBhavCopyConnector()
     run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
-    df, result = connector.ingest(target_date)
+    try:
+        df, result = connector.ingest(target_date)
+    except Exception as e:
+        if "404" in str(e):
+            logger.info("404 — market holiday on %s. Skipping.", target_date)
+            return
+        raise
+
     if df.empty:
-        logger.warning("No data — market holiday or weekend")
+        logger.warning("No data returned")
         return
 
     path = write_to_lake(df=df, domain="market_data", table="equity_prices",
                          partition_date=target_date, source_id="nse_bhavcopy",
                          quality_score=result.quality_score, run_id=run_id)
-
     log_pipeline_run(source_id="nse_bhavcopy", run_date=target_date,
                      status="success" if result.quality_score >= 50 else "quarantined",
                      rows_ingested=len(df), quality_score=result.quality_score)
-
-    logger.info("NSE Bhavcopy done — rows=%d quality=%d path=%s",
-                len(df), result.quality_score, path)
+    logger.info("NSE Bhavcopy done — rows=%d quality=%d", len(df), result.quality_score)
 
 
 if __name__ == "__main__":

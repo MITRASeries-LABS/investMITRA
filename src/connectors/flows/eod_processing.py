@@ -7,6 +7,7 @@ from datetime import date, datetime
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+
 def eod_processing_daily():
     from src.connectors.nse_circuit_limits import NSECircuitLimitsConnector
     from src.transforms.lake_writer import write_to_lake
@@ -17,6 +18,10 @@ def eod_processing_daily():
     date_str = os.getenv("TRADE_DATE", "")
     target_date = date.fromisoformat(date_str) if date_str else date.today()
     run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+    if target_date.weekday() >= 5:
+        logger.info("Weekend — skipping EOD processing.")
+        return
 
     logger.info("EOD Processing for %s", target_date)
 
@@ -29,10 +34,14 @@ def eod_processing_daily():
                           partition_date=target_date, source_id="nse_circuit_limits",
                           quality_score=result.quality_score, run_id=run_id)
             log_pipeline_run(source_id="nse_circuit_limits", run_date=target_date,
-                             status="success", rows_ingested=len(df), quality_score=result.quality_score)
+                             status="success", rows_ingested=len(df),
+                             quality_score=result.quality_score)
         logger.info("Circuit limits done — rows=%d", len(df))
     except Exception as e:
-        logger.error("Circuit limits failed: %s", e)
+        if "404" in str(e):
+            logger.info("Circuit limits — market holiday. Skipping.")
+        else:
+            logger.error("Circuit limits failed: %s", e)
 
     # Step 2: Cross-validation
     try:
@@ -50,6 +59,7 @@ def eod_processing_daily():
         logger.error("CA adjustment failed: %s", e)
 
     logger.info("EOD Processing complete for %s", target_date)
+
 
 if __name__ == "__main__":
     eod_processing_daily()
