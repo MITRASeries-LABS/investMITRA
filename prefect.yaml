@@ -39,3 +39,13 @@ deployments:
     work_pool:
       name: cc-worker-pool
     parameters: {}
+
+    - name: nse-delivery-daily
+    description: "Daily NSE delivery % and VWAP ingestion"
+    entrypoint: src/connectors/flows/ingest_nse_delivery.py:ingest_nse_delivery
+    schedule:
+      cron: "45 14 * * 1-5"
+      timezone: "UTC"
+    work_pool:
+      name: cc-worker-pool
+    parameters: {}
