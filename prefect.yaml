@@ -48,4 +48,14 @@ deployments:
       timezone: "UTC"
     work_pool:
       name: cc-worker-pool
-    parameters: {}  
+    parameters: {}
+
+  - name: nse-fo-bhavcopy-daily
+    description: "Daily NSE F&O OHLCV + open interest ingestion"
+    entrypoint: src/connectors/flows/ingest_nse_fo_bhavcopy.py:ingest_nse_fo_bhavcopy
+    schedule:
+      cron: "15 15 * * 1-5"
+      timezone: "UTC"
+    work_pool:
+      name: cc-worker-pool
+    parameters: {}
