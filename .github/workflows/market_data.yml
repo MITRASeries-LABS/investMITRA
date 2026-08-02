@@ -1,0 +1,188 @@
+name: Market Data — NSE + BSE Daily Pipeline
+
+on:
+  schedule:
+    # NSE Bhavcopy: 8:00 PM IST = 14:30 UTC Mon-Fri
+    - cron: "30 14 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Trade date (YYYY-MM-DD, default today)"
+        required: false
+        default: ""
+      step:
+        description: "Which step to run"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - bhavcopy
+          - delivery
+          - bse_eod
+          - fo_bhavcopy
+          - eod_processing
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Step 1 — NSE Bhavcopy (8:00 PM IST)
+  # ─────────────────────────────────────────────
+  nse-bhavcopy:
+    name: NSE Bhavcopy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'bhavcopy'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-flow.txt
+
+      - name: Run NSE Bhavcopy
+        env:
+          CC_ENV: prod
+          CC_DB_SCHEMA: investmitra
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          CC_TIMESCALE_URL: ${{ secrets.CC_TIMESCALE_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          CC_BUCKET_RAW: cc-raw
+          CC_BUCKET_QUARANTINE: cc-quarantine
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          TRADE_DATE: ${{ github.event.inputs.date }}
+        run: python -m src.connectors.flows.ingest_nse_bhavcopy
+
+  # ─────────────────────────────────────────────
+  # Step 2 — NSE Delivery % (8:15 PM IST)
+  # ─────────────────────────────────────────────
+  nse-delivery:
+    name: NSE Delivery %
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: nse-bhavcopy
+    if: always() && (github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'delivery')
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-flow.txt
+      - name: Run NSE Delivery
+        env:
+          CC_ENV: prod
+          CC_DB_SCHEMA: investmitra
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          CC_BUCKET_RAW: cc-raw
+          CC_BUCKET_QUARANTINE: cc-quarantine
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python -m src.connectors.flows.ingest_nse_delivery
+
+  # ─────────────────────────────────────────────
+  # Step 3 — BSE EOD (8:30 PM IST)
+  # ─────────────────────────────────────────────
+  bse-eod:
+    name: BSE EOD
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: nse-bhavcopy
+    if: always() && (github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'bse_eod')
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-flow.txt
+      - name: Run BSE EOD
+        env:
+          CC_ENV: prod
+          CC_DB_SCHEMA: investmitra
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          CC_BUCKET_RAW: cc-raw
+          CC_BUCKET_QUARANTINE: cc-quarantine
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python -m src.connectors.flows.ingest_bse_eod
+
+  # ─────────────────────────────────────────────
+  # Step 4 — NSE F&O (8:45 PM IST)
+  # ─────────────────────────────────────────────
+  nse-fo:
+    name: NSE F&O Bhavcopy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: nse-bhavcopy
+    if: always() && (github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'fo_bhavcopy')
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-flow.txt
+      - name: Run NSE F&O
+        env:
+          CC_ENV: prod
+          CC_DB_SCHEMA: investmitra
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          CC_BUCKET_RAW: cc-raw
+          CC_BUCKET_QUARANTINE: cc-quarantine
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python -m src.connectors.flows.ingest_nse_fo_bhavcopy
+
+  # ─────────────────────────────────────────────
+  # Step 5 — EOD Processing (9:00 PM IST)
+  # Circuit limits + Cross-validation + CA adjustment
+  # Runs after all price ingestion completes
+  # ─────────────────────────────────────────────
+  eod-processing:
+    name: EOD Processing
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [nse-delivery, bse-eod, nse-fo]
+    if: always() && (github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'eod_processing')
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-flow.txt duckdb
+      - name: Run EOD Processing
+        env:
+          CC_ENV: prod
+          CC_DB_SCHEMA: investmitra
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          CC_TIMESCALE_URL: ${{ secrets.CC_TIMESCALE_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          CC_BUCKET_RAW: cc-raw
+          CC_BUCKET_QUARANTINE: cc-quarantine
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python -m src.connectors.flows.eod_processing
