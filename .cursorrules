@@ -1,0 +1,147 @@
+# investMITRA — Cursor Rules
+# Phase 1: Data Lake Infrastructure
+
+## Project Overview
+This is the data pipeline for investMITRA, an AI investment intelligence platform
+covering 5,000+ NSE/BSE stocks with 10+ years of history. Built entirely on free
+infrastructure: Neon (Postgres), Cloudflare R2 (object store), Prefect Cloud (orchestration).
+
+## Architecture — 5 Layers
+L1 Source Connectors → L2 Ingestion & Validation → L3 Raw Data Lake → L4 Transformation → L5 Feature Store
+
+All code lives in src/:
+  src/config/        → storage.py (R2/MinIO), database.py (Neon/local Postgres)
+  src/connectors/    → one file per data source, all extend BaseConnector
+  src/connectors/flows/ → one Prefect flow per connector
+  src/transforms/    → lake_writer.py routes raw/quarantine, corporate action adjustments
+  src/quality/       → db_logger.py writes to pipeline_run_log
+
+## THE THREE NON-NEGOTIABLES
+# Cursor must never suggest code that violates these:
+
+1. NEVER use period_end for point-in-time features. Always use filing_date.
+   BAD:  WHERE period_end <= prediction_date
+   GOOD: WHERE filing_date <= prediction_date
+
+2. NEVER overwrite raw lake data. The raw lake is immutable.
+   BAD:  pq.write_table(df, existing_path)   # overwrites
+   GOOD: Always generate a new timestamped path via lake_writer.write_to_lake()
+
+3. ALWAYS cross-validate NSE and BSE. Never trust a single source.
+   Both sources are ingested independently. Discrepancies → quarantine flag.
+
+## BaseConnector Pattern
+Every data source connector MUST extend BaseConnector (src/connectors/base.py).
+Required class attributes:
+  source_id         str   e.g. "nse_bhavcopy"
+  domain            str   e.g. "market_data"
+  refresh_frequency str   "realtime" | "daily" | "weekly" | "quarterly" | "event"
+  required_columns  list  columns that must be present and non-null
+  expected_columns  list  full list for schema drift detection
+
+Required methods:
+  fetch(target_date: date) -> pd.DataFrame
+  backfill(start: date, end: date) -> Iterator[pd.DataFrame]
+
+Always call self._polite_sleep(1.2) between requests in backfill().
+Always raise SourceUnavailableError on failure — never return None or empty silently.
+Always tag rows via self._tag_metadata() — adds source_id and ingested_at.
+
+## Prefect Flow Pattern
+Every connector has a matching flow in src/connectors/flows/ingest_{source_id}.py
+Flow name convention: ingest_{domain}_{source_id}_{frequency}
+Example: ingest_market_data_nse_bhavcopy_daily
+
+Three tasks per flow:
+  fetch_task   → calls connector.ingest()
+  write_task   → calls lake_writer.write_to_lake()
+  log_task     → calls db_logger.log_pipeline_run()
+
+## Database Schema
+All tables live in the investmitra schema on Neon.
+Universal join key: isin (VARCHAR 12) — never use nse_symbol or bse_code as join key.
+Connection via: src/config/database.py — get_pg_conn() context manager.
+
+Core tables:
+  company_master        → isin PK, aliases[], is_active (never delete delisted)
+  source_registry       → source_id PK, auto-disabled when avg_quality_score_30d < 60
+  equity_prices         → (isin, trade_date, source) PK, partitioned by year
+  company_financials    → filing_date is the PIT key
+  ownership_data        → filing_date is the PIT key
+  corporate_actions     → adj_factor applied backward from ex_date
+  news_events           → entities_isin[] linked by NER pipeline
+  macroeconomic_indicators → data_vintage tracks revisions
+  pipeline_run_log      → audit trail for every run
+
+## Object Storage
+src/config/storage.py handles MinIO (local) ↔ Cloudflare R2 (prod) switching.
+Always use write_to_lake() from src/transforms/lake_writer.py — never write to S3 directly.
+
+Partition path: {bucket}/{env}/{domain}/{table}/year={Y}/month={M}/day={D}/{source}_{ts}.parquet
+quality_score >= 50 → cc-raw bucket
+quality_score <  50 → cc-quarantine bucket
+
+## Data Quality Scoring (0-100)
+Deductions applied in BaseConnector.validate_schema():
+  -20 pts  missing required column
+  -20 pts  >5% nulls in required column
+  -20 pts  row count < 10 (suspiciously low)
+  -15 pts  schema drift (expected column missing)
+  -10 pts  >1% duplicate rows on primary key
+
+quality_score < 50  → quarantine (never enters pipeline)
+quality_score < 70  → flag for investigation
+30d avg < 60        → source auto-disabled + Slack alert
+
+## NSE/BSE Specific
+NSE Bhavcopy URL:
+  https://nsearchives.nseindia.com/content/historical/EQUITIES/{YYYY}/{MMM}/cm{DD}{MMM}{YYYY}bhav.csv.zip
+
+BSE EOD URL:
+  https://www.bseindia.com/download/BhavCopy/Equity/EQ{DDMMYYYY}_CSV.ZIP
+
+Both require headers:
+  User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
+  Referer: https://www.nseindia.com
+
+NSE turnover is in LAKHS — divide by 100 to get crores.
+BSE uses numeric code (6 digits), not symbol — always map to ISIN via company_master.
+NSE delivery data format changed in 2019 — always build format-detection wrappers.
+
+## Corporate Action Adjustments
+adj_close = close * product_of_all_future_adj_factors
+Adjustments cascade BACKWARD from most recent event.
+Adjustment factors:
+  SPLIT:    old_face_value / new_face_value
+  BONUS:    (existing + new) / existing
+  DIVIDEND: (price_on_ex_date - dividend) / price_on_ex_date
+  RIGHTS:   theoretical_ex_rights_price / market_price
+  MERGER/DEMERGER: requires_manual_review = TRUE — no standard formula
+
+Any adj_close gap > 50% between consecutive days → investigate.
+
+## Coding Conventions
+- Timezone: all timestamps stored UTC, display IST at UI layer only
+- Date format: ISO 8601 YYYY-MM-DD everywhere
+- Column naming: snake_case. Abbreviations: cr (crore), pct (percent), qty (quantity)
+- Parquet compression: snappy (default), zstd for files > 1 year old
+- Imports: absolute only, no wildcards
+- Secrets: environment variables only — never hardcode
+- Formatting: black + ruff
+- Testing: pytest — every connector needs tests for schema validation and backfill
+
+## Free Infrastructure Stack
+Local dev:   Docker Compose (postgres:15, timescaledb, minio, redis)
+Prod DB:     Neon free tier — investmitra schema — Singapore region
+Prod store:  Cloudflare R2 — cc-raw and cc-quarantine buckets
+Orchestrate: Prefect Cloud free tier — cc-worker-pool
+Worker:      Render.com free dyno or local machine
+
+## What NOT to do
+- Do not use TimescaleDB-specific SQL in production queries (Neon is plain Postgres)
+- Do not pip install at container runtime (use Dockerfile.worker)
+- Do not use period_end as a feature join key (look-ahead bias)
+- Do not overwrite files in the raw lake
+- Do not hardcode ISINs, symbols, or dates
+- Do not silently swallow schema drift — always log + alert
+- Do not use a single source — always cross-validate NSE and BSE

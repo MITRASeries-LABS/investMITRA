@@ -1,0 +1,148 @@
+version: "3.9"
+
+# =============================================================================
+# ClearedCircle — Local Dev Stack (₹0/month)
+#
+# 4 services only. Everything else runs free on cloud:
+#   Orchestration  → Prefect Cloud (free tier, no server needed)
+#   Database       → Supabase free (Postgres 15, 500MB)
+#   Object store   → Cloudflare R2 (10GB free, S3-compatible, zero egress)
+#   Worker         → Render.com free dyno OR your laptop
+#
+# Local services:
+#   postgres   → mirrors Supabase schema for offline dev
+#   timescale  → equity_prices hypertable (local only; prod uses partitioned Postgres)
+#   minio      → mirrors Cloudflare R2 for offline dev
+#   redis      → feature store + job caching
+# =============================================================================
+
+networks:
+  cc-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  timescale_data:
+  minio_data:
+  redis_data:
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # POSTGRES — Local mirror of Supabase schema
+  # In prod: point CC_POSTGRES_URL at your Supabase connection string
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: cc-postgres
+    environment:
+      POSTGRES_USER: cc
+      POSTGRES_PASSWORD: cc
+      POSTGRES_DB: clearedcircle
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/sql/init_postgres.sql:/docker-entrypoint-initdb.d/01_init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - cc-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cc -d clearedcircle"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # TIMESCALEDB — equity_prices hypertable (local dev only)
+  # Prod: Supabase free tier does NOT have TimescaleDB. We use a plain
+  # Postgres table with declarative partitioning (by year) instead.
+  # Schema is compatible — same columns, same queries.
+  # ---------------------------------------------------------------------------
+  timescale:
+    image: timescale/timescaledb:latest-pg15
+    container_name: cc-timescale
+    environment:
+      POSTGRES_USER: cc
+      POSTGRES_PASSWORD: cc
+      POSTGRES_DB: clearedcircle
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      - ./infra/sql/init_timescale.sql:/docker-entrypoint-initdb.d/01_init.sql
+    ports:
+      - "5433:5432"
+    networks:
+      - cc-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cc -d clearedcircle"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # MINIO — S3-compatible local object store
+  # In prod: swap endpoint to Cloudflare R2 — zero code changes.
+  # R2 free tier: 10GB storage, 10M reads/month, 1M writes/month.
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: cc-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:-minioadmin}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-minioadmin}"
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"    # S3 API  →  maps to R2 endpoint in prod
+      - "9001:9001"    # MinIO Console UI (local only)
+    networks:
+      - cc-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # MINIO INIT — one-shot bucket creation
+  # ---------------------------------------------------------------------------
+  minio-init:
+    image: minio/mc:latest
+    container_name: cc-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - cc-net
+    entrypoint: >
+      sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/cc-raw &&
+        mc mb --ignore-existing local/cc-quarantine &&
+        echo 'Buckets ready: cc-raw, cc-quarantine'
+      "
+
+  # ---------------------------------------------------------------------------
+  # REDIS — Feature store online cache + Prefect result caching
+  # Free: Redis Cloud free tier (30MB) is enough for Phase 1 online features.
+  # Or just run this container on your laptop and skip Redis Cloud entirely.
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: cc-redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - cc-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

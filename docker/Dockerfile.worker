@@ -1,0 +1,31 @@
+# =============================================================================
+# ClearedCircle — Prefect Worker Image
+# Build once, run everywhere (local Docker, Render.com, E2E VM).
+#
+# Build: docker build -f docker/Dockerfile.worker -t cc-worker .
+# Push to Docker Hub (free) then reference in Render.com deploy.
+# =============================================================================
+
+FROM prefecthq/prefect:2-latest
+
+WORKDIR /app
+
+# System deps for pdfplumber, lxml, spacy
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ libpq-dev libxml2-dev libxslt1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python deps (installed at build time — NOT at container start)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Download spaCy model at build time
+RUN python -m spacy download en_core_web_sm
+
+# Copy application source
+COPY src/ ./src/
+COPY config/ ./config/
+
+# Prefect worker entrypoint
+# Pool name matches what's configured in Prefect Cloud free tier
+CMD ["prefect", "worker", "start", "--pool", "cc-worker-pool"]

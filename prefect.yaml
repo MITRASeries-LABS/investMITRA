@@ -1,0 +1,27 @@
+# investMITRA — Prefect Deployment Configuration
+# Managed pool pulls code from GitHub on every run
+
+name: investmitra
+prefect-version: 3.8.1
+
+build: null
+
+push: null
+
+pull:
+  - prefect.deployments.steps.git_clone:
+      repository: https://github.com/MITRASeries-LABS/investMITRA.git
+      branch: main
+
+deployments:
+  - name: nse-bhavcopy-daily
+    version: null
+    tags: [market_data, daily]
+    description: "Daily NSE Bhavcopy EOD equity price ingestion"
+    entrypoint: src/connectors/flows/ingest_nse_bhavcopy.py:ingest_nse_bhavcopy
+    schedule:
+      cron: "30 14 * * 1-5"
+      timezone: "UTC"
+    work_pool:
+      name: cc-worker-pool
+    parameters: {}

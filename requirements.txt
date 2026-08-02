@@ -1,0 +1,47 @@
+# ClearedCircle Phase 1 — Python Dependencies
+
+# Orchestration (Prefect Cloud free tier)
+prefect>=2.16,<3.0
+
+# Storage
+pyarrow>=14.0
+boto3>=1.34          # MinIO (local) + Cloudflare R2 (prod) — same client
+minio>=7.2
+
+# Databases
+psycopg2-binary>=2.9
+sqlalchemy>=2.0
+redis>=5.0
+
+# Processing
+duckdb>=0.10
+pandas>=2.0
+numpy>=1.26
+
+# Ingestion
+requests>=2.31
+httpx>=0.27
+scrapy>=2.11
+feedparser>=6.0
+praw>=7.7
+pytrends>=4.9
+yfinance>=0.2
+pdfplumber>=0.11
+arelle-release>=2.0
+openpyxl>=3.1
+lxml>=5.0
+
+# NLP
+transformers>=4.40
+torch>=2.2
+spacy>=3.7
+
+# Quality
+great-expectations>=0.18
+pandera>=0.18
+
+# Dev
+pytest>=8.0
+black>=24.0
+ruff>=0.4
+python-dotenv>=1.0
