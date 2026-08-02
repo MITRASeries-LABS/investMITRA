@@ -12,6 +12,9 @@ pull:
   - prefect.deployments.steps.git_clone:
       repository: https://github.com/MITRASeries-LABS/investMITRA.git
       branch: main
+  - prefect.deployments.steps.pip_install_requirements:
+      requirements_file: requirements.txt
+      stream_output: false
 
 deployments:
   - name: nse-bhavcopy-daily
