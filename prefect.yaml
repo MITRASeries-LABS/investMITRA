@@ -13,8 +13,8 @@ pull:
       repository: https://github.com/MITRASeries-LABS/investMITRA.git
       branch: main
   - prefect.deployments.steps.pip_install_requirements:
-      requirements_file: requirements.txt
-      stream_output: false
+      requirements_file: requirements-flow.txt
+      stream_output: true
 
 deployments:
   - name: nse-bhavcopy-daily
