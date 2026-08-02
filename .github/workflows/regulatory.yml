@@ -1,0 +1,67 @@
+name: Regulatory — SEBI Circulars + RBI Policy + PIB
+
+on:
+  schedule:
+    # Run every 4 hours — regulatory events are unpredictable
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+
+jobs:
+  ingest-regulatory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-flow.txt pdfplumber feedparser
+
+      - name: Run SEBI Circulars ingestion
+        env:
+          CC_ENV: prod
+          CC_DB_SCHEMA: investmitra
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          CC_BUCKET_RAW: cc-raw
+          CC_BUCKET_QUARANTINE: cc-quarantine
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python -m src.connectors.flows.ingest_sebi_circulars
+
+      - name: Run RBI Policy ingestion
+        env:
+          CC_ENV: prod
+          CC_DB_SCHEMA: investmitra
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          CC_BUCKET_RAW: cc-raw
+          CC_BUCKET_QUARANTINE: cc-quarantine
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python -m src.connectors.flows.ingest_rbi_policy
+
+      - name: Run PIB Press Releases ingestion
+        env:
+          CC_ENV: prod
+          CC_DB_SCHEMA: investmitra
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          CC_BUCKET_RAW: cc-raw
+          CC_BUCKET_QUARANTINE: cc-quarantine
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python -m src.connectors.flows.ingest_pib_press

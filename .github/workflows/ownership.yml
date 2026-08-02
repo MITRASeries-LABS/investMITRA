@@ -1,0 +1,69 @@
+name: Ownership — BSE Shareholding + SEBI Insider + Block Deals
+
+on:
+  schedule:
+    # Run daily at 10:30 PM IST (17:00 UTC)
+    # Shareholding patterns filed within 21 days of quarter end
+    - cron: "0 17 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  ingest-ownership:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-flow.txt
+
+      - name: Run BSE Shareholding ingestion
+        env:
+          CC_ENV: prod
+          CC_DB_SCHEMA: investmitra
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          CC_TIMESCALE_URL: ${{ secrets.CC_TIMESCALE_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          CC_BUCKET_RAW: cc-raw
+          CC_BUCKET_QUARANTINE: cc-quarantine
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python -m src.connectors.flows.ingest_bse_shareholding
+
+      - name: Run SEBI Insider Trading ingestion
+        env:
+          CC_ENV: prod
+          CC_DB_SCHEMA: investmitra
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          CC_BUCKET_RAW: cc-raw
+          CC_BUCKET_QUARANTINE: cc-quarantine
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python -m src.connectors.flows.ingest_sebi_insider
+
+      - name: Run SEBI Block/Bulk Deals ingestion
+        env:
+          CC_ENV: prod
+          CC_DB_SCHEMA: investmitra
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          CC_BUCKET_RAW: cc-raw
+          CC_BUCKET_QUARANTINE: cc-quarantine
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python -m src.connectors.flows.ingest_sebi_block_deals

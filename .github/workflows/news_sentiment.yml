@@ -1,0 +1,130 @@
+name: News and Sentiment — RSS + Reddit + Google Trends + FinBERT
+
+on:
+  schedule:
+    # RSS feeds: every 30 min during market hours (9 AM - 6 PM IST)
+    - cron: "*/30 3-12 * * 1-5"
+    # Reddit + Google Trends: once daily at 8 AM IST
+    - cron: "30 2 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      run_finbert:
+        description: "Run FinBERT sentiment scoring"
+        required: false
+        default: "true"
+        type: boolean
+
+jobs:
+  ingest-rss:
+    name: RSS Feeds (ET, Mint, BS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-flow.txt feedparser
+
+      - name: Run RSS ingestion
+        env:
+          CC_ENV: prod
+          CC_DB_SCHEMA: investmitra
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          CC_BUCKET_RAW: cc-raw
+          CC_BUCKET_QUARANTINE: cc-quarantine
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python -m src.connectors.flows.ingest_rss_feeds
+
+  ingest-social:
+    name: Reddit + Google Trends
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-flow.txt praw pytrends
+
+      - name: Run Reddit ingestion
+        env:
+          CC_ENV: prod
+          CC_DB_SCHEMA: investmitra
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          CC_BUCKET_RAW: cc-raw
+          CC_BUCKET_QUARANTINE: cc-quarantine
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          REDDIT_USER_AGENT: investMITRA/1.0
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python -m src.connectors.flows.ingest_reddit
+
+      - name: Run Google Trends ingestion
+        env:
+          CC_ENV: prod
+          CC_DB_SCHEMA: investmitra
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          CC_BUCKET_RAW: cc-raw
+          CC_BUCKET_QUARANTINE: cc-quarantine
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python -m src.connectors.flows.ingest_google_trends
+
+  sentiment-scoring:
+    name: FinBERT Sentiment Scoring
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: [ingest-rss]  # run after RSS is ingested
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-flow.txt transformers torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Run FinBERT sentiment scoring
+        env:
+          CC_ENV: prod
+          CC_DB_SCHEMA: investmitra
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          CC_BUCKET_RAW: cc-raw
+          CC_BUCKET_QUARANTINE: cc-quarantine
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python -m src.transforms.sentiment_scoring
