@@ -12,8 +12,9 @@ pull:
   - prefect.deployments.steps.git_clone:
       repository: https://github.com/MITRASeries-LABS/investMITRA.git
       branch: main
+      id: clone-step
   - prefect.deployments.steps.pip_install_requirements:
-      requirements_file: requirements-flow.txt
+      requirements_file: "{{ clone-step.directory }}/requirements-flow.txt"
       stream_output: true
 
 deployments:
