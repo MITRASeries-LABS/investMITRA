@@ -1,0 +1,27 @@
+# Secrets
+.env
+.env.prod
+.env.local
+
+# Setup scripts with credentials
+scripts/setup_*.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Data files
+*.parquet
+*.csv.zip
+*.zip
+
+# Editor
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
