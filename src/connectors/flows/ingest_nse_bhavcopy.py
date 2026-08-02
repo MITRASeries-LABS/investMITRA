@@ -1,4 +1,4 @@
-﻿"""
+"""
 investMITRA — Prefect Flow: NSE Bhavcopy Daily Ingestion
 """
 from __future__ import annotations
