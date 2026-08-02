@@ -60,31 +60,11 @@ deployments:
       name: cc-worker-pool
     parameters: {}
   
-  - name: nse-circuit-limits-daily
-    description: "Daily NSE circuit limits ingestion"
-    entrypoint: src/connectors/flows/ingest_nse_circuit_limits.py:ingest_nse_circuit_limits
-    schedule:
-      cron: "30 14 * * 1-5"
-      timezone: "UTC"
-    work_pool:
-      name: cc-worker-pool
-    parameters: {}
-
-  - name: cross-validate-daily
-    description: "Daily NSE vs BSE price cross-validation"
-    entrypoint: src/connectors/flows/cross_validate_nse_bse.py:cross_validate_nse_bse
+  - name: eod-processing-daily
+    description: "EOD: circuit limits + NSE vs BSE cross-validation + CA adjustment"
+    entrypoint: src/connectors/flows/eod_processing.py:eod_processing_daily
     schedule:
       cron: "30 15 * * 1-5"
-      timezone: "UTC"
-    work_pool:
-      name: cc-worker-pool
-    parameters: {}
-
-  - name: ca-adjustment-daily
-    description: "Daily corporate action price adjustment"
-    entrypoint: src/connectors/flows/ca_adjustment.py:ca_adjustment_daily
-    schedule:
-      cron: "0 16 * * 1-5"
       timezone: "UTC"
     work_pool:
       name: cc-worker-pool
