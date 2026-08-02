@@ -1,0 +1,83 @@
+name: Company Master — Weekly Update
+
+on:
+  schedule:
+    # Every Sunday at 6 AM IST (00:30 UTC)
+    - cron: "30 0 * * 0"
+  workflow_dispatch:
+
+jobs:
+  update-company-master:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install pandas requests psycopg2-binary python-dotenv openpyxl lxml beautifulsoup4
+
+      - name: Update company master
+        env:
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+        run: |
+          python -c "
+          import os, io, time, psycopg2, requests, pandas as pd
+
+          NEON_URL = os.getenv('CC_POSTGRES_URL')
+          NSE_URL  = 'https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv'
+          HEADERS  = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.nseindia.com'}
+
+          print('Fetching NSE equity list...')
+          session = requests.Session()
+          session.headers.update(HEADERS)
+          session.get('https://www.nseindia.com', timeout=15)
+          time.sleep(1)
+          resp = session.get(NSE_URL, timeout=30)
+          df = pd.read_csv(io.StringIO(resp.text), dtype=str)
+          df.columns = df.columns.str.strip()
+
+          col_map = {}
+          for col in df.columns:
+              c = col.lower().strip()
+              if 'isin' in c: col_map[col] = 'isin'
+              elif 'symbol' in c: col_map[col] = 'nse_symbol'
+              elif 'name' in c or 'company' in c: col_map[col] = 'company_name'
+              elif 'series' in c: col_map[col] = 'series'
+          df = df.rename(columns=col_map)
+          if 'series' in df.columns:
+              df = df[df['series'].str.strip() == 'EQ']
+
+          print(f'NSE list: {len(df)} stocks')
+
+          conn = psycopg2.connect(NEON_URL, connect_timeout=15)
+          conn.autocommit = False
+          cur = conn.cursor()
+          inserted = updated = 0
+
+          for _, row in df.iterrows():
+              isin = str(row.get('isin', '')).strip()
+              if not isin or len(isin) != 12: continue
+              cur.execute(
+                  '''INSERT INTO investmitra.company_master
+                     (isin, nse_symbol, company_name, is_active)
+                     VALUES (%s, %s, %s, TRUE)
+                     ON CONFLICT (isin) DO UPDATE SET
+                     nse_symbol = COALESCE(EXCLUDED.nse_symbol, company_master.nse_symbol),
+                     is_active = TRUE, updated_at = NOW()''',
+                  (isin, str(row.get('nse_symbol','')).strip() or None,
+                   str(row.get('company_name','')).strip())
+              )
+              if cur.rowcount == 1: inserted += 1
+              else: updated += 1
+
+          conn.commit()
+          cur.close()
+          conn.close()
+          print(f'Done: inserted={inserted} updated={updated}')
+          "
