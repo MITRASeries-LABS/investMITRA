@@ -29,3 +29,13 @@ deployments:
     work_pool:
       name: cc-worker-pool
     parameters: {}
+
+  - name: bse-eod-daily
+    description: "Daily BSE EOD equity price ingestion"
+    entrypoint: src/connectors/flows/ingest_bse_eod.py:ingest_bse_eod
+    schedule:
+      cron: "0 15 * * 1-5"
+      timezone: "UTC"
+    work_pool:
+      name: cc-worker-pool
+    parameters: {}
