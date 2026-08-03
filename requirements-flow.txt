@@ -7,3 +7,5 @@ python-dotenv>=1.0
 feedparser>=6.0
 beautifulsoup4>=4.12
 lxml>=5.0
+praw>=7.7
+pytrends>=4.9
