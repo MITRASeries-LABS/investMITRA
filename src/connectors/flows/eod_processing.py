@@ -2,7 +2,7 @@
 from __future__ import annotations
 import logging
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -16,7 +16,7 @@ def eod_processing_daily():
     from src.quality.db_logger import log_pipeline_run
 
     date_str = os.getenv("TRADE_DATE", "")
-    target_date = date.fromisoformat(date_str) if date_str else date.today()
+    target_date = date.fromisoformat(date_str) if date_str else datetime.now(IST).date()
     run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
     if target_date.weekday() >= 5:

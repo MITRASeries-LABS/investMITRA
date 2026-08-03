@@ -2,7 +2,7 @@
 from __future__ import annotations
 import logging
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -15,7 +15,7 @@ def ingest_nse_bhavcopy(target_date: date = None):
 
     if target_date is None:
         date_str = os.getenv("TRADE_DATE", "")
-        target_date = date.fromisoformat(date_str) if date_str else date.today()
+        target_date = date.fromisoformat(date_str) if date_str else datetime.now(IST).date()
 
     if target_date.weekday() >= 5:
         logger.info("Weekend — no NSE data for %s. Skipping.", target_date)
