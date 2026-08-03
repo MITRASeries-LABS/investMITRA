@@ -6,7 +6,7 @@ Runs via GitHub Actions (ownership.yml)
 from __future__ import annotations
 import logging
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -21,7 +21,7 @@ def ingest_bse_shareholding():
     logger.info("BSE Shareholding ingestion started")
     connector = BSEShareholdingConnector()
     run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    target_date = date.today()
+    target_date = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
 
     df, result = connector.ingest(target_date)
     if df.empty:
@@ -72,7 +72,7 @@ def ingest_sebi_insider():
     logger.info("SEBI Insider Trading ingestion started")
     connector = SEBIInsiderConnector()
     run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    target_date = date.today()
+    target_date = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
 
     df, result = connector.ingest(target_date)
     if df.empty:
@@ -97,7 +97,7 @@ def ingest_sebi_block_deals():
     logger.info("SEBI Block/Bulk Deals ingestion started")
     connector = SEBIBlockDealsConnector()
     run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    target_date = date.today()
+    target_date = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
 
     df, result = connector.ingest(target_date)
     if df.empty:

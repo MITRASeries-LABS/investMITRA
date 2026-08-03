@@ -6,7 +6,7 @@ Runs via GitHub Actions (macroeconomic.yml)
 from __future__ import annotations
 import logging
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ def ingest_rbi_dbie():
     logger.info("RBI DBIE ingestion started")
     connector = RBIDBIEConnector()
     run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    target_date = date.today()
+    target_date = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
 
     df, result = connector.ingest(target_date)
     if df.empty:
@@ -79,7 +79,7 @@ def ingest_mospi():
     logger.info("MOSPI ingestion started")
     connector = MOSPIConnector()
     run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    target_date = date.today()
+    target_date = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
 
     df, result = connector.ingest(target_date)
     if df.empty:
@@ -104,7 +104,7 @@ def ingest_fred():
     logger.info("FRED API ingestion started")
     connector = FREDConnector()
     run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    target_date = date.today()
+    target_date = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
 
     df, result = connector.ingest(target_date)
     if df.empty:

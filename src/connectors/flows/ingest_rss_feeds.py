@@ -6,7 +6,7 @@ Runs via GitHub Actions (news_sentiment.yml)
 from __future__ import annotations
 import logging
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -52,7 +52,7 @@ def ingest_rss_feeds():
     logger.info("RSS Feeds ingestion started")
     connector = RSSFeedsConnector()
     run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    target_date = date.today()
+    target_date = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
 
     df, result = connector.ingest(target_date)
     if df.empty:
@@ -77,7 +77,7 @@ def ingest_reddit():
     logger.info("Reddit ingestion started")
     connector = RedditConnector()
     run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    target_date = date.today()
+    target_date = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
 
     df, result = connector.ingest(target_date)
     if df.empty:
@@ -102,7 +102,7 @@ def ingest_google_trends():
     logger.info("Google Trends ingestion started")
     connector = GoogleTrendsConnector()
     run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    target_date = date.today()
+    target_date = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
 
     df, result = connector.ingest(target_date)
     if df.empty:

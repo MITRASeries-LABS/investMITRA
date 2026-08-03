@@ -5,7 +5,7 @@ Runs via GitHub Actions (regulatory.yml)
 
 from __future__ import annotations
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -53,7 +53,7 @@ def ingest_sebi_circulars():
     logger.info("SEBI Circulars ingestion started")
     connector = SEBICircularsConnector()
     run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    target_date = date.today()
+    target_date = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
 
     df, result = connector.ingest(target_date)
     if df.empty:
@@ -79,7 +79,7 @@ def ingest_rbi_policy():
 
     logger.info("RBI Policy ingestion started")
     run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    target_date = date.today()
+    target_date = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
 
     feed = feedparser.parse(_RBI_POLICY_RSS)
     rows = []
@@ -119,7 +119,7 @@ def ingest_pib_press():
 
     logger.info("PIB Press Releases ingestion started")
     run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    target_date = date.today()
+    target_date = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
 
     feed = feedparser.parse(_PIB_RSS)
     rows = []
