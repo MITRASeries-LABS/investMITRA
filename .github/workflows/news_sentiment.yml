@@ -113,7 +113,9 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements-flow.txt transformers torch --index-url https://download.pytorch.org/whl/cpu
+        run: |
+          pip install -r requirements-flow.txt
+          pip install transformers torch --extra-index-url https://download.pytorch.org/whl/cpu
 
       - name: Run FinBERT sentiment scoring
         env:
