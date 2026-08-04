@@ -4,6 +4,8 @@ import logging
 import os
 from datetime import date, datetime, timezone, timedelta
 
+IST = __import__('datetime').timezone(__import__('datetime').timedelta(hours=5, minutes=30))
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
