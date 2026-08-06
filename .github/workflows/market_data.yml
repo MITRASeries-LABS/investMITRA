@@ -47,6 +47,7 @@ jobs:
       - name: Run NSE Bhavcopy
         env:
           CC_ENV: prod
+          TRADE_DATE: ${{ github.event.inputs.date }}
           CC_DB_SCHEMA: investmitra
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
           CC_TIMESCALE_URL: ${{ secrets.CC_TIMESCALE_URL }}
@@ -80,6 +81,7 @@ jobs:
       - name: Run NSE Delivery
         env:
           CC_ENV: prod
+          TRADE_DATE: ${{ github.event.inputs.date }}
           CC_DB_SCHEMA: investmitra
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
           AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
@@ -111,6 +113,7 @@ jobs:
       - name: Run BSE EOD
         env:
           CC_ENV: prod
+          TRADE_DATE: ${{ github.event.inputs.date }}
           CC_DB_SCHEMA: investmitra
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
           AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
@@ -142,6 +145,7 @@ jobs:
       - name: Run NSE F&O
         env:
           CC_ENV: prod
+          TRADE_DATE: ${{ github.event.inputs.date }}
           CC_DB_SCHEMA: investmitra
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
           AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
@@ -175,6 +179,7 @@ jobs:
       - name: Run EOD Processing
         env:
           CC_ENV: prod
+          TRADE_DATE: ${{ github.event.inputs.date }}
           CC_DB_SCHEMA: investmitra
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
           CC_TIMESCALE_URL: ${{ secrets.CC_TIMESCALE_URL }}
@@ -190,6 +195,7 @@ jobs:
       - name: Load prices to Neon
         env:
           CC_ENV: prod
+          TRADE_DATE: ${{ github.event.inputs.date }}
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
           AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
