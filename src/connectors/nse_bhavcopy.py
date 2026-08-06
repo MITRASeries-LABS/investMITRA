@@ -22,22 +22,23 @@ from .base import BaseConnector, SourceUnavailableError
 
 logger = logging.getLogger(__name__)
 
-_EQUITY_SERIES = {"EQ", "BE", "BZ", "BL", "GC", "IL"}
+_EQUITY_SERIES = {"EQ", "BE", "BZ", "BL", "GC", "IL", "ST", "GB", "SM", "MF"}
 
 _COL_MAP = {
-    "SYMBOL":     "nse_symbol",
-    "SERIES":     "series",
-    "OPEN":       "open",
-    "HIGH":       "high",
-    "LOW":        "low",
-    "CLOSE":      "close",
-    "LAST":       "last_price",
-    "PREVCLOSE":  "prev_close",
-    "TOTTRDQTY":  "volume",
-    "TOTTRDVAL":  "turnover_lakhs",
-    "TIMESTAMP":  "trade_date_raw",
-    "TOTALTRADES":"total_trades",
-    "ISIN":       "isin",
+    "ISIN":            "isin",
+    "TckrSymb":        "nse_symbol",
+    "SctySrs":         "series",
+    "FinInstrmNm":     "company_name",
+    "OpnPric":         "open",
+    "HghPric":         "high",
+    "LwPric":          "low",
+    "ClsPric":         "close",
+    "LastPric":        "last_price",
+    "PrvsClsgPric":    "prev_close",
+    "TtlTradgVol":     "volume",
+    "TtlTrfVal":       "turnover_rs",
+    "TtlNbOfTxsExctd": "total_trades",
+    "TradDt":          "trade_date_raw",
 }
 
 
@@ -47,7 +48,7 @@ class NSEBhavCopyConnector(BaseConnector):
     domain            = "market_data"
     refresh_frequency = "daily"
     required_columns  = ["isin", "trade_date", "open", "high", "low", "close", "volume"]
-    expected_columns  = list(_COL_MAP.keys())
+    expected_columns  = list(_COL_MAP.keys())  # UDiFF format
 
     _URL_NEW = (
         "https://nsearchives.nseindia.com/content/cm"
@@ -101,7 +102,8 @@ class NSEBhavCopyConnector(BaseConnector):
             raise SourceUnavailableError(f"[nse_bhavcopy] Parse failed {target_date}: {e}") from e
 
         raw.columns = raw.columns.str.strip()
-        df = raw.rename(columns=_COL_MAP)
+        # Map columns ? handle both old and new format
+        df = raw.rename(columns={k: v for k, v in _COL_MAP.items() if k in raw.columns})
 
         if "series" in df.columns:
             df = df[df["series"].isin(_EQUITY_SERIES)].copy()
