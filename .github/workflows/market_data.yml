@@ -58,7 +58,6 @@ jobs:
           CC_BUCKET_RAW: cc-raw
           CC_BUCKET_QUARANTINE: cc-quarantine
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          TRADE_DATE: ${{ github.event.inputs.date }}
         run: python -m src.connectors.flows.ingest_nse_bhavcopy
 
   # ─────────────────────────────────────────────
