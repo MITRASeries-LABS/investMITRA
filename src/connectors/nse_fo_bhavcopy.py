@@ -58,20 +58,35 @@ class NSEFOBhavCopyConnector(BaseConnector):
                          "open", "high", "low", "close", "open_interest"]
     expected_columns  = list(_COL_MAP.keys())
 
-    _URL = (
+    _URL_NEW = (
+        "https://nsearchives.nseindia.com/content/fo"
+        "/BhavCopy_NSE_FO_0_0_0_{date}_F_0000.csv.zip"
+    )
+    _URL_OLD = (
         "https://nsearchives.nseindia.com/content/historical/DERIVATIVES"
         "/{year}/{month}/fo{dd}{month}{year}bhav.csv.zip"
     )
 
     def fetch(self, target_date: date) -> pd.DataFrame:
-        url = self._URL.format(
-            year=target_date.strftime("%Y"),
-            month=target_date.strftime("%b").upper(),
-            dd=target_date.strftime("%d"),
-        )
-        logger.info("[nse_fo_bhavcopy] GET %s", url)
-        resp = self._get(url)
-        return self._parse(resp.content, target_date)
+        urls = [
+            self._URL_NEW.format(date=target_date.strftime("%Y%m%d")),
+            self._URL_OLD.format(
+                year=target_date.strftime("%Y"),
+                month=target_date.strftime("%b").upper(),
+                dd=target_date.strftime("%d"),
+            ),
+        ]
+        for url in urls:
+            try:
+                logger.info("[nse_fo_bhavcopy] GET %s", url)
+                resp = self._get(url)
+                return self._parse(resp.content, target_date)
+            except Exception as e:
+                if "404" in str(e):
+                    continue
+                raise
+        from src.connectors.base import SourceUnavailableError
+        raise SourceUnavailableError(f"[nse_fo_bhavcopy] No data for {target_date}")
 
     def backfill(self, start: date, end: date) -> Iterator[pd.DataFrame]:
         current = start

@@ -62,6 +62,7 @@ class NSEDeliveryConnector(BaseConnector):
     expected_columns  = list(_COL_MAP_NEW.keys())
 
     _URL_NEW = "https://nsearchives.nseindia.com/archives/equities/deliveries/MTO_{date}.DAT"
+    _URL_NEW2 = "https://nsearchives.nseindia.com/content/equities/deliveries/MTO_{date}.DAT"
     _URL_OLD = "https://nsearchives.nseindia.com/archives/equities/deliveries/MTO_{date}.ZIP"
 
     def fetch(self, target_date: date) -> pd.DataFrame:
@@ -85,9 +86,19 @@ class NSEDeliveryConnector(BaseConnector):
     # Post-2019 format — plain DAT (CSV) file
     # ------------------------------------------------------------------
     def _fetch_new(self, target_date: date) -> pd.DataFrame:
-        url = self._URL_NEW.format(date=target_date.strftime("%d%m%Y"))
-        logger.info("[nse_delivery] GET %s", url)
-        resp = self._get(url)
+        for url_template in [self._URL_NEW, self._URL_NEW2]:
+            url = url_template.format(date=target_date.strftime("%d%m%Y"))
+            try:
+                logger.info("[nse_delivery] GET %s", url)
+                resp = self._get(url)
+                break
+            except Exception as e:
+                if "404" in str(e):
+                    continue
+                raise
+        else:
+            from src.connectors.base import SourceUnavailableError
+            raise SourceUnavailableError(f"[nse_delivery] No delivery data for {target_date}")
 
         try:
             # DAT file is CSV with header on line 4 (skip first 3 rows)
