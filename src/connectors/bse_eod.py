@@ -107,9 +107,9 @@ class BSEEODConnector(BaseConnector):
         if "volume" in df.columns:
             df["volume"] = pd.to_numeric(df["volume"], errors="coerce").astype("Int64")
 
-        if "turnover_lakhs" in df.columns:
-            # BSE turnover in lakhs — convert to crore
-            df["turnover_cr"] = pd.to_numeric(df["turnover_lakhs"], errors="coerce") / 100.0
+        if "turnover_rs" in df.columns:
+            # New BSE UDiFF format - turnover in rupees, convert to crore
+            df["turnover_cr"] = pd.to_numeric(df["turnover_rs"], errors="coerce") / 10000000.0
 
         # BSE code as string with leading zeros
         if "bse_code" in df.columns:
