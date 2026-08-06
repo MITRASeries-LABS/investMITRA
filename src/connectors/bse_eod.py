@@ -83,16 +83,7 @@ class BSEEODConnector(BaseConnector):
     def _parse_csv(self, content: bytes, target_date: date) -> pd.DataFrame:
         try:
             import io as _io
-            text = content.decode("utf-8")
-            # Find the header row (contains ISIN or TradDt)
-            lines = text.split("\n")
-            header_idx = 0
-            for i, line in enumerate(lines):
-                if "ISIN" in line or "TradDt" in line:
-                    header_idx = i
-                    break
-            clean = "\n".join(lines[header_idx:])
-            raw = pd.read_csv(_io.StringIO(clean), dtype=str)
+            raw = pd.read_csv(_io.StringIO(content.decode("utf-8")), dtype=str, on_bad_lines="skip")
         except Exception as e:
             raise SourceUnavailableError(f"[bse_eod] Parse failed {target_date}: {e}") from e
         raw.columns = raw.columns.str.strip()
