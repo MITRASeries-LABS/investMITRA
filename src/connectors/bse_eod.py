@@ -27,25 +27,25 @@ from .base import BaseConnector, SourceUnavailableError
 logger = logging.getLogger(__name__)
 
 _COL_MAP = {
-    "SCRIP_CD":   "bse_code",
-    "SC_NAME":    "company_name",
-    "SC_GROUP":   "group",
-    "SC_TYPE":    "sc_type",
-    "OPEN":       "open",
-    "HIGH":       "high",
-    "LOW":        "low",
-    "CLOSE":      "close",
-    "LAST":       "last_price",
-    "PREVCLOSE":  "prev_close",
-    "NO_TRADES":  "total_trades",
-    "NO_OF_SHRS": "volume",
-    "NET_TURNOV": "turnover_lakhs",
-    "ISIN_CODE":  "isin",
-    "TDCLOINDI":  "td_close_indicator",
+    "ISIN":          "isin",
+    "FinInstrmId":   "bse_code",
+    "TckrSymb":      "nse_symbol",
+    "FinInstrmNm":   "company_name",
+    "SctySrs":       "group",
+    "OpnPric":       "open",
+    "HghPric":       "high",
+    "LwPric":        "low",
+    "ClsPric":       "close",
+    "LastPric":      "last_price",
+    "PrvsClsgPric":  "prev_close",
+    "TtlNbOfTxsExctd": "total_trades",
+    "TtlTradgVol":   "volume",
+    "TtlTrfVal":     "turnover_rs",
+    "TradDt":        "trade_date_raw",
 }
 
 # BSE equity groups to retain
-_EQUITY_GROUPS = {"A", "B", "E", "F", "S", "T", "XT", "Z", "X"}
+_EQUITY_GROUPS = {"A", "B", "E", "F", "S", "T", "XT", "Z", "X", "Q", "M", "MT", "MS", "IF", "IV", "IG"}
 
 
 class BSEEODConnector(BaseConnector):
@@ -56,7 +56,10 @@ class BSEEODConnector(BaseConnector):
     required_columns  = ["isin", "trade_date", "open", "high", "low", "close", "volume"]
     expected_columns  = list(_COL_MAP.keys())
 
-    _URL = "https://www.bseindia.com/download/BhavCopy/Equity/EQ{date}_CSV.ZIP"
+    _URL = (
+        "https://www.bseindia.com/download/BhavCopy/Equity"
+        "/BhavCopy_BSE_CM_0_0_0_{date}_F_0000.CSV"
+    )
 
     def fetch(self, target_date: date) -> pd.DataFrame:
         url = self._URL.format(date=target_date.strftime("%d%m%Y"))
@@ -77,17 +80,17 @@ class BSEEODConnector(BaseConnector):
                 self._polite_sleep(1.5)  # BSE is stricter on rate limits
             current += timedelta(days=1)
 
-    def _parse(self, content: bytes, target_date: date) -> pd.DataFrame:
+    def _parse_csv(self, content: bytes, target_date: date) -> pd.DataFrame:
         try:
-            with zipfile.ZipFile(io.BytesIO(content)) as z:
-                csv_name = next(n for n in z.namelist() if n.endswith(".CSV") or n.endswith(".csv"))
-                with z.open(csv_name) as f:
-                    raw = pd.read_csv(f, dtype=str)
+            import io as _io
+            raw = pd.read_csv(_io.StringIO(content.decode("utf-8")), dtype=str)
         except Exception as e:
             raise SourceUnavailableError(f"[bse_eod] Parse failed {target_date}: {e}") from e
-
         raw.columns = raw.columns.str.strip()
         return self._normalise(raw, target_date)
+
+    def _parse(self, content: bytes, target_date: date) -> pd.DataFrame:
+        return self._parse_csv(content, target_date)
 
     def _normalise(self, raw: pd.DataFrame, target_date: date) -> pd.DataFrame:
         df = raw.rename(columns=_COL_MAP)
