@@ -30,7 +30,7 @@ def ingest_nse_bhavcopy(target_date: date = None):
     try:
         df, result = connector.ingest(target_date)
     except Exception as e:
-        if "404" in str(e):
+        if "404" in str(e) or "No data" in str(e):
             logger.info("404 — market holiday on %s. Skipping.", target_date)
             return
         raise
