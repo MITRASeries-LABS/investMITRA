@@ -41,6 +41,7 @@ _COL_MAP = {
 }
 
 _INSTRUMENT_TYPES = {
+    "STO", "IDO", "STF", "IDF",
     "FF", "IO", "IF", "OI", "FS", "OS",
     "STK", "IDX", "FUTIDX", "OPTIDX", "FUTSTK", "OPTSTK"
 }
