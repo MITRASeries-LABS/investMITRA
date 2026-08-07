@@ -34,12 +34,12 @@ def eod_processing_daily():
         logger.error("Cross-validation failed: %s", e)
 
     # Step 3: CA adjustment
-    try:
-        nse = run_adjustment_for_all(source="NSE")
-        bse = run_adjustment_for_all(source="BSE")
-        logger.info("CA adjustment done — NSE: %s BSE: %s", nse, bse)
-    except Exception as e:
-        logger.error("CA adjustment failed: %s", e)
+    #try:
+    #    nse = run_adjustment_for_all(source="NSE")
+    #    bse = run_adjustment_for_all(source="BSE")
+    #   logger.info("CA adjustment done — NSE: %s BSE: %s", nse, bse)
+    #except Exception as e:
+    #    logger.error("CA adjustment failed: %s", e)
 
     logger.info("EOD Processing complete for %s", target_date)
 
