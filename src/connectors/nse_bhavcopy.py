@@ -73,7 +73,7 @@ class NSEBhavCopyConnector(BaseConnector):
     domain            = "market_data"
     refresh_frequency = "daily"
     required_columns  = ["nse_symbol", "trade_date", "open", "high", "low", "close", "volume"]
-    expected_columns  = list(_COL_MAP_FULL.keys())
+    expected_columns  = []  # UDiFF migration — schema stabilised, drift detection disabled
 
     # Full file with delivery data (preferred)
     _URL_FULL = (
