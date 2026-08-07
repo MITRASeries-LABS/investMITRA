@@ -2,15 +2,8 @@
 investMITRA — NSE F&O Bhavcopy Connector
 Daily Futures & Options OHLCV + Open Interest from NSE.
 
-URL:
-  https://nsearchives.nseindia.com/content/historical/DERIVATIVES/{YYYY}/{MMM}/fo{DD}{MMM}{YYYY}bhav.csv.zip
-
-Key notes:
-  - Covers: Index Futures, Index Options, Stock Futures, Stock Options
-  - Instrument types: FUTIDX, OPTIDX, FUTSTK, OPTSTK
-  - Join to equity_prices via underlying symbol → ISIN mapping
-  - Open interest is a key signal for derivative-based sentiment features
-  - Settlement price (SETTLE_PR) used for mark-to-market, not CLOSE
+New UDiFF format URL:
+  https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{YYYYMMDD}_F_0000.csv.zip
 """
 
 from __future__ import annotations
@@ -28,25 +21,29 @@ from .base import BaseConnector, SourceUnavailableError
 logger = logging.getLogger(__name__)
 
 _COL_MAP = {
-    "INSTRUMENT": "instrument_type",   # FUTIDX | OPTIDX | FUTSTK | OPTSTK
-    "SYMBOL":     "nse_symbol",
-    "EXPIRY_DT":  "expiry_date",
-    "STRIKE_PR":  "strike_price",
-    "OPTION_TYP": "option_type",       # CE | PE | XX (for futures)
-    "OPEN":       "open",
-    "HIGH":       "high",
-    "LOW":        "low",
-    "CLOSE":      "close",
-    "SETTLE_PR":  "settle_price",
-    "CONTRACTS":  "contracts",
-    "VAL_INLAKH": "turnover_lakhs",
-    "OPEN_INT":   "open_interest",
-    "CHG_IN_OI":  "oi_change",
-    "TIMESTAMP":  "trade_date_raw",
+    "FinInstrmTp":     "instrument_type",
+    "TckrSymb":        "nse_symbol",
+    "ISIN":            "isin",
+    "XpryDt":          "expiry_date",
+    "StrkPric":        "strike_price",
+    "OptnTp":          "option_type",
+    "OpnPric":         "open",
+    "HghPric":         "high",
+    "LwPric":          "low",
+    "ClsPric":         "close",
+    "SttlmPric":       "settle_price",
+    "TtlTradgVol":     "contracts",
+    "TtlTrfVal":       "turnover_rs",
+    "OpnIntrst":       "open_interest",
+    "ChngInOpnIntrst": "oi_change",
+    "TradDt":          "trade_date_raw",
+    "FinInstrmNm":     "company_name",
 }
 
-# Instrument types to ingest
-_INSTRUMENT_TYPES = {"FUTIDX", "OPTIDX", "FUTSTK", "OPTSTK"}
+_INSTRUMENT_TYPES = {
+    "FF", "IO", "IF", "OI", "FS", "OS",
+    "STK", "IDX", "FUTIDX", "OPTIDX", "FUTSTK", "OPTSTK"
+}
 
 
 class NSEFOBhavCopyConnector(BaseConnector):
@@ -85,7 +82,6 @@ class NSEFOBhavCopyConnector(BaseConnector):
                 if "404" in str(e):
                     continue
                 raise
-        from src.connectors.base import SourceUnavailableError
         raise SourceUnavailableError(f"[nse_fo_bhavcopy] No data for {target_date}")
 
     def backfill(self, start: date, end: date) -> Iterator[pd.DataFrame]:
@@ -102,9 +98,9 @@ class NSEFOBhavCopyConnector(BaseConnector):
     def _parse(self, content: bytes, target_date: date) -> pd.DataFrame:
         try:
             with zipfile.ZipFile(io.BytesIO(content)) as z:
-                csv_name = next(n for n in z.namelist() if n.endswith(".csv"))
+                csv_name = next(n for n in z.namelist() if n.lower().endswith(".csv"))
                 with z.open(csv_name) as f:
-                    raw = pd.read_csv(f, dtype=str)
+                    raw = pd.read_csv(f, dtype=str, on_bad_lines="skip")
         except Exception as e:
             raise SourceUnavailableError(
                 f"[nse_fo_bhavcopy] Parse failed {target_date}: {e}"
@@ -114,13 +110,13 @@ class NSEFOBhavCopyConnector(BaseConnector):
         return self._normalise(raw, target_date)
 
     def _normalise(self, raw: pd.DataFrame, target_date: date) -> pd.DataFrame:
-        df = raw.rename(columns=_COL_MAP)
+        df = raw.rename(columns={k: v for k, v in _COL_MAP.items() if k in raw.columns})
 
         # Filter to known instrument types
         if "instrument_type" in df.columns:
             df = df[df["instrument_type"].isin(_INSTRUMENT_TYPES)].copy()
 
-        # Type conversions — price columns
+        # Price columns
         for col in ["open", "high", "low", "close", "settle_price", "strike_price"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -130,26 +126,26 @@ class NSEFOBhavCopyConnector(BaseConnector):
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
 
-        # Turnover: lakhs → crore
-        if "turnover_lakhs" in df.columns:
-            df["turnover_cr"] = pd.to_numeric(df["turnover_lakhs"], errors="coerce") / 100.0
+        # Turnover: rupees -> crore
+        if "turnover_rs" in df.columns:
+            df["turnover_cr"] = pd.to_numeric(df["turnover_rs"], errors="coerce") / 10000000.0
 
-        # Expiry date normalise
+        # Expiry date
         if "expiry_date" in df.columns:
             df["expiry_date"] = pd.to_datetime(
-                df["expiry_date"], format="%d-%b-%Y", errors="coerce"
+                df["expiry_date"], errors="coerce"
             ).dt.date
 
-        # Option type: futures have 'XX' — normalise to None
+        # Option type normalise
         if "option_type" in df.columns:
-            df["option_type"] = df["option_type"].replace("XX", None)
+            df["option_type"] = df["option_type"].replace({"XX": None, "": None})
 
         df["trade_date"] = target_date
         df["source"]     = "NSE"
 
         keep = [
-            "nse_symbol", "instrument_type", "expiry_date", "strike_price",
-            "option_type", "trade_date", "source",
+            "nse_symbol", "isin", "instrument_type", "expiry_date", "strike_price",
+            "option_type", "trade_date", "source", "company_name",
             "open", "high", "low", "close", "settle_price",
             "contracts", "turnover_cr", "open_interest", "oi_change",
         ]
