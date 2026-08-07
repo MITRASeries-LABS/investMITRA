@@ -1,12 +1,8 @@
 """
-investMITRA — R2 to Neon: Equity Prices Loader
-Reads Parquet files from Cloudflare R2 and loads into Neon equity_prices table.
-Includes ISIN enrichment for NSE full file (sec_bhavdata_full) which lacks ISIN column.
-
-Run daily after market data pipeline completes:
-  python scripts/load_prices_to_neon.py              # today
-  python scripts/load_prices_to_neon.py --date 2026-08-04  # specific date
-  python scripts/load_prices_to_neon.py --backfill        # all available dates in R2
+investMITRA — R2 to Neon: Equity Prices Loader v4
+- ISIN enrichment for NSE full file
+- Bulk insert with execute_values
+- Deduplication before insert
 """
 
 from __future__ import annotations
@@ -35,11 +31,10 @@ BUCKET       = os.getenv("CC_BUCKET_RAW", "cc-raw")
 ENV          = os.getenv("CC_ENV", "prod")
 IST          = timezone(timedelta(hours=5, minutes=30))
 
-# Cache symbol->ISIN map for the session
 _SYMBOL_TO_ISIN: dict[str, str] = {}
 
 
-def get_duckdb_con() -> duckdb.DuckDBPyConnection:
+def get_duckdb_con():
     con = duckdb.connect()
     endpoint = (AWS_ENDPOINT or "").replace("https://", "").replace("http://", "")
     use_ssl  = "true" if (AWS_ENDPOINT or "").startswith("https") else "false"
@@ -55,7 +50,6 @@ def get_duckdb_con() -> duckdb.DuckDBPyConnection:
 
 
 def get_symbol_to_isin() -> dict[str, str]:
-    """Load NSE symbol -> ISIN mapping from company_master (cached)."""
     global _SYMBOL_TO_ISIN
     if _SYMBOL_TO_ISIN:
         return _SYMBOL_TO_ISIN
@@ -63,12 +57,12 @@ def get_symbol_to_isin() -> dict[str, str]:
         conn = psycopg2.connect(NEON_URL, connect_timeout=15)
         cur  = conn.cursor()
         cur.execute(
-            "SELECT nse_symbol, isin FROM investmitra.company_master WHERE nse_symbol IS NOT NULL AND isin IS NOT NULL"
+            "SELECT nse_symbol, isin FROM investmitra.company_master "
+            "WHERE nse_symbol IS NOT NULL AND isin IS NOT NULL"
         )
         _SYMBOL_TO_ISIN = {row[0]: row[1] for row in cur.fetchall()}
-        cur.close()
-        conn.close()
-        logger.info("Loaded %d symbol->ISIN mappings from company_master", len(_SYMBOL_TO_ISIN))
+        cur.close(); conn.close()
+        logger.info("Loaded %d symbol->ISIN mappings", len(_SYMBOL_TO_ISIN))
     except Exception as e:
         logger.error("Could not load symbol->ISIN map: %s", e)
     return _SYMBOL_TO_ISIN
@@ -77,15 +71,13 @@ def get_symbol_to_isin() -> dict[str, str]:
 def load_date(target_date: date) -> dict:
     logger.info("Loading equity prices for %s", target_date)
     con = get_duckdb_con()
-    results = {"date": str(target_date), "nse_rows": 0, "bse_rows": 0, "errors": []}
+    results = {"date": str(target_date), "nse_rows": 0, "bse_rows": 0}
 
     for source in ["nse_bhavcopy", "bse_eod"]:
         path = (
             f"s3://{BUCKET}/{ENV}/market_data/equity_prices"
-            f"/year={target_date.year}"
-            f"/month={target_date.month:02d}"
-            f"/day={target_date.day:02d}"
-            f"/{source}_*.parquet"
+            f"/year={target_date.year}/month={target_date.month:02d}"
+            f"/day={target_date.day:02d}/{source}_*.parquet"
         )
         try:
             df = con.execute(
@@ -101,15 +93,14 @@ def load_date(target_date: date) -> dict:
                 results["bse_rows"] = written
         except Exception as e:
             logger.warning("  No data for %s — %s", source, e)
-            results["errors"].append(str(e))
 
     con.close()
-    logger.info("Loaded %s — NSE: %d BSE: %d", target_date, results["nse_rows"], results["bse_rows"])
+    logger.info("Loaded %s — NSE: %d BSE: %d",
+                target_date, results["nse_rows"], results["bse_rows"])
     return results
 
 
 def write_to_neon(df: pd.DataFrame, trade_date: date, source_id: str) -> int:
-    """Bulk upsert equity prices into Neon. Uses execute_values for speed."""
     source = "NSE" if "nse" in source_id else "BSE"
 
     required = ["open", "high", "low", "close", "volume"]
@@ -118,59 +109,56 @@ def write_to_neon(df: pd.DataFrame, trade_date: date, source_id: str) -> int:
         logger.warning("Missing columns %s in %s", missing, source_id)
         return 0
 
-    # ISIN enrichment for NSE full file (sec_bhavdata_full has no ISIN column)
+    df = df.copy()
+
+    # ISIN enrichment for NSE full file
     if source == "NSE" and "nse_symbol" in df.columns:
-        isin_col = df.get("isin", pd.Series(dtype=str))
-        if isin_col.isna().all() or "isin" not in df.columns:
+        if "isin" not in df.columns or df["isin"].isna().all():
             symbol_map = get_symbol_to_isin()
-            df = df.copy()
             df["isin"] = df["nse_symbol"].map(symbol_map)
             matched = df["isin"].notna().sum()
-            logger.info("  ISIN enrichment: %d/%d symbols matched", matched, len(df))
+            logger.info("  ISIN enrichment: %d/%d matched", matched, len(df))
 
     # Filter valid ISINs
     if "isin" in df.columns:
-        df = df[df["isin"].notna() & (df["isin"].astype(str).str.len() == 12)].copy()
+        df = df[df["isin"].notna() & (df["isin"].astype(str).str.len() == 12)]
 
     if df.empty:
-        logger.warning("  No valid rows after ISIN filter for %s", source_id)
+        logger.warning("  No valid rows after ISIN filter")
         return 0
 
-    def safe_float(val):
+    # Deduplicate — keep last occurrence per ISIN
+    if "isin" in df.columns:
+        before = len(df)
+        df = df.drop_duplicates(subset=["isin"], keep="last")
+        if len(df) < before:
+            logger.info("  Deduped: %d -> %d rows", before, len(df))
+
+    def sf(val):
         try:
             f = float(val)
-            return None if (f != f) else f
-        except:
-            return None
+            return None if f != f else f
+        except: return None
 
-    def safe_int(val):
-        try:
-            return int(val) if pd.notna(val) else None
-        except:
-            return None
+    def si(val):
+        try: return int(val) if pd.notna(val) else None
+        except: return None
 
-    rows = []
-    for _, row in df.iterrows():
-        isin = str(row.get("isin", "")).strip()
-        if not isin or len(isin) != 12:
-            continue
-        rows.append((
-            isin,
-            trade_date,
-            source,
-            safe_float(row.get("open")),
-            safe_float(row.get("high")),
-            safe_float(row.get("low")),
-            safe_float(row.get("close")),
-            safe_float(row.get("vwap")),
-            safe_int(row.get("volume")),
-            safe_float(row.get("turnover_cr")),
-            safe_float(row.get("delivery_pct")),
+    rows = [
+        (
+            str(row["isin"]).strip(), trade_date, source,
+            sf(row.get("open")), sf(row.get("high")),
+            sf(row.get("low")), sf(row.get("close")),
+            sf(row.get("vwap")), si(row.get("volume")),
+            sf(row.get("turnover_cr")), sf(row.get("delivery_pct")),
             int(row.get("quality_score", 100)),
-        ))
+        )
+        for _, row in df.iterrows()
+        if str(row.get("isin", "")).strip() and len(str(row.get("isin", "")).strip()) == 12
+    ]
 
     if not rows:
-        logger.warning("  No valid rows to insert for %s", source_id)
+        logger.warning("  No valid rows to insert")
         return 0
 
     conn = psycopg2.connect(NEON_URL, connect_timeout=15)
@@ -187,15 +175,12 @@ def write_to_neon(df: pd.DataFrame, trade_date: date, source_id: str) -> int:
              quality_score, ingested_at)
         VALUES %s
         ON CONFLICT (isin, trade_date, source) DO UPDATE SET
-            open         = EXCLUDED.open,
-            high         = EXCLUDED.high,
-            low          = EXCLUDED.low,
-            close        = EXCLUDED.close,
-            vwap         = EXCLUDED.vwap,
-            volume       = EXCLUDED.volume,
-            turnover_cr  = EXCLUDED.turnover_cr,
-            delivery_pct = EXCLUDED.delivery_pct,
-            quality_score= EXCLUDED.quality_score
+            open=EXCLUDED.open, high=EXCLUDED.high,
+            low=EXCLUDED.low, close=EXCLUDED.close,
+            vwap=EXCLUDED.vwap, volume=EXCLUDED.volume,
+            turnover_cr=EXCLUDED.turnover_cr,
+            delivery_pct=EXCLUDED.delivery_pct,
+            quality_score=EXCLUDED.quality_score
         """,
         rows,
         template="(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())",
@@ -203,8 +188,7 @@ def write_to_neon(df: pd.DataFrame, trade_date: date, source_id: str) -> int:
     )
 
     conn.commit()
-    cur.close()
-    conn.close()
+    cur.close(); conn.close()
     logger.info("  Written %d rows to Neon (%s)", len(rows), source)
     return len(rows)
 
@@ -214,14 +198,13 @@ def list_available_dates() -> list[date]:
     try:
         path = f"s3://{BUCKET}/{ENV}/market_data/equity_prices/*/*/*/*.parquet"
         df   = con.execute(
-            f"SELECT DISTINCT year, month, day FROM read_parquet('{path}', hive_partitioning=true, union_by_name=true)"
+            f"SELECT DISTINCT year, month, day FROM "
+            f"read_parquet('{path}', hive_partitioning=true, union_by_name=true)"
         ).df()
         dates = []
         for _, row in df.iterrows():
-            try:
-                dates.append(date(int(row["year"]), int(row["month"]), int(row["day"])))
-            except:
-                pass
+            try: dates.append(date(int(row["year"]), int(row["month"]), int(row["day"])))
+            except: pass
         con.close()
         return sorted(dates)
     except Exception as e:
@@ -235,8 +218,8 @@ def verify():
     cur  = conn.cursor()
     cur.execute("""
         SELECT trade_date, source, COUNT(*) AS stocks,
-               ROUND(AVG(close)::numeric, 2) AS avg_close,
-               MIN(close) AS min_close, MAX(close) AS max_close
+               ROUND(AVG(close)::numeric,2) AS avg_close,
+               MIN(close), MAX(close)
         FROM investmitra.equity_prices
         GROUP BY trade_date, source
         ORDER BY trade_date DESC, source
@@ -252,8 +235,7 @@ def verify():
     cur.execute("SELECT COUNT(*) FROM investmitra.equity_prices")
     total = cur.fetchone()[0]
     print(f"\nTotal rows: {total}")
-    cur.close()
-    conn.close()
+    cur.close(); conn.close()
 
 
 def main():
@@ -264,19 +246,16 @@ def main():
     args = parser.parse_args()
 
     if args.verify:
-        verify()
-        return
+        verify(); return
 
     if args.backfill:
         dates = list_available_dates()
         if not dates:
-            logger.warning("No dates found in R2")
-            return
+            logger.warning("No dates in R2"); return
         logger.info("Backfilling %d dates: %s to %s", len(dates), dates[0], dates[-1])
         for d in dates:
             load_date(d)
-        verify()
-        return
+        verify(); return
 
     target = args.date or datetime.now(IST).date()
     load_date(target)
