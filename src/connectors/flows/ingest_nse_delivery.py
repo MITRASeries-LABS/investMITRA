@@ -8,7 +8,8 @@ IST = __import__('datetime').timezone(__import__('datetime').timedelta(hours=5, 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
-
+logger.info("NSE Delivery % temporarily disabled — URL format changed")
+    return
 
 def ingest_nse_delivery():
     from src.connectors.nse_delivery import NSEDeliveryConnector

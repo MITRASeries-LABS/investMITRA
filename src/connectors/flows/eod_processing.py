@@ -27,10 +27,11 @@ def eod_processing_daily():
 
     logger.info("EOD Processing for %s", target_date)
 
-    # Step 1: Circuit limits
+    # Step 1: Circuit limits (URL changed in new NSE format — temporarily disabled)
     try:
-        connector = NSECircuitLimitsConnector()
-        df, result = connector.ingest(target_date)
+        logger.info("Circuit limits temporarily disabled — NSE removed MTO files")
+        # connector = NSECircuitLimitsConnector()
+        # df, result = connector.ingest(target_date)
         if not df.empty and result.quality_score >= 50:
             write_to_lake(df=df, domain="market_data", table="circuit_limits",
                           partition_date=target_date, source_id="nse_circuit_limits",
