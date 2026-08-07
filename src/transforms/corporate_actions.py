@@ -223,7 +223,7 @@ def run_adjustment_for_all(source: str = "NSE", batch_size: int = 100) -> dict:
     """
     with get_pg_conn() as conn:
         isins = pd.read_sql(
-            "SELECT DISTINCT isin FROM investmitra.equity_prices WHERE source = %s",
+            "SELECT DISTINCT isin FROM investmitra.equity_prices WHERE source = %s AND trade_date >= CURRENT_DATE - INTERVAL '7 days'",    
             conn, params=(source,)
         )["isin"].tolist()
 

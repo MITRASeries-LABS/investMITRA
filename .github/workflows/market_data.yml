@@ -164,7 +164,7 @@ jobs:
   eod-processing:
     name: EOD Processing
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     needs: [nse-delivery, bse-eod, nse-fo]
     if: always() && (github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'eod_processing')
 
