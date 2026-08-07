@@ -126,7 +126,7 @@ def _read_parquet(prefix: str) -> Optional[pd.DataFrame]:
             """)
 
         df = con.execute(
-            f"SELECT isin, close FROM read_parquet('s3://{prefix}/*.parquet')"
+            f"SELECT isin, close FROM read_parquet('s3://{prefix}/*.parquet', union_by_name=true) WHERE isin IS NOT NULL AND LENGTH(CAST(isin AS VARCHAR)) = 12"
         ).df()
         con.close()
         return df if not df.empty else None
