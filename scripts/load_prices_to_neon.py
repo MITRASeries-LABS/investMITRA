@@ -1,6 +1,7 @@
 """
 investMITRA — R2 to Neon: Equity Prices Loader
 Reads Parquet files from Cloudflare R2 and loads into Neon equity_prices table.
+Includes ISIN enrichment for NSE full file (sec_bhavdata_full) which lacks ISIN column.
 
 Run daily after market data pipeline completes:
   python scripts/load_prices_to_neon.py              # today
@@ -26,13 +27,16 @@ load_dotenv('.env.prod')
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-NEON_URL        = os.getenv("CC_POSTGRES_URL")
-AWS_ENDPOINT    = os.getenv("AWS_ENDPOINT_URL")
-AWS_KEY         = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET      = os.getenv("AWS_SECRET_ACCESS_KEY")
-BUCKET          = os.getenv("CC_BUCKET_RAW", "cc-raw")
-ENV             = os.getenv("CC_ENV", "prod")
-IST             = timezone(timedelta(hours=5, minutes=30))
+NEON_URL     = os.getenv("CC_POSTGRES_URL")
+AWS_ENDPOINT = os.getenv("AWS_ENDPOINT_URL")
+AWS_KEY      = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET   = os.getenv("AWS_SECRET_ACCESS_KEY")
+BUCKET       = os.getenv("CC_BUCKET_RAW", "cc-raw")
+ENV          = os.getenv("CC_ENV", "prod")
+IST          = timezone(timedelta(hours=5, minutes=30))
+
+# Cache symbol->ISIN map for the session
+_SYMBOL_TO_ISIN: dict[str, str] = {}
 
 
 def get_duckdb_con() -> duckdb.DuckDBPyConnection:
@@ -48,6 +52,26 @@ def get_duckdb_con() -> duckdb.DuckDBPyConnection:
         SET s3_url_style         = 'path';
     """)
     return con
+
+
+def get_symbol_to_isin() -> dict[str, str]:
+    """Load NSE symbol -> ISIN mapping from company_master (cached)."""
+    global _SYMBOL_TO_ISIN
+    if _SYMBOL_TO_ISIN:
+        return _SYMBOL_TO_ISIN
+    try:
+        conn = psycopg2.connect(NEON_URL, connect_timeout=15)
+        cur  = conn.cursor()
+        cur.execute(
+            "SELECT nse_symbol, isin FROM investmitra.company_master WHERE nse_symbol IS NOT NULL AND isin IS NOT NULL"
+        )
+        _SYMBOL_TO_ISIN = {row[0]: row[1] for row in cur.fetchall()}
+        cur.close()
+        conn.close()
+        logger.info("Loaded %d symbol->ISIN mappings from company_master", len(_SYMBOL_TO_ISIN))
+    except Exception as e:
+        logger.error("Could not load symbol->ISIN map: %s", e)
+    return _SYMBOL_TO_ISIN
 
 
 def load_date(target_date: date) -> dict:
@@ -85,21 +109,31 @@ def load_date(target_date: date) -> dict:
 
 
 def write_to_neon(df: pd.DataFrame, trade_date: date, source_id: str) -> int:
-    """Bulk upsert equity prices — uses execute_values for speed."""
+    """Bulk upsert equity prices into Neon. Uses execute_values for speed."""
     source = "NSE" if "nse" in source_id else "BSE"
 
     required = ["open", "high", "low", "close", "volume"]
-    missing = [c for c in required if c not in df.columns]
+    missing  = [c for c in required if c not in df.columns]
     if missing:
         logger.warning("Missing columns %s in %s", missing, source_id)
         return 0
 
-    # Filter valid ISINs only
+    # ISIN enrichment for NSE full file (sec_bhavdata_full has no ISIN column)
+    if source == "NSE" and "nse_symbol" in df.columns:
+        isin_col = df.get("isin", pd.Series(dtype=str))
+        if isin_col.isna().all() or "isin" not in df.columns:
+            symbol_map = get_symbol_to_isin()
+            df = df.copy()
+            df["isin"] = df["nse_symbol"].map(symbol_map)
+            matched = df["isin"].notna().sum()
+            logger.info("  ISIN enrichment: %d/%d symbols matched", matched, len(df))
+
+    # Filter valid ISINs
     if "isin" in df.columns:
         df = df[df["isin"].notna() & (df["isin"].astype(str).str.len() == 12)].copy()
 
     if df.empty:
-        logger.warning("No valid rows after ISIN filter for %s", source_id)
+        logger.warning("  No valid rows after ISIN filter for %s", source_id)
         return 0
 
     def safe_float(val):
@@ -136,12 +170,12 @@ def write_to_neon(df: pd.DataFrame, trade_date: date, source_id: str) -> int:
         ))
 
     if not rows:
-        logger.warning("No valid rows to insert for %s", source_id)
+        logger.warning("  No valid rows to insert for %s", source_id)
         return 0
 
     conn = psycopg2.connect(NEON_URL, connect_timeout=15)
     conn.autocommit = False
-    cur = conn.cursor()
+    cur  = conn.cursor()
 
     execute_values(
         cur,
@@ -179,7 +213,7 @@ def list_available_dates() -> list[date]:
     con = get_duckdb_con()
     try:
         path = f"s3://{BUCKET}/{ENV}/market_data/equity_prices/*/*/*/*.parquet"
-        df = con.execute(
+        df   = con.execute(
             f"SELECT DISTINCT year, month, day FROM read_parquet('{path}', hive_partitioning=true, union_by_name=true)"
         ).df()
         dates = []
