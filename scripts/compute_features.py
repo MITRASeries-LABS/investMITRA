@@ -79,9 +79,9 @@ def compute_price_features(target_date: date) -> pd.DataFrame:
     start_year = (target_date - timedelta(days=450)).year
     
     # Build path pattern for multiple years
-    # Use glob pattern that matches the actual R2 structure
-    paths = ", ".join([
-        f"'s3://{BUCKET}/{ENV}/market_data/equity_prices/year={y}/**/*.parquet'"
+    years = list(range(start_year, target_date.year + 1))
+    paths = " ".join([
+        f"'s3://{BUCKET}/{ENV}/market_data/equity_prices/year={y}/*/nse_bhavcopy_*.parquet'"
         for y in years
     ])
 
@@ -100,10 +100,9 @@ def compute_price_features(target_date: date) -> pd.DataFrame:
             turnover_cr,
             delivery_pct,
             vwap
-        FROM read_parquet('{path}', union_by_name=true, hive_partitioning=true)
+        FROM read_parquet([{paths}], union_by_name=true)
         WHERE 
             trade_date <= '{target_date}'
-            AND trade_date >= '{(target_date - timedelta(days=450)).isoformat()}'
             AND isin IS NOT NULL
             AND LENGTH(CAST(isin AS VARCHAR)) = 12
             AND close > 0
