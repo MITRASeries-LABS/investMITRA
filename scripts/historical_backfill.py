@@ -1,14 +1,11 @@
 """
-investMITRA — Historical Backfill v2
-Fetches NSE + BSE equity prices for a date range.
+investMITRA — Historical Backfill v3
+NSE old archive format added for pre-2019 dates.
 
-Architecture:
-  - ALL historical data → R2 (Parquet files, unlimited storage)
-  - Only last 90 days → Neon (for Grafana dashboard)
-  - DuckDB queries R2 directly for model training
-
-Runs via GitHub Actions or locally:
-  python scripts/historical_backfill.py --start 2014-01-01 --end 2026-08-02
+URL formats:
+  NSE new (2019+): https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{DDMMYYYY}.csv
+  NSE old (pre-2019): https://nsearchives.nseindia.com/content/historical/EQUITIES/{YYYY}/{MMM}/cm{DD}{MMM}{YYYY}bhav.csv.zip
+  BSE: https://www.bseindia.com/download/BhavCopy/Equity/BhavCopy_BSE_CM_0_0_0_{YYYYMMDD}_F_0000.CSV
 """
 
 from __future__ import annotations
@@ -18,6 +15,7 @@ import io
 import logging
 import os
 import time
+import zipfile
 from datetime import date, datetime, timedelta, timezone
 
 import boto3
@@ -41,22 +39,48 @@ AWS_KEY      = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET   = os.getenv("AWS_SECRET_ACCESS_KEY")
 BUCKET       = os.getenv("CC_BUCKET_RAW", "cc-raw")
 ENV          = os.getenv("CC_ENV", "prod")
-
-# Only load to Neon if within last 90 days
 NEON_WINDOW_DAYS = 90
 
-NSE_URL = "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{date}.csv"
-BSE_URL = "https://www.bseindia.com/download/BhavCopy/Equity/BhavCopy_BSE_CM_0_0_0_{date}_F_0000.CSV"
+# NSE URLs
+NSE_NEW_URL = "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{date}.csv"
+NSE_OLD_URL = "https://nsearchives.nseindia.com/content/historical/EQUITIES/{year}/{month}/cm{dd}{month}{year}bhav.csv.zip"
+BSE_URL     = "https://www.bseindia.com/download/BhavCopy/Equity/BhavCopy_BSE_CM_0_0_0_{date}_F_0000.CSV"
+
+# Cutoff for new vs old NSE format
+NSE_NEW_FORMAT_DATE = date(2024, 7, 8)  # NSE circular 62424 dated June 12, 2024
 
 HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.nseindia.com"}
 
-NSE_COL_MAP = {
-    "SYMBOL": "nse_symbol", "SERIES": "series",
-    "OPEN_PRICE": "open", "HIGH_PRICE": "high", "LOW_PRICE": "low",
-    "CLOSE_PRICE": "close", "AVG_PRICE": "vwap",
-    "TTL_TRD_QNTY": "volume", "TURNOVER_LACS": "turnover_lacs",
-    "NO_OF_TRADES": "total_trades", "DELIV_QTY": "delivery_qty",
-    "DELIV_PER": "delivery_pct",
+# Old NSE column mapping
+NSE_OLD_COL_MAP = {
+    "SYMBOL":      "nse_symbol",
+    "SERIES":      "series",
+    "OPEN":        "open",
+    "HIGH":        "high",
+    "LOW":         "low",
+    "CLOSE":       "close",
+    "LAST":        "last_price",
+    "PREVCLOSE":   "prev_close",
+    "TOTTRDQTY":   "volume",
+    "TOTTRDVAL":   "turnover_rs",
+    "TOTALTRADES": "total_trades",
+    "ISIN":        "isin",
+}
+
+# New NSE column mapping
+NSE_NEW_COL_MAP = {
+    "SYMBOL":        "nse_symbol",
+    "SERIES":        "series",
+    "OPEN_PRICE":    "open",
+    "HIGH_PRICE":    "high",
+    "LOW_PRICE":     "low",
+    "CLOSE_PRICE":   "close",
+    "AVG_PRICE":     "vwap",
+    "TTL_TRD_QNTY":  "volume",
+    "TURNOVER_LACS": "turnover_lacs",
+    "NO_OF_TRADES":  "total_trades",
+    "DELIV_QTY":     "delivery_qty",
+    "DELIV_PER":     "delivery_pct",
 }
 
 BSE_COL_MAP = {
@@ -85,13 +109,11 @@ def get_session():
 def get_s3():
     global _s3_client
     if _s3_client is None:
-        _s3_client = boto3.client(
-            "s3",
+        _s3_client = boto3.client("s3",
             endpoint_url=AWS_ENDPOINT,
             aws_access_key_id=AWS_KEY,
             aws_secret_access_key=AWS_SECRET,
-            region_name="auto",
-        )
+            region_name="auto")
     return _s3_client
 
 
@@ -101,10 +123,7 @@ def get_symbol_to_isin() -> dict[str, str]:
         return _SYMBOL_TO_ISIN
     conn = psycopg2.connect(NEON_URL, connect_timeout=15)
     cur  = conn.cursor()
-    cur.execute(
-        "SELECT nse_symbol, isin FROM investmitra.company_master "
-        "WHERE nse_symbol IS NOT NULL AND isin IS NOT NULL"
-    )
+    cur.execute("SELECT nse_symbol, isin FROM investmitra.company_master WHERE nse_symbol IS NOT NULL AND isin IS NOT NULL")
     _SYMBOL_TO_ISIN = {r[0]: r[1] for r in cur.fetchall()}
     cur.close(); conn.close()
     logger.info("Loaded %d symbol->ISIN mappings", len(_SYMBOL_TO_ISIN))
@@ -112,26 +131,19 @@ def get_symbol_to_isin() -> dict[str, str]:
 
 
 def file_exists_in_r2(source_id: str, target_date: date) -> bool:
-    """Check if data already exists in R2 for this date/source."""
-    prefix = (
-        f"{ENV}/market_data/equity_prices"
-        f"/year={target_date.year}/month={target_date.month:02d}"
-        f"/day={target_date.day:02d}/{source_id}_"
-    )
+    prefix = (f"{ENV}/market_data/equity_prices"
+              f"/year={target_date.year}/month={target_date.month:02d}"
+              f"/day={target_date.day:02d}/{source_id}_")
     result = get_s3().list_objects_v2(Bucket=BUCKET, Prefix=prefix)
     return len(result.get("Contents", [])) > 0
 
 
 def write_to_r2(df: pd.DataFrame, source_id: str, target_date: date) -> int:
-    """Write DataFrame to R2 as Parquet."""
-    if df.empty:
-        return 0
-    key = (
-        f"{ENV}/market_data/equity_prices"
-        f"/year={target_date.year}/month={target_date.month:02d}"
-        f"/day={target_date.day:02d}"
-        f"/{source_id}_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.parquet"
-    )
+    if df.empty: return 0
+    key = (f"{ENV}/market_data/equity_prices"
+           f"/year={target_date.year}/month={target_date.month:02d}"
+           f"/day={target_date.day:02d}"
+           f"/{source_id}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.parquet")
     table = pa.Table.from_pandas(df, preserve_index=False)
     buf   = io.BytesIO()
     pq.write_table(table, buf, compression="snappy")
@@ -141,9 +153,7 @@ def write_to_r2(df: pd.DataFrame, source_id: str, target_date: date) -> int:
 
 
 def write_to_neon(df: pd.DataFrame, source: str) -> int:
-    """Write to Neon — only for recent data."""
-    if df.empty:
-        return 0
+    if df.empty: return 0
 
     def sf(v):
         try: f=float(v); return None if f!=f else f
@@ -152,64 +162,119 @@ def write_to_neon(df: pd.DataFrame, source: str) -> int:
         try: return int(v) if pd.notna(v) else None
         except: return None
 
-    rows = [
-        (str(r.get("isin","")).strip(), r["trade_date"], source,
-         sf(r.get("open")), sf(r.get("high")), sf(r.get("low")), sf(r.get("close")),
-         sf(r.get("vwap")), si(r.get("volume")), sf(r.get("turnover_cr")),
-         sf(r.get("delivery_pct")), 85)
-        for _, r in df.iterrows()
-        if str(r.get("isin","")).strip() and len(str(r.get("isin","")).strip()) == 12
-    ]
+    rows = [(str(r.get("isin","")).strip(), r["trade_date"], source,
+             sf(r.get("open")), sf(r.get("high")), sf(r.get("low")), sf(r.get("close")),
+             sf(r.get("vwap")), si(r.get("volume")), sf(r.get("turnover_cr")),
+             sf(r.get("delivery_pct")), 85)
+            for _, r in df.iterrows()
+            if str(r.get("isin","")).strip() and len(str(r.get("isin","")).strip()) == 12]
 
-    if not rows:
-        return 0
+    if not rows: return 0
 
     conn = psycopg2.connect(NEON_URL, connect_timeout=15)
     conn.autocommit = False
     cur  = conn.cursor()
-    execute_values(
-        cur,
+    execute_values(cur,
         """INSERT INTO investmitra.equity_prices
            (isin,trade_date,source,open,high,low,close,vwap,
             volume,turnover_cr,delivery_pct,quality_score,ingested_at)
-           VALUES %s
-           ON CONFLICT (isin,trade_date,source) DO NOTHING""",
-        rows,
-        template="(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())",
-        page_size=1000
-    )
+           VALUES %s ON CONFLICT (isin,trade_date,source) DO NOTHING""",
+        rows, template="(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())", page_size=1000)
     conn.commit(); cur.close(); conn.close()
     return len(rows)
 
 
-def fetch_nse(target_date: date) -> pd.DataFrame | None:
-    url = NSE_URL.format(date=target_date.strftime("%d%m%Y"))
+def fetch_nse_old(target_date: date) -> pd.DataFrame | None:
+    """Fetch NSE Bhavcopy using old archive format (pre-July 2024)."""
+    url = NSE_OLD_URL.format(
+        year=target_date.strftime("%Y"),
+        month=target_date.strftime("%b").upper(),
+        dd=target_date.strftime("%d"),
+    )
     try:
         resp = get_session().get(url, timeout=30)
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
-        df = pd.read_csv(io.StringIO(resp.text), dtype=str)
+
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+            df = pd.read_csv(z.open(z.namelist()[0]), dtype=str)
+
         df.columns = df.columns.str.strip()
-        df = df.rename(columns={k: v for k, v in NSE_COL_MAP.items() if k in df.columns})
+        df = df.rename(columns={k: v for k, v in NSE_OLD_COL_MAP.items() if k in df.columns})
+
         if "series" in df.columns:
             df = df[df["series"].str.strip().isin(EQUITY_SERIES)].copy()
+
+        for col in ["open", "high", "low", "close", "last_price", "prev_close"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").astype("Int64")
+
+        if "turnover_rs" in df.columns:
+            df["turnover_cr"] = pd.to_numeric(df["turnover_rs"], errors="coerce") / 100000.0
+
+        df["trade_date"]   = target_date
+        df["source"]       = "NSE"
+        df["vwap"]         = None
+        df["delivery_pct"] = None
+
+        if "isin" in df.columns:
+            df = df[df["isin"].notna() & (df["isin"].astype(str).str.len() == 12)].copy()
+
+        return df if not df.empty else None
+
+    except Exception as e:
+        logger.warning("NSE old fetch failed %s: %s", target_date, e)
+        return None
+
+
+def fetch_nse_new(target_date: date) -> pd.DataFrame | None:
+    """Fetch NSE full file with delivery % (post-July 2024)."""
+    url = NSE_NEW_URL.format(date=target_date.strftime("%d%m%Y"))
+    try:
+        resp = get_session().get(url, timeout=30)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+
+        df = pd.read_csv(io.StringIO(resp.text), dtype=str)
+        df.columns = df.columns.str.strip()
+        df = df.rename(columns={k: v for k, v in NSE_NEW_COL_MAP.items() if k in df.columns})
+
+        if "series" in df.columns:
+            df = df[df["series"].str.strip().isin(EQUITY_SERIES)].copy()
+
         for col in ["open","high","low","close","vwap","delivery_pct"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
+
         if "volume" in df.columns:
             df["volume"] = pd.to_numeric(df["volume"], errors="coerce").astype("Int64")
+
         if "turnover_lacs" in df.columns:
             df["turnover_cr"] = pd.to_numeric(df["turnover_lacs"], errors="coerce") / 100.0
+
         sym_map = get_symbol_to_isin()
         df["isin"]       = df["nse_symbol"].map(sym_map)
         df["trade_date"] = target_date
         df["source"]     = "NSE"
+
         df = df[df["isin"].notna() & (df["isin"].astype(str).str.len() == 12)].copy()
         return df if not df.empty else None
+
     except Exception as e:
-        logger.warning("NSE failed %s: %s", target_date, e)
+        logger.warning("NSE new fetch failed %s: %s", target_date, e)
         return None
+
+
+def fetch_nse(target_date: date) -> pd.DataFrame | None:
+    if target_date >= NSE_NEW_FORMAT_DATE:
+        return fetch_nse_new(target_date)
+    else:
+        return fetch_nse_old(target_date)
 
 
 def fetch_bse(target_date: date) -> pd.DataFrame | None:
@@ -242,13 +307,13 @@ def fetch_bse(target_date: date) -> pd.DataFrame | None:
 
 
 def run_backfill(start: date, end: date):
-    today        = datetime.now(IST).date()
-    neon_cutoff  = today - timedelta(days=NEON_WINDOW_DAYS)
-    total_days   = 0
-    total_nse    = 0
-    total_bse    = 0
+    today       = datetime.now(IST).date()
+    neon_cutoff = today - timedelta(days=NEON_WINDOW_DAYS)
+    total_days  = 0
+    total_nse   = 0
+    total_bse   = 0
 
-    logger.info("Backfill: %s to %s | Neon: last %d days only", start, end, NEON_WINDOW_DAYS)
+    logger.info("Backfill: %s to %s | Neon: last %d days", start, end, NEON_WINDOW_DAYS)
 
     current = start
     while current <= end:
@@ -257,20 +322,16 @@ def run_backfill(start: date, end: date):
             continue
 
         load_to_neon = current >= neon_cutoff
-
-        # Skip if already in R2
-        nse_exists = file_exists_in_r2("nse_bhavcopy", current)
-        bse_exists = file_exists_in_r2("bse_eod", current)
+        nse_exists   = file_exists_in_r2("nse_bhavcopy", current)
+        bse_exists   = file_exists_in_r2("bse_eod", current)
 
         if nse_exists and bse_exists and not load_to_neon:
-            logger.debug("Skip %s — already in R2", current)
             current += timedelta(days=1)
             total_days += 1
             continue
 
         logger.info("Processing %s (neon=%s)...", current, load_to_neon)
 
-        # NSE
         if not nse_exists:
             nse_df = fetch_nse(current)
             if nse_df is not None:
@@ -281,7 +342,6 @@ def run_backfill(start: date, end: date):
                     write_to_neon(nse_df, "NSE")
             time.sleep(0.5)
 
-        # BSE
         if not bse_exists:
             bse_df = fetch_bse(current)
             if bse_df is not None:
