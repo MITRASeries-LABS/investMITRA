@@ -1,5 +1,5 @@
-"""investMITRA — Phase 2: Feature Engineering v2
-Fixes nested window function error by computing daily_ret in a separate CTE.
+"""investMITRA — Phase 2: Feature Engineering v3
+Optimized: reads only relevant years from R2 (not all 13 years).
 """
 from __future__ import annotations
 import argparse, io, logging, os
@@ -32,9 +32,23 @@ def get_duckdb_con():
     return con
 
 
+def build_path(target_date: date) -> str:
+    """Build R2 path covering only the years needed for 450-day window."""
+    start_year = (target_date - timedelta(days=450)).year
+    end_year   = target_date.year
+    years      = list(range(start_year, end_year + 1))
+    if len(years) == 1:
+        return f"'s3://{BUCKET}/{ENV}/market_data/equity_prices/year={years[0]}/**/*.parquet'"
+    paths = ", ".join(
+        f"'s3://{BUCKET}/{ENV}/market_data/equity_prices/year={y}/**/*.parquet'"
+        for y in years
+    )
+    return f"[{paths}]"
+
+
 def compute_price_features(target_date: date) -> pd.DataFrame:
     con        = get_duckdb_con()
-    path       = f"s3://{BUCKET}/{ENV}/market_data/equity_prices/**/*.parquet"
+    path       = build_path(target_date)
     start_date = (target_date - timedelta(days=450)).isoformat()
     logger.info("Computing price features for %s...", target_date)
 
@@ -42,12 +56,12 @@ def compute_price_features(target_date: date) -> pd.DataFrame:
     WITH prices AS (
         SELECT
             isin,
-            trade_date::DATE    AS trade_date,
-            close::DOUBLE       AS close,
-            volume::BIGINT      AS volume,
-            turnover_cr::DOUBLE AS turnover_cr,
+            trade_date::DATE     AS trade_date,
+            close::DOUBLE        AS close,
+            volume::BIGINT       AS volume,
+            turnover_cr::DOUBLE  AS turnover_cr,
             delivery_pct::DOUBLE AS delivery_pct
-        FROM read_parquet('{path}', union_by_name=true, hive_partitioning=true)
+        FROM read_parquet({path}, union_by_name=true, hive_partitioning=true)
         WHERE trade_date >= '{start_date}'
           AND trade_date <= '{target_date}'
           AND isin IS NOT NULL
@@ -55,46 +69,32 @@ def compute_price_features(target_date: date) -> pd.DataFrame:
           AND close IS NOT NULL AND close > 0
     ),
 
-    -- Step 1: compute daily return as a simple column (no nesting)
     daily_ret AS (
-        SELECT
-            isin, trade_date, close, volume, turnover_cr, delivery_pct,
+        SELECT isin, trade_date, close, volume, turnover_cr, delivery_pct,
             (close - LAG(close,1) OVER w) / NULLIF(LAG(close,1) OVER w, 0) AS dr
         FROM prices
         WINDOW w AS (PARTITION BY isin ORDER BY trade_date)
     ),
 
-    -- Step 2: all other features using daily_ret.dr for volatility
     features AS (
         SELECT
             isin, trade_date, close, volume, turnover_cr, delivery_pct,
-
-            -- Returns
             (close - LAG(close,1)   OVER w) / NULLIF(LAG(close,1)   OVER w,0) AS ret_1d,
             (close - LAG(close,5)   OVER w) / NULLIF(LAG(close,5)   OVER w,0) AS ret_5d,
             (close - LAG(close,20)  OVER w) / NULLIF(LAG(close,20)  OVER w,0) AS ret_20d,
             (close - LAG(close,60)  OVER w) / NULLIF(LAG(close,60)  OVER w,0) AS ret_60d,
             (close - LAG(close,252) OVER w) / NULLIF(LAG(close,252) OVER w,0) AS ret_252d,
-
-            -- Moving averages
             AVG(close) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 19  PRECEDING AND CURRENT ROW) AS ma_20d,
             AVG(close) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 49  PRECEDING AND CURRENT ROW) AS ma_50d,
             AVG(close) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 199 PRECEDING AND CURRENT ROW) AS ma_200d,
-
-            -- Volatility — use pre-computed daily return (no nesting)
             STDDEV(dr) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 19  PRECEDING AND CURRENT ROW) * SQRT(252) AS vol_20d,
             STDDEV(dr) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 59  PRECEDING AND CURRENT ROW) * SQRT(252) AS vol_60d,
             STDDEV(dr) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) * SQRT(252) AS vol_252d,
-
-            -- Volume
             AVG(volume)       OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS avg_vol_20d,
             AVG(turnover_cr)  OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS avg_turnover_20d,
             AVG(delivery_pct) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS avg_delivery_pct_20d,
-
-            -- 52-week high/low
             MAX(close) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS high_52w,
             MIN(close) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS low_52w
-
         FROM daily_ret
         WINDOW w AS (PARTITION BY isin ORDER BY trade_date)
     )
@@ -154,7 +154,23 @@ def write_features_to_r2(df: pd.DataFrame, target_date: date) -> str:
     return path
 
 
+def feature_exists_in_r2(target_date: date) -> bool:
+    """Skip dates already computed."""
+    import boto3 as b3
+    s3 = b3.client("s3", endpoint_url=AWS_ENDPOINT,
+                   aws_access_key_id=AWS_KEY, aws_secret_access_key=AWS_SECRET,
+                   region_name="auto")
+    prefix = (f"{ENV}/features/price_features"
+              f"/year={target_date.year}/month={target_date.month:02d}"
+              f"/price_features_{target_date.strftime('%Y%m%d')}.parquet")
+    result = s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
+    return len(result.get("Contents", [])) > 0
+
+
 def run_for_date(target_date: date) -> dict:
+    if feature_exists_in_r2(target_date):
+        logger.info("  %s already computed — skipping", target_date)
+        return {"date": str(target_date), "status": "skipped"}
     df = compute_price_features(target_date)
     if df.empty: return {"date": str(target_date), "isins": 0, "status": "no_data"}
     path = write_features_to_r2(df, target_date)
