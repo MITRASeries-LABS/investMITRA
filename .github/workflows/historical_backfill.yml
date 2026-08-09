@@ -1,0 +1,50 @@
+name: Historical Backfill — NSE + BSE
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Start date (YYYY-MM-DD)"
+        required: true
+        default: "2014-01-01"
+      end_date:
+        description: "End date (YYYY-MM-DD)"
+        required: true
+        default: "2026-08-02"
+      batch_size:
+        description: "Days per batch"
+        required: false
+        default: "30"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # 6 hours per run
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-flow.txt duckdb
+
+      - name: Run historical backfill
+        env:
+          CC_ENV: prod
+          CC_DB_SCHEMA: investmitra
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          CC_BUCKET_RAW: cc-raw
+          CC_BUCKET_QUARANTINE: cc-quarantine
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          START_DATE: ${{ github.event.inputs.start_date }}
+          END_DATE: ${{ github.event.inputs.end_date }}
+          BATCH_SIZE: ${{ github.event.inputs.batch_size }}
+        run: python scripts/historical_backfill.py
