@@ -5,20 +5,21 @@ Computes price-based technical features using DuckDB directly on R2 Parquet file
 Features computed:
   Returns:    1d, 5d, 20d, 60d, 252d
   Volatility: rolling std 20d, 60d, 252d (annualised)
-  Momentum:   RSI-14, MACD signal, price vs 50d/200d MA
+  Momentum:   price vs 20d/50d/200d MA, MA crossover signal
   Volume:     20d avg volume ratio, delivery % 20d avg
   Liquidity:  turnover_cr 20d avg
+  Position:   52-week high/low position
 
 Output: Parquet files on R2
-  cc-raw/prod/features/price_features/year={Y}/month={M}/isin={ISIN}.parquet
+  cc-raw/prod/features/price_features/year={Y}/month={M}/price_features_{YYYYMMDD}.parquet
 
 PIT correctness:
-  All features computed using only data available on or before trade_date.
-  No look-ahead bias — rolling windows look backward only.
+  All features use only data available on or before trade_date.
+  No look-ahead bias.
 
 Run:
-  python scripts/compute_features.py --date 2026-08-07        # one date
-  python scripts/compute_features.py --start 2024-01-01       # from date to today
+  python scripts/compute_features.py --date 2026-08-07
+  python scripts/compute_features.py --start 2024-01-01 --end 2026-08-07
 """
 
 from __future__ import annotations
@@ -29,11 +30,11 @@ import logging
 import os
 from datetime import date, datetime, timedelta, timezone
 
+import boto3
 import duckdb
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-import boto3
 from dotenv import load_dotenv
 
 load_dotenv('.env.prod')
@@ -65,33 +66,35 @@ def get_duckdb_con() -> duckdb.DuckDBPyConnection:
 
 
 def compute_price_features(target_date: date) -> pd.DataFrame:
-    """
-    Compute price-based features for all ISINs as of target_date.
-    Uses DuckDB window functions on R2 Parquet — no data movement needed.
-    
-    Returns DataFrame with one row per ISIN.
-    """
+    """Compute price features for all ISINs as of target_date."""
     con = get_duckdb_con()
 
-    # Read all NSE price history from R2
-    # We need last 252 trading days to compute 252d features
-    # Load 15 months of data to be safe
-    start_year = (target_date - timedelta(days=450)).year
-    
-    # Build path pattern for multiple years
-    years = list(range(start_year, target_date.year + 1))
-    paths = " ".join([
-        f"'s3://{BUCKET}/{ENV}/market_data/equity_prices/year={y}/*/nse_bhavcopy_*.parquet'"
-        for y in years
-    ])
+    # Single glob path covering all years/months/days
+    path       = f"s3://{BUCKET}/{ENV}/market_data/equity_prices/**/*.parquet"
+    start_date = (target_date - timedelta(days=450)).isoformat()
 
-    logger.info("Computing price features for %s...", target_date)
+    logger.info("Computing price features for %s (data from %s)...", target_date, start_date)
 
-    # Main feature computation query using DuckDB window functions
-    # All windows look backward (ROWS BETWEEN N PRECEDING AND CURRENT ROW)
-    # PIT correct: filter to trade_date <= target_date
     query = f"""
     WITH prices AS (
+        SELECT
+            isin,
+            trade_date::DATE AS trade_date,
+            close::DOUBLE    AS close,
+            volume::BIGINT   AS volume,
+            turnover_cr::DOUBLE  AS turnover_cr,
+            delivery_pct::DOUBLE AS delivery_pct
+        FROM read_parquet('{path}', union_by_name=true, hive_partitioning=true)
+        WHERE
+            trade_date >= '{start_date}'
+            AND trade_date <= '{target_date}'
+            AND isin IS NOT NULL
+            AND LENGTH(CAST(isin AS VARCHAR)) = 12
+            AND close IS NOT NULL
+            AND close > 0
+    ),
+
+    features AS (
         SELECT
             isin,
             trade_date,
@@ -99,103 +102,71 @@ def compute_price_features(target_date: date) -> pd.DataFrame:
             volume,
             turnover_cr,
             delivery_pct,
-            vwap
-        FROM read_parquet([{paths}], union_by_name=true)
-        WHERE 
-            trade_date <= '{target_date}'
-            AND isin IS NOT NULL
-            AND LENGTH(CAST(isin AS VARCHAR)) = 12
-            AND close > 0
-        ORDER BY isin, trade_date
-    ),
 
-    -- Compute rolling features using window functions
-    features AS (
-        SELECT
-            isin,
-            trade_date,
-            close,
+            -- Returns
+            (close - LAG(close,1)   OVER w) / NULLIF(LAG(close,1)   OVER w, 0) AS ret_1d,
+            (close - LAG(close,5)   OVER w) / NULLIF(LAG(close,5)   OVER w, 0) AS ret_5d,
+            (close - LAG(close,20)  OVER w) / NULLIF(LAG(close,20)  OVER w, 0) AS ret_20d,
+            (close - LAG(close,60)  OVER w) / NULLIF(LAG(close,60)  OVER w, 0) AS ret_60d,
+            (close - LAG(close,252) OVER w) / NULLIF(LAG(close,252) OVER w, 0) AS ret_252d,
 
-            -- ── Returns ──────────────────────────────────────────────
-            (close - LAG(close, 1)  OVER w) / NULLIF(LAG(close, 1)  OVER w, 0) AS ret_1d,
-            (close - LAG(close, 5)  OVER w) / NULLIF(LAG(close, 5)  OVER w, 0) AS ret_5d,
-            (close - LAG(close, 20) OVER w) / NULLIF(LAG(close, 20) OVER w, 0) AS ret_20d,
-            (close - LAG(close, 60) OVER w) / NULLIF(LAG(close, 60) OVER w, 0) AS ret_60d,
-            (close - LAG(close, 252)OVER w) / NULLIF(LAG(close, 252)OVER w, 0) AS ret_252d,
-
-            -- ── Moving Averages ───────────────────────────────────────
-            AVG(close) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS ma_50d,
+            -- Moving averages
+            AVG(close) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 19  PRECEDING AND CURRENT ROW) AS ma_20d,
+            AVG(close) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 49  PRECEDING AND CURRENT ROW) AS ma_50d,
             AVG(close) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 199 PRECEDING AND CURRENT ROW) AS ma_200d,
-            AVG(close) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)  AS ma_20d,
 
-            -- ── Volatility (rolling std of daily returns, annualised) ─
-            STDDEV(
-                (close - LAG(close,1) OVER w) / NULLIF(LAG(close,1) OVER w, 0)
-            ) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)
-                * SQRT(252) AS vol_20d,
+            -- Volatility (annualised)
+            STDDEV((close - LAG(close,1) OVER w) / NULLIF(LAG(close,1) OVER w,0))
+                OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 19  PRECEDING AND CURRENT ROW) * SQRT(252) AS vol_20d,
+            STDDEV((close - LAG(close,1) OVER w) / NULLIF(LAG(close,1) OVER w,0))
+                OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 59  PRECEDING AND CURRENT ROW) * SQRT(252) AS vol_60d,
+            STDDEV((close - LAG(close,1) OVER w) / NULLIF(LAG(close,1) OVER w,0))
+                OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) * SQRT(252) AS vol_252d,
 
-            STDDEV(
-                (close - LAG(close,1) OVER w) / NULLIF(LAG(close,1) OVER w, 0)
-            ) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW)
-                * SQRT(252) AS vol_60d,
-
-            STDDEV(
-                (close - LAG(close,1) OVER w) / NULLIF(LAG(close,1) OVER w, 0)
-            ) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW)
-                * SQRT(252) AS vol_252d,
-
-            -- ── Volume features ───────────────────────────────────────
-            volume,
-            AVG(volume) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS avg_vol_20d,
-            AVG(turnover_cr) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS avg_turnover_20d,
+            -- Volume
+            AVG(volume)       OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS avg_vol_20d,
+            AVG(turnover_cr)  OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS avg_turnover_20d,
             AVG(delivery_pct) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS avg_delivery_pct_20d,
 
-            -- ── 52-week high/low ──────────────────────────────────────
+            -- 52-week high/low
             MAX(close) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS high_52w,
             MIN(close) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS low_52w
 
         FROM prices
         WINDOW w AS (PARTITION BY isin ORDER BY trade_date)
-    ),
-
-    -- Final features as of target_date only
-    latest AS (
-        SELECT
-            isin,
-            '{target_date}'::DATE AS feature_date,
-            close AS price,
-
-            -- Returns
-            ret_1d, ret_5d, ret_20d, ret_60d, ret_252d,
-
-            -- Price vs moving averages (momentum signals)
-            ROUND((close / NULLIF(ma_20d,  0) - 1) * 100, 4) AS price_vs_ma20,
-            ROUND((close / NULLIF(ma_50d,  0) - 1) * 100, 4) AS price_vs_ma50,
-            ROUND((close / NULLIF(ma_200d, 0) - 1) * 100, 4) AS price_vs_ma200,
-
-            -- MA crossover signal (golden/death cross)
-            CASE WHEN ma_50d > ma_200d THEN 1 ELSE -1 END AS ma_cross_signal,
-
-            -- Volatility
-            ROUND(vol_20d  * 100, 4) AS vol_20d_pct,
-            ROUND(vol_60d  * 100, 4) AS vol_60d_pct,
-            ROUND(vol_252d * 100, 4) AS vol_252d_pct,
-
-            -- Volume
-            ROUND(volume / NULLIF(avg_vol_20d, 0), 4) AS vol_ratio_20d,
-            ROUND(avg_turnover_20d, 4)   AS avg_turnover_cr_20d,
-            ROUND(avg_delivery_pct_20d, 4) AS avg_delivery_pct_20d,
-
-            -- 52-week position (0=at low, 1=at high)
-            ROUND((close - low_52w) / NULLIF(high_52w - low_52w, 0), 4) AS pos_52w,
-            ROUND(high_52w, 2) AS high_52w,
-            ROUND(low_52w,  2) AS low_52w
-
-        FROM features
-        WHERE trade_date = '{target_date}'
     )
 
-    SELECT * FROM latest
+    SELECT
+        isin,
+        '{target_date}'::DATE AS feature_date,
+        close                 AS price,
+
+        ROUND(ret_1d   * 100, 4) AS ret_1d_pct,
+        ROUND(ret_5d   * 100, 4) AS ret_5d_pct,
+        ROUND(ret_20d  * 100, 4) AS ret_20d_pct,
+        ROUND(ret_60d  * 100, 4) AS ret_60d_pct,
+        ROUND(ret_252d * 100, 4) AS ret_252d_pct,
+
+        ROUND((close / NULLIF(ma_20d,  0) - 1) * 100, 4) AS price_vs_ma20,
+        ROUND((close / NULLIF(ma_50d,  0) - 1) * 100, 4) AS price_vs_ma50,
+        ROUND((close / NULLIF(ma_200d, 0) - 1) * 100, 4) AS price_vs_ma200,
+
+        CASE WHEN ma_50d > ma_200d THEN 1 ELSE -1 END AS ma_cross_signal,
+
+        ROUND(vol_20d  * 100, 4) AS vol_20d_pct,
+        ROUND(vol_60d  * 100, 4) AS vol_60d_pct,
+        ROUND(vol_252d * 100, 4) AS vol_252d_pct,
+
+        ROUND(volume / NULLIF(avg_vol_20d, 0), 4)  AS vol_ratio_20d,
+        ROUND(avg_turnover_20d, 4)                  AS avg_turnover_cr_20d,
+        ROUND(avg_delivery_pct_20d, 4)              AS avg_delivery_pct_20d,
+
+        ROUND((close - low_52w) / NULLIF(high_52w - low_52w, 0), 4) AS pos_52w,
+        ROUND(high_52w, 2) AS high_52w,
+        ROUND(low_52w,  2) AS low_52w
+
+    FROM features
+    WHERE trade_date = '{target_date}'
     ORDER BY isin
     """
 
@@ -211,7 +182,6 @@ def compute_price_features(target_date: date) -> pd.DataFrame:
 
 
 def write_features_to_r2(df: pd.DataFrame, target_date: date) -> str:
-    """Write feature DataFrame to R2 as Parquet."""
     if df.empty:
         return ""
 
@@ -234,28 +204,20 @@ def write_features_to_r2(df: pd.DataFrame, target_date: date) -> str:
     s3.put_object(Bucket=BUCKET, Key=key, Body=buf.read())
 
     path = f"s3://{BUCKET}/{key}"
-    logger.info("  Written features → %s", path)
+    logger.info("  Written → %s (%d rows)", path, len(df))
     return path
 
 
 def run_for_date(target_date: date) -> dict:
-    """Compute and store features for a single date."""
-    df   = compute_price_features(target_date)
+    df = compute_price_features(target_date)
     if df.empty:
         return {"date": str(target_date), "isins": 0, "status": "no_data"}
-
     path = write_features_to_r2(df, target_date)
-    return {
-        "date":   str(target_date),
-        "isins":  len(df),
-        "cols":   len(df.columns),
-        "path":   path,
-        "status": "ok",
-    }
+    return {"date": str(target_date), "isins": len(df), "cols": len(df.columns),
+            "path": path, "status": "ok"}
 
 
 def run_date_range(start: date, end: date):
-    """Compute features for all trading days in range."""
     current = start
     total   = 0
     while current <= end:
@@ -275,16 +237,11 @@ def main():
     args = parser.parse_args()
 
     if args.date:
-        result = run_for_date(args.date)
-        print(result)
+        print(run_for_date(args.date))
     elif args.start:
-        end = args.end or datetime.now(IST).date()
-        run_date_range(args.start, end)
+        run_date_range(args.start, args.end or datetime.now(IST).date())
     else:
-        # Default: compute for today
-        target = datetime.now(IST).date()
-        result = run_for_date(target)
-        print(result)
+        print(run_for_date(datetime.now(IST).date()))
 
 
 if __name__ == "__main__":
