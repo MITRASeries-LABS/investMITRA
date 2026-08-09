@@ -80,7 +80,7 @@ def compute_price_features(target_date: date) -> pd.DataFrame:
     
     # Build path pattern for multiple years
     years = list(range(start_year, target_date.year + 1))
-    paths = " ".join([
+    paths = ", ".join([
         f"'s3://{BUCKET}/{ENV}/market_data/equity_prices/year={y}/*/nse_bhavcopy_*.parquet'"
         for y in years
     ])
