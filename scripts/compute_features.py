@@ -33,8 +33,7 @@ def get_duckdb_con():
 
 
 def build_path(target_date: date) -> str:
-    """Build R2 path covering only the years needed for 450-day window."""
-    start_year = (target_date - timedelta(days=450)).year
+    start_year = max((target_date - timedelta(days=450)).year, 2014)  # R2 starts 2014
     end_year   = target_date.year
     years      = list(range(start_year, end_year + 1))
     if len(years) == 1:
