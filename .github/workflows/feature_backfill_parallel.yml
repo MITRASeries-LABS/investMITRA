@@ -1,0 +1,42 @@
+name: Feature Backfill — Parallel by Year
+
+on:
+  workflow_dispatch:
+    inputs:
+      years:
+        description: "Years to process (comma-separated, e.g. 2014,2015,2016)"
+        required: false
+        default: "2014,2015,2016,2017,2018,2019,2020,2021,2022,2023,2024,2025"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      matrix:
+        year: [2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+      fail-fast: false   # continue other years even if one fails
+      max-parallel: 6    # run 6 years at a time
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-flow.txt duckdb pyarrow boto3
+
+      - name: Compute features for ${{ matrix.year }}
+        env:
+          CC_ENV: prod
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CC_BUCKET_RAW: cc-raw
+        run: |
+          python scripts/compute_features.py \
+            --start ${{ matrix.year }}-01-01 \
+            --end ${{ matrix.year }}-12-31
