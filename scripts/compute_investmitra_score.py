@@ -46,18 +46,22 @@ def get_duckdb_con():
     return con
 
 
-def load_score(con: duckdb.DuckDBPyConnection, score_type: str, score_date: date) -> pd.DataFrame | None:
-    """Load a score parquet file from R2."""
-    path = (f"s3://{BUCKET}/{ENV}/scores/{score_type}"
-            f"/year={score_date.year}/month={score_date.month:02d}"
-            f"/{score_type}_{score_date.strftime('%Y%m%d')}.parquet")
-    try:
-        df = con.execute(f"SELECT * FROM read_parquet('{path}')").df()
-        logger.info("Loaded %s: %d rows", score_type, len(df))
-        return df
-    except Exception as e:
-        logger.warning("Could not load %s for %s: %s", score_type, score_date, e)
-        return None
+def load_score(con, score_type: str, score_date: date) -> pd.DataFrame | None:
+    """Load most recent score file on or before score_date."""
+    # Try exact date first, then look back up to 7 days
+    for days_back in range(8):
+        check_date = score_date - timedelta(days=days_back)
+        path = (f"s3://{BUCKET}/{ENV}/scores/{score_type}"
+                f"/year={check_date.year}/month={check_date.month:02d}"
+                f"/{score_type}_{check_date.strftime('%Y%m%d')}.parquet")
+        try:
+            df = con.execute(f"SELECT * FROM read_parquet('{path}')").df()
+            logger.info("Loaded %s from %s: %d rows", score_type, check_date, len(df))
+            return df
+        except:
+            continue
+    logger.warning("Could not find %s within 7 days of %s", score_type, score_date)
+    return None
 
 
 def compute_investmitra_score(score_date: date) -> pd.DataFrame:
