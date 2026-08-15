@@ -1,0 +1,47 @@
+name: Score Backfill — Parallel by Year
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_year:
+        description: "Start year"
+        required: false
+        default: "2024"
+      end_year:
+        description: "End year"
+        required: false
+        default: "2026"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      matrix:
+        year: [2024, 2025, 2026]
+      fail-fast: false
+      max-parallel: 3
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-flow.txt duckdb pyarrow boto3 numpy yfinance psycopg2-binary
+
+      - name: Backfill scores for ${{ matrix.year }}
+        env:
+          CC_ENV: prod
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CC_BUCKET_RAW: cc-raw
+        run: |
+          python scripts/backfill_scores.py \
+            --start ${{ matrix.year }}-01-01 \
+            --end ${{ matrix.year }}-12-31
