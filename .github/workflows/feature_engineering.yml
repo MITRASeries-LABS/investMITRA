@@ -33,7 +33,7 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements-flow.txt duckdb pyarrow boto3
+        run: pip install -r requirements-flow.txt duckdb pyarrow boto3 numpy
 
       - name: Compute price features
         env:
@@ -49,4 +49,21 @@ jobs:
             python scripts/compute_features.py --date ${{ github.event.inputs.date }}
           else
             python scripts/compute_features.py
+          fi
+
+      - name: Compute momentum scores
+        env:
+          CC_ENV: prod
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CC_BUCKET_RAW: cc-raw
+        run: |
+          if [ -n "${{ github.event.inputs.start }}" ]; then
+            python scripts/compute_momentum_score.py --start ${{ github.event.inputs.start }} --end ${{ github.event.inputs.end || '' }}
+          elif [ -n "${{ github.event.inputs.date }}" ]; then
+            python scripts/compute_momentum_score.py --date ${{ github.event.inputs.date }}
+          else
+            python scripts/compute_momentum_score.py
           fi
