@@ -1,7 +1,7 @@
 """
-investMITRA — Load Scores to Neon
+investMITRA — Load Scores to Neon v2
 Loads composite investMITRA scores from R2 into Neon daily_scores table.
-Runs automatically after score computation in feature_engineering workflow.
+Includes company name enrichment from company_master.
 
 Run:
   python scripts/load_scores_to_neon.py              # today
@@ -40,6 +40,43 @@ def get_duckdb_con():
         SET s3_url_style         = 'path';
     """)
     return con
+
+
+def ensure_table():
+    """Create daily_scores table if not exists, add company_name if missing."""
+    conn = psycopg2.connect(NEON_URL, connect_timeout=15)
+    conn.autocommit = True
+    cur  = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS investmitra.daily_scores (
+            isin                     VARCHAR(12),
+            score_date               DATE,
+            company_name             VARCHAR(200),
+            sector                   VARCHAR(100),
+            price                    DECIMAL(15,2),
+            investmitra_score        DECIMAL(6,2),
+            signal                   VARCHAR(20),
+            momentum_score           DECIMAL(6,2),
+            financial_health_score   DECIMAL(6,2),
+            management_quality_score DECIMAL(6,2),
+            financial_stress_score   DECIMAL(6,2),
+            ret_252d_pct             DECIMAL(10,4),
+            vol_20d_pct              DECIMAL(10,4),
+            pos_52w                  DECIMAL(6,4),
+            debt_equity              DECIMAL(10,4),
+            pat_margin               DECIMAL(10,4),
+            insider_pct              DECIMAL(6,2),
+            institution_pct          DECIMAL(6,2),
+            ingested_at              TIMESTAMPTZ DEFAULT NOW(),
+            PRIMARY KEY (isin, score_date)
+        )
+    """)
+    # Add company_name column if it doesn't exist (for older tables)
+    cur.execute("""
+        ALTER TABLE investmitra.daily_scores
+        ADD COLUMN IF NOT EXISTS company_name VARCHAR(200)
+    """)
+    cur.close(); conn.close()
 
 
 def load_for_date(target_date: date) -> int:
@@ -107,14 +144,33 @@ def load_for_date(target_date: date) -> int:
 
     conn.commit(); cur.close(); conn.close()
     logger.info("Written %d scores to Neon for %s", len(rows), target_date)
+
+    # Enrich with company names from company_master
+    conn2 = psycopg2.connect(NEON_URL, connect_timeout=15)
+    conn2.autocommit = True
+    cur2  = conn2.cursor()
+    cur2.execute("""
+        UPDATE investmitra.daily_scores ds
+        SET company_name = cm.company_name
+        FROM investmitra.company_master cm
+        WHERE ds.isin = cm.isin
+          AND ds.score_date = %s
+          AND ds.company_name IS NULL
+    """, (target_date,))
+    enriched = cur2.rowcount
+    cur2.close(); conn2.close()
+    logger.info("Enriched %d rows with company names", enriched)
+
     return len(rows)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", type=date.fromisoformat)
-    args   = parser.parse_args()
-    target = args.date or datetime.now(IST).date()
+    args    = parser.parse_args()
+    target  = args.date or datetime.now(IST).date()
+
+    ensure_table()
     written = load_for_date(target)
     print(f"Loaded {written} scores for {target}")
 
