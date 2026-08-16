@@ -112,3 +112,19 @@ jobs:
           else
             python scripts/compute_investmitra_score.py
           fi
+      
+      - name: Load scores to Neon
+        env:
+          CC_ENV: prod
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CC_BUCKET_RAW: cc-raw
+        run: |
+          pip install duckdb --quiet
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            python scripts/load_scores_to_neon.py --date ${{ github.event.inputs.date }}
+          else
+            python scripts/load_scores_to_neon.py
+          fi
