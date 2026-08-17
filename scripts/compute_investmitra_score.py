@@ -110,9 +110,9 @@ def compute_investmitra_score(score_date: date) -> pd.DataFrame:
 
     # Weighted composite score
     df["investmitra_score"] = (
-        df["momentum_score"]           * 0.20 +
-        df["financial_health_score"]   * 0.30 +
-        df["management_quality_score"] * 0.50
+        df["momentum_score"]           * 0.30 +
+        df["financial_health_score"]   * 0.40 +
+        df["management_quality_score"] * 0.30
     ).round(2)
 
     # Add signal labels
