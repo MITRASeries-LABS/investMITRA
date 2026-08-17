@@ -81,6 +81,7 @@ def compute_early_signals(target_date: date) -> pd.DataFrame:
           AND close > 0
           AND volume > 0
           AND isin LIKE 'INE%'
+          AND SUBSTRING(CAST(isin AS VARCHAR), 9, 2) NOT IN ('07','08','09')
     ),
 
     with_ret AS (
