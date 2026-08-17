@@ -96,8 +96,12 @@ def get_top_strong_buys(score_date: date, top_n: int = 10) -> list[dict]:
 def run_trading_agents(symbol: str, analysis_date: str) -> dict:
     """Run TradingAgents on a single stock and return decision."""
     try:
+        # Load both env files explicitly
+        load_dotenv('.env.prod', override=True)
+        load_dotenv(f"{TA_PATH}/.env", override=True)
         sys.path.insert(0, TA_PATH)
-        os.environ["INVESTMITRA_NEON_URL"] = NEON_URL
+        neon = os.getenv("CC_POSTGRES_URL", NEON_URL)
+        os.environ["INVESTMITRA_NEON_URL"] = neon
 
         from tradingagents.graph.trading_graph import TradingAgentsGraph
         from tradingagents.default_config import DEFAULT_CONFIG
