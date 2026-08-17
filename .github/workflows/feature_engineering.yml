@@ -142,3 +142,6 @@ jobs:
           else
             python scripts/compute_early_signals.py
           fi
+      
+      - name: Fetch Screener signals
+        run: pip install beautifulsoup4 --quiet && python scripts/fetch_screener_signals.py
