@@ -33,7 +33,7 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements-flow.txt duckdb pyarrow boto3 numpy
+        run: pip install -r requirements-flow.txt duckdb pyarrow boto3 numpy yfinance psycopg2-binary
 
       - name: Compute price features
         env:
