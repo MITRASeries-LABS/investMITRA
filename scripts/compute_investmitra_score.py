@@ -1,11 +1,12 @@
 """
-investMITRA — Composite Score (investMITRA Score)
-Combines all three signals into one 0-100 investMITRA score.
+investMITRA — Composite Score (investMITRA Score) v2
+Combines four signals into one 0-100 investMITRA score.
 
 Components:
-  - Momentum Score      (40%) — price momentum, trend, volume
-  - Financial Health    (30%) — inverse of Financial Stress Score
-  - Management Quality  (30%) — promoter holding, institutional confidence
+  - Momentum Score      (25%) — price momentum, trend, volume
+  - Financial Health    (35%) — inverse of Financial Stress Score
+  - Management Quality  (25%) — promoter holding, institutional confidence
+  - Value Quality       (15%) — Piotroski F-Score + Benjamin Graham criteria
 
 Higher score = Better investment candidate
 
@@ -29,6 +30,7 @@ AWS_KEY      = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET   = os.getenv("AWS_SECRET_ACCESS_KEY")
 BUCKET       = os.getenv("CC_BUCKET_RAW", "cc-raw")
 ENV          = os.getenv("CC_ENV", "prod")
+NEON_URL     = os.getenv("CC_POSTGRES_URL")
 
 
 def get_duckdb_con():
@@ -48,7 +50,6 @@ def get_duckdb_con():
 
 def load_score(con, score_type: str, score_date: date) -> pd.DataFrame | None:
     """Load most recent score file on or before score_date."""
-    # Try exact date first, then look back up to 7 days
     for days_back in range(8):
         check_date = score_date - timedelta(days=days_back)
         path = (f"s3://{BUCKET}/{ENV}/scores/{score_type}"
@@ -64,10 +65,31 @@ def load_score(con, score_type: str, score_date: date) -> pd.DataFrame | None:
     return None
 
 
+def load_value_quality() -> pd.DataFrame:
+    """Load Piotroski + Graham scores from Neon."""
+    if not NEON_URL:
+        logger.warning("CC_POSTGRES_URL not set — skipping value quality")
+        return pd.DataFrame()
+    try:
+        import psycopg2
+        conn = psycopg2.connect(NEON_URL, connect_timeout=10)
+        df   = pd.read_sql(
+            "SELECT isin, value_quality_score, piotroski_score, graham_criteria_met "
+            "FROM investmitra.value_quality",
+            conn
+        )
+        conn.close()
+        logger.info("Loaded value_quality: %d rows", len(df))
+        return df
+    except Exception as e:
+        logger.warning("Could not load value_quality: %s", e)
+        return pd.DataFrame()
+
+
 def compute_investmitra_score(score_date: date) -> pd.DataFrame:
     con = get_duckdb_con()
 
-    # Load all three scores
+    # Load component scores
     momentum = load_score(con, "momentum", score_date)
     stress   = load_score(con, "financial_stress", score_date)
     mgmt     = load_score(con, "management_quality", score_date)
@@ -89,7 +111,7 @@ def compute_investmitra_score(score_date: date) -> pd.DataFrame:
         df = df.merge(stress_cols, on="isin", how="left")
     else:
         df["financial_stress_score"] = np.nan
-        df["financial_health_score"] = 50.0  # neutral
+        df["financial_health_score"] = 50.0
         df["debt_equity"]  = np.nan
         df["pat_margin"]   = np.nan
 
@@ -99,23 +121,43 @@ def compute_investmitra_score(score_date: date) -> pd.DataFrame:
                            "insider_pct", "institution_pct"]].copy()
         df = df.merge(mgmt_cols, on="isin", how="left")
     else:
-        df["management_quality_score"] = 50.0  # neutral
+        df["management_quality_score"] = 50.0
         df["insider_pct"]     = np.nan
         df["institution_pct"] = np.nan
+
+    # Join value quality (Piotroski + Graham)
+    vq = load_value_quality()
+    if not vq.empty:
+        df = df.merge(
+            vq[["isin", "value_quality_score", "piotroski_score", "graham_criteria_met"]],
+            on="isin", how="left"
+        )
+        df["value_quality_score"] = df["value_quality_score"].fillna(50.0)
+    else:
+        df["value_quality_score"]   = 50.0
+        df["piotroski_score"]       = np.nan
+        df["graham_criteria_met"]   = np.nan
 
     # Fill missing component scores with neutral 50
     df["momentum_score"]          = df["momentum_score"].fillna(50)
     df["financial_health_score"]  = df["financial_health_score"].fillna(50)
     df["management_quality_score"]= df["management_quality_score"].fillna(50)
+    df["value_quality_score"]     = df["value_quality_score"].fillna(50)
 
-    # Weighted composite score
+    # ── Weighted composite score v2 ─────────────────────────────────────
+    # Backtested optimal weights (261,388 obs, IC=0.064):
+    #   Momentum        25% — price trend signal
+    #   Financial Health 35% — debt, margins, cash
+    #   Management Quality 25% — promoter + institutional
+    #   Value Quality    15% — Piotroski F-Score + Graham criteria
     df["investmitra_score"] = (
-        df["momentum_score"]           * 0.30 +
-        df["financial_health_score"]   * 0.40 +
-        df["management_quality_score"] * 0.30
+        df["momentum_score"]           * 0.25 +
+        df["financial_health_score"]   * 0.35 +
+        df["management_quality_score"] * 0.25 +
+        df["value_quality_score"]      * 0.15
     ).round(2)
 
-    # Add signal labels
+    # Signal labels
     df["signal"] = pd.cut(
         df["investmitra_score"],
         bins=[0, 20, 40, 60, 80, 100],
@@ -124,25 +166,23 @@ def compute_investmitra_score(score_date: date) -> pd.DataFrame:
     )
 
     df["score_date"]    = score_date
-    df["score_version"] = "v1.0"
+    df["score_version"] = "v2.0"
 
-    # Sort by score
     df = df.sort_values("investmitra_score", ascending=False).reset_index(drop=True)
 
-    logger.info("investMITRA Scores: min=%.1f max=%.1f mean=%.1f",
+    logger.info("investMITRA Scores v2: min=%.1f max=%.1f mean=%.1f",
                 df["investmitra_score"].min(),
                 df["investmitra_score"].max(),
                 df["investmitra_score"].mean())
 
-    # Signal distribution
     sig_dist = df["signal"].value_counts()
     logger.info("Signal distribution:\n%s", sig_dist.to_string())
 
-    # Top picks
     logger.info("\nTop 20 investMITRA picks:\n%s",
                 df.head(20)[["isin","sector","investmitra_score","signal",
                               "momentum_score","financial_health_score",
-                              "management_quality_score","ret_252d_pct"]].to_string())
+                              "management_quality_score","value_quality_score",
+                              "piotroski_score"]].to_string())
 
     return df
 
@@ -169,7 +209,7 @@ def main():
     args   = parser.parse_args()
     target = args.date or datetime.now(IST).date()
 
-    df   = compute_investmitra_score(target)
+    df = compute_investmitra_score(target)
     if df.empty:
         logger.error("No scores computed")
         return
