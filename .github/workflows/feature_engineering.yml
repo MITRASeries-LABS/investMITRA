@@ -198,3 +198,8 @@ jobs:
         env:
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
         run: python scripts/fetch_nse_announcements.py
+
+      - name: Fetch SEBI RSS
+        env:
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+        run: python scripts/fetch_sebi_rss.py
