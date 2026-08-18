@@ -33,7 +33,7 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements-flow.txt duckdb pyarrow boto3 numpy yfinance psycopg2-binary
+        run: pip install -r requirements-flow.txt duckdb pyarrow boto3 numpy yfinance psycopg2-binary beautifulsoup4 requests
 
       - name: Compute price features
         env:
@@ -112,7 +112,7 @@ jobs:
           else
             python scripts/compute_investmitra_score.py
           fi
-      
+
       - name: Load scores to Neon
         env:
           CC_ENV: prod
@@ -122,7 +122,6 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           CC_BUCKET_RAW: cc-raw
         run: |
-          pip install duckdb --quiet
           if [ -n "${{ github.event.inputs.date }}" ]; then
             python scripts/load_scores_to_neon.py --date ${{ github.event.inputs.date }}
           else
@@ -142,60 +141,17 @@ jobs:
           else
             python scripts/compute_early_signals.py
           fi
-      
+
       - name: Fetch Screener signals
         env:
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
-        run: pip install beautifulsoup4 --quiet && python scripts/fetch_screener_signals.py
-    
-      - name: Compute daily top picks
-        env:
-          CC_ENV: prod
-          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
-          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          CC_BUCKET_RAW: cc-raw
-          TRADING_AGENTS_PATH: /home/runner/work/investMITRA/TradingAgents
-        run: |
-          if [ -n "${{ github.event.inputs.date }}" ]; then
-            python scripts/daily_top_picks.py --date ${{ github.event.inputs.date }} --top 10 --cap ALL --no-ta
-            python scripts/daily_top_picks.py --date ${{ github.event.inputs.date }} --top 10 --cap SMALLMICRO --no-ta
-          else
-            python scripts/daily_top_picks.py --top 10 --cap ALL --no-ta
-            python scripts/daily_top_picks.py --top 10 --cap SMALLMICRO --no-ta
-          fi
-        
-      - name: Fetch corporate events
-        env:
-          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
-        run: python scripts/fetch_corporate_events.py
-      
-      - name: Fetch Screener signals
-        run: pip install beautifulsoup4 --quiet && python scripts/fetch_screener_signals.py
+        run: python scripts/fetch_screener_signals.py
 
       - name: Fetch corporate events
         env:
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
         run: python scripts/fetch_corporate_events.py
 
-      - name: Compute daily top picks
-        env:
-          CC_ENV: prod
-          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
-          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          CC_BUCKET_RAW: cc-raw
-        run: |
-          if [ -n "${{ github.event.inputs.date }}" ]; then
-            python scripts/daily_top_picks.py --date ${{ github.event.inputs.date }} --top 10 --cap ALL --no-ta
-            python scripts/daily_top_picks.py --date ${{ github.event.inputs.date }} --top 10 --cap SMALLMICRO --no-ta
-          else
-            python scripts/daily_top_picks.py --top 10 --cap ALL --no-ta
-            python scripts/daily_top_picks.py --top 10 --cap SMALLMICRO --no-ta
-          fi
-      
       - name: Fetch NSE announcements
         env:
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
@@ -205,3 +161,20 @@ jobs:
         env:
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
         run: python scripts/fetch_sebi_rss.py
+
+      - name: Compute daily top picks
+        env:
+          CC_ENV: prod
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CC_BUCKET_RAW: cc-raw
+        run: |
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            python scripts/daily_top_picks.py --date ${{ github.event.inputs.date }} --top 10 --cap ALL --no-ta
+            python scripts/daily_top_picks.py --date ${{ github.event.inputs.date }} --top 10 --cap SMALLMICRO --no-ta
+          else
+            python scripts/daily_top_picks.py --top 10 --cap ALL --no-ta
+            python scripts/daily_top_picks.py --top 10 --cap SMALLMICRO --no-ta
+          fi
