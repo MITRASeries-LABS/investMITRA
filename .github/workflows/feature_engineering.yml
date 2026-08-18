@@ -144,6 +144,8 @@ jobs:
           fi
       
       - name: Fetch Screener signals
+        env:
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
         run: pip install beautifulsoup4 --quiet && python scripts/fetch_screener_signals.py
     
       - name: Compute daily top picks
