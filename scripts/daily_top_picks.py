@@ -1,16 +1,12 @@
 """
-investMITRA — Daily Top Picks v2
+investMITRA — Daily Top Picks v3
 Triple confirmation: investMITRA score + Screener signals + TradingAgents
-
-Flow:
-  1. Get top Strong Buy stocks from daily_scores
-  2. Cross-reference with Screener signals (must appear in 2+ screens)
-  3. Run TradingAgents on shortlist
-  4. Final picks = all three agree
+Now with market cap filter to focus on small/micro caps.
 
 Run:
-  python scripts/daily_top_picks.py --date 2026-08-18 --top 5
-  python scripts/daily_top_picks.py --date 2026-08-18 --top 5 --no-ta
+  python scripts/daily_top_picks.py --date 2026-08-18 --top 10 --cap SMALL --no-ta
+  python scripts/daily_top_picks.py --date 2026-08-18 --top 5 --cap MICRO
+  python scripts/daily_top_picks.py --date 2026-08-18 --top 10 --cap ALL --no-ta
 """
 from __future__ import annotations
 import argparse, logging, os, sys
@@ -27,6 +23,15 @@ NEON_URL = os.getenv("CC_POSTGRES_URL")
 IST      = timezone(timedelta(hours=5, minutes=30))
 TA_PATH  = os.getenv("TRADING_AGENTS_PATH", "C:/MITRAseries/TradingAgents")
 
+CAP_CATEGORIES = {
+    "MICRO":      ["MICRO"],
+    "SMALL":      ["SMALL"],
+    "MID":        ["MID"],
+    "LARGE":      ["LARGE"],
+    "SMALLMICRO": ["SMALL", "MICRO"],
+    "ALL":        ["MICRO", "SMALL", "MID", "LARGE"],
+}
+
 
 def ensure_tables():
     conn = psycopg2.connect(NEON_URL, connect_timeout=15)
@@ -41,6 +46,7 @@ def ensure_tables():
             company_name             VARCHAR(200),
             nse_symbol               VARCHAR(20),
             sector                   VARCHAR(100),
+            market_cap_category      VARCHAR(20),
             price                    DECIMAL(15,2),
             investmitra_score        DECIMAL(6,2),
             signal                   VARCHAR(20),
@@ -54,22 +60,23 @@ def ensure_tables():
             ta_time_horizon          VARCHAR(50),
             both_agree               BOOLEAN DEFAULT FALSE,
             triple_confirm           BOOLEAN DEFAULT FALSE,
+            cap_filter               VARCHAR(20) DEFAULT 'ALL',
             ingested_at              TIMESTAMPTZ DEFAULT NOW(),
-            UNIQUE (pick_date, rank)
+            UNIQUE (pick_date, rank, cap_filter)
         )
     """)
     cur.close(); conn.close()
 
 
-def get_top_candidates(score_date: date, top_n: int = 10) -> list[dict]:
-    """
-    Get top candidates ranked by combined investMITRA score + Screener signal count.
-    Requires: Strong/Buy signal + NSE symbol + all 3 score components populated.
-    """
+def get_top_candidates(score_date: date, top_n: int, cap_filter: str) -> list[dict]:
+    caps = CAP_CATEGORIES.get(cap_filter, ["MICRO", "SMALL", "MID", "LARGE"])
+    cap_placeholders = ",".join(["%s"] * len(caps))
+
     conn = psycopg2.connect(NEON_URL, connect_timeout=15)
     cur  = conn.cursor()
-    cur.execute("""
+    cur.execute(f"""
         SELECT ds.isin, ds.company_name, cm.nse_symbol, ds.sector,
+               cm.market_cap_category,
                ds.price, ds.investmitra_score, ds.signal,
                ds.momentum_score, ds.financial_health_score,
                ds.management_quality_score, ds.ret_252d_pct,
@@ -88,13 +95,14 @@ def get_top_candidates(score_date: date, top_n: int = 10) -> list[dict]:
         WHERE ds.score_date = %s
           AND ds.signal IN ('Strong Buy', 'Buy')
           AND cm.nse_symbol IS NOT NULL
+          AND cm.market_cap_category IN ({cap_placeholders})
           AND ds.financial_health_score IS NOT NULL
           AND ds.financial_health_score != 50.0
           AND ds.management_quality_score IS NOT NULL
           AND ds.management_quality_score != 50.0
         ORDER BY (ds.investmitra_score * 0.6 + COALESCE(ss.screen_count, 0) * 2.0) DESC
         LIMIT %s
-    """, (score_date, top_n))
+    """, [score_date] + caps + [top_n])
 
     rows = cur.fetchall()
     cur.close(); conn.close()
@@ -104,25 +112,24 @@ def get_top_candidates(score_date: date, top_n: int = 10) -> list[dict]:
         "company_name":            r[1],
         "nse_symbol":              r[2],
         "sector":                  r[3],
-        "price":                   r[4],
-        "investmitra_score":       r[5],
-        "signal":                  r[6],
-        "momentum_score":          r[7],
-        "financial_health_score":  r[8],
-        "management_quality_score":r[9],
-        "ret_252d_pct":            r[10],
-        "screen_count":            r[11],
-        "screens_list":            r[12],
+        "market_cap_category":     r[4],
+        "price":                   r[5],
+        "investmitra_score":       r[6],
+        "signal":                  r[7],
+        "momentum_score":          r[8],
+        "financial_health_score":  r[9],
+        "management_quality_score":r[10],
+        "ret_252d_pct":            r[11],
+        "screen_count":            r[12],
+        "screens_list":            r[13],
     } for r in rows]
 
 
 def run_trading_agents(symbol: str, analysis_date: str) -> dict:
-    """Run TradingAgents on a single stock."""
     try:
         load_dotenv(f"{TA_PATH}/.env", override=True)
         sys.path.insert(0, TA_PATH)
-        neon = os.getenv("CC_POSTGRES_URL", NEON_URL)
-        os.environ["INVESTMITRA_NEON_URL"] = neon
+        os.environ["INVESTMITRA_NEON_URL"] = os.getenv("CC_POSTGRES_URL", NEON_URL)
 
         from tradingagents.graph.trading_graph import TradingAgentsGraph
         from tradingagents.default_config import DEFAULT_CONFIG
@@ -167,7 +174,7 @@ def run_trading_agents(symbol: str, analysis_date: str) -> dict:
         return {"decision": "Error", "thesis": str(e)[:200]}
 
 
-def save_top_picks(picks: list[dict], score_date: date):
+def save_top_picks(picks: list[dict], score_date: date, cap_filter: str):
     conn = psycopg2.connect(NEON_URL, connect_timeout=15)
     conn.autocommit = False
     cur  = conn.cursor()
@@ -175,28 +182,30 @@ def save_top_picks(picks: list[dict], score_date: date):
     rows = [
         (score_date, i + 1,
          p["isin"], p["company_name"], p.get("nse_symbol"),
-         p["sector"], float(p["price"] or 0),
+         p["sector"], p.get("market_cap_category"),
+         float(p["price"] or 0),
          float(p["investmitra_score"] or 0), p["signal"],
          float(p["momentum_score"] or 0),
          float(p["financial_health_score"] or 0),
          float(p["management_quality_score"] or 0),
          int(p.get("screen_count", 0)),
          p.get("screens_list", ""),
-         p.get("ta_decision"), p.get("ta_thesis"), p.get("ta_horizon"),
+         p.get("ta_decision"), p.get("ta_thesis"), "",
          p.get("both_agree", False),
-         p.get("triple_confirm", False))
+         p.get("triple_confirm", False),
+         cap_filter)
         for i, p in enumerate(picks)
     ]
 
     execute_values(cur, """
         INSERT INTO investmitra.top_picks
-            (pick_date, rank, isin, company_name, nse_symbol, sector, price,
-             investmitra_score, signal, momentum_score, financial_health_score,
-             management_quality_score, screen_count, screens_list,
-             ta_decision, ta_thesis, ta_time_horizon,
-             both_agree, triple_confirm)
+            (pick_date, rank, isin, company_name, nse_symbol, sector,
+             market_cap_category, price, investmitra_score, signal,
+             momentum_score, financial_health_score, management_quality_score,
+             screen_count, screens_list, ta_decision, ta_thesis, ta_time_horizon,
+             both_agree, triple_confirm, cap_filter)
         VALUES %s
-        ON CONFLICT (pick_date, rank) DO UPDATE SET
+        ON CONFLICT (pick_date, rank, cap_filter) DO UPDATE SET
             ta_decision    = EXCLUDED.ta_decision,
             ta_thesis      = EXCLUDED.ta_thesis,
             both_agree     = EXCLUDED.both_agree,
@@ -208,35 +217,71 @@ def save_top_picks(picks: list[dict], score_date: date):
     conn.commit(); cur.close(); conn.close()
 
 
+def _print_summary(picks: list, score_date: date, cap_filter: str):
+    print(f"\n{'='*70}")
+    print(f"investMITRA TOP PICKS — {score_date} [{cap_filter}]")
+    print(f"{'='*70}")
+
+    for i, c in enumerate(picks):
+        triple = "🏆 TRIPLE CONFIRM" if c.get("triple_confirm") else \
+                 "✅ BOTH AGREE"     if c.get("both_agree")    else "⚠️  DIVERGE"
+        cap    = c.get("market_cap_category", "?")
+        print(f"\n#{i+1} {c['company_name']} ({c.get('nse_symbol')}) [{cap}]")
+        print(f"     Sector:          {c['sector']}")
+        print(f"     investMITRA:     {c['investmitra_score']:.1f} — {c['signal']}")
+        print(f"     Screener Screens:{c.get('screen_count', 0)}")
+        if c.get("ta_decision"):
+            print(f"     TradingAgents:   {c.get('ta_decision')}")
+        print(f"     {triple}")
+
+    triple = [c for c in picks if c.get("triple_confirm")]
+    agreed = [c for c in picks if c.get("both_agree") and not c.get("triple_confirm")]
+
+    print(f"\n{'='*70}")
+    if triple:
+        print(f"🏆 TRIPLE CONFIRMED ({len(triple)}):")
+        for c in triple:
+            print(f"  → {c['company_name']} ({c.get('nse_symbol')}) [{c.get('market_cap_category')}]"
+                  f" — Score: {c['investmitra_score']:.1f} | Screens: {c.get('screen_count',0)}")
+    if agreed:
+        print(f"✅ BOTH AGREE ({len(agreed)}):")
+        for c in agreed[:5]:
+            print(f"  → {c['company_name']} ({c.get('nse_symbol')}) [{c.get('market_cap_category')}]"
+                  f" — Score: {c['investmitra_score']:.1f} | Screens: {c.get('screen_count',0)}")
+    print(f"{'='*70}")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--date",    type=date.fromisoformat, default=datetime.now(IST).date())
-    parser.add_argument("--top",     type=int, default=5)
-    parser.add_argument("--no-ta",   action="store_true")
+    parser.add_argument("--date",  type=date.fromisoformat, default=datetime.now(IST).date())
+    parser.add_argument("--top",   type=int, default=10)
+    parser.add_argument("--cap",   choices=["MICRO","SMALL","MID","LARGE","SMALLMICRO","ALL"],
+                        default="ALL", help="Market cap filter")
+    parser.add_argument("--no-ta", action="store_true", help="Skip TradingAgents")
     args = parser.parse_args()
 
     ensure_tables()
 
-    candidates = get_top_candidates(args.date, top_n=args.top)
+    candidates = get_top_candidates(args.date, args.top, args.cap)
     if not candidates:
-        logger.warning("No candidates for %s", args.date)
+        logger.warning("No candidates found for %s [%s]", args.date, args.cap)
         return
 
-    logger.info("Top %d candidates for %s:", len(candidates), args.date)
+    logger.info("Top %d candidates [%s] for %s:", len(candidates), args.cap, args.date)
     for i, c in enumerate(candidates):
-        logger.info("  %d. %s (%s) — Score: %.1f | Screens: %d | Sector: %s",
+        logger.info("  %d. %s (%s) [%s] — Score: %.1f | Screens: %d",
                     i+1, c["company_name"], c.get("nse_symbol"),
-                    c["investmitra_score"], c["screen_count"], c["sector"])
+                    c.get("market_cap_category"), c["investmitra_score"],
+                    c["screen_count"])
 
     if args.no_ta:
         for c in candidates:
             c["both_agree"]    = c["investmitra_score"] >= 70 and c["screen_count"] >= 2
             c["triple_confirm"] = False
-        save_top_picks(candidates, args.date)
-        _print_summary(candidates, args.date)
+        save_top_picks(candidates, args.date, args.cap)
+        _print_summary(candidates, args.date, args.cap)
         return
 
-    # Run TradingAgents
     date_str = args.date.isoformat()
     for c in candidates:
         symbol = c.get("nse_symbol")
@@ -248,50 +293,14 @@ def main():
         result           = run_trading_agents(symbol, date_str)
         c["ta_decision"] = result["decision"]
         c["ta_thesis"]   = result["thesis"]
-        c["ta_horizon"]  = ""
 
-        # Both agree = investMITRA bullish + TradingAgents bullish
-        inv_bullish = c["signal"] in ("Strong Buy", "Buy")
-        ta_bullish  = result["decision"] in ("Strong Buy", "Buy", "Hold")
-        c["both_agree"] = inv_bullish and ta_bullish
-
-        # Triple confirm = all three: investMITRA + Screener (2+ screens) + TradingAgents
+        inv_bullish      = c["signal"] in ("Strong Buy", "Buy")
+        ta_bullish       = result["decision"] in ("Strong Buy", "Buy", "Hold")
+        c["both_agree"]  = inv_bullish and ta_bullish
         c["triple_confirm"] = inv_bullish and ta_bullish and c["screen_count"] >= 2
 
-    save_top_picks(candidates, args.date)
-    _print_summary(candidates, args.date)
-
-
-def _print_summary(picks: list[dict], score_date: date):
-    print(f"\n{'='*70}")
-    print(f"investMITRA TOP PICKS — {score_date}")
-    print(f"{'='*70}")
-
-    for i, c in enumerate(picks):
-        triple = "🏆 TRIPLE CONFIRM" if c.get("triple_confirm") else \
-                 "✅ BOTH AGREE"     if c.get("both_agree")    else "⚠️  DIVERGE"
-        print(f"\n#{i+1} {c['company_name']} ({c.get('nse_symbol')})")
-        print(f"     Sector:          {c['sector']}")
-        print(f"     investMITRA:     {c['investmitra_score']:.1f} — {c['signal']}")
-        print(f"     Screener Screens:{c.get('screen_count', 0)}")
-        print(f"     TradingAgents:   {c.get('ta_decision', 'N/A')}")
-        print(f"     {triple}")
-
-    triple = [c for c in picks if c.get("triple_confirm")]
-    agreed = [c for c in picks if c.get("both_agree") and not c.get("triple_confirm")]
-
-    print(f"\n{'='*70}")
-    if triple:
-        print(f"🏆 TRIPLE CONFIRMED BUYS ({len(triple)}):")
-        for c in triple:
-            print(f"  → {c['company_name']} ({c.get('nse_symbol')}) "
-                  f"— Score: {c['investmitra_score']:.1f} | Screens: {c.get('screen_count',0)}")
-    if agreed:
-        print(f"✅ BOTH AGREE ({len(agreed)}):")
-        for c in agreed[:3]:
-            print(f"  → {c['company_name']} ({c.get('nse_symbol')}) "
-                  f"— Score: {c['investmitra_score']:.1f} | Screens: {c.get('screen_count',0)}")
-    print(f"{'='*70}")
+    save_top_picks(candidates, args.date, args.cap)
+    _print_summary(candidates, args.date, args.cap)
 
 
 if __name__ == "__main__":

@@ -145,3 +145,21 @@ jobs:
       
       - name: Fetch Screener signals
         run: pip install beautifulsoup4 --quiet && python scripts/fetch_screener_signals.py
+    
+      - name: Compute daily top picks
+        env:
+          CC_ENV: prod
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CC_BUCKET_RAW: cc-raw
+          TRADING_AGENTS_PATH: /home/runner/work/investMITRA/TradingAgents
+        run: |
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            python scripts/daily_top_picks.py --date ${{ github.event.inputs.date }} --top 10 --cap ALL --no-ta
+            python scripts/daily_top_picks.py --date ${{ github.event.inputs.date }} --top 10 --cap SMALLMICRO --no-ta
+          else
+            python scripts/daily_top_picks.py --top 10 --cap ALL --no-ta
+            python scripts/daily_top_picks.py --top 10 --cap SMALLMICRO --no-ta
+          fi
