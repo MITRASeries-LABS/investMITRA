@@ -1,0 +1,15 @@
+import psycopg2, os
+from dotenv import load_dotenv
+load_dotenv('.env.prod')
+conn = psycopg2.connect(os.getenv('CC_POSTGRES_URL'))
+cur = conn.cursor()
+cur.execute("SELECT isin, period_end, revenue_cr, ebitda_cr, pat_cr, total_debt_cr, cash_cr, equity_cr FROM investmitra.company_financials WHERE isin='INE002A01018' ORDER BY period_end DESC LIMIT 4")
+for r in cur.fetchall(): print(r)
+print()
+cur.execute("SELECT COUNT(*) FROM investmitra.company_financials WHERE revenue_cr IS NOT NULL")
+print('With revenue:', cur.fetchone()[0])
+cur.execute("SELECT COUNT(*) FROM investmitra.company_financials WHERE total_debt_cr IS NOT NULL")
+print('With debt:', cur.fetchone()[0])
+cur.execute("SELECT COUNT(*) FROM investmitra.company_financials WHERE equity_cr IS NOT NULL")
+print('With equity:', cur.fetchone()[0])
+conn.close()

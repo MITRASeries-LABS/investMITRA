@@ -171,8 +171,11 @@ def compute_capex_screen(data: dict) -> dict:
     rev_cur = rev[0] if rev[0] else None
     rev_3yr = rev[3] if len(rev) > 3 and rev[3] else (rev[2] if rev[2] else None)
     rev_growth_3yr = None
-    if rev_cur and rev_3yr and rev_3yr > 0:
-        rev_growth_3yr = ((rev_cur / rev_3yr) ** (1/3) - 1) * 100
+    if rev_cur and rev_3yr and rev_3yr > 0 and rev_cur > 0:
+        try:
+            rev_growth_3yr = ((rev_cur / rev_3yr) ** (1/3) - 1) * 100
+            rev_growth_3yr = float(rev_growth_3yr.real if hasattr(rev_growth_3yr, 'real') else rev_growth_3yr)
+        except: rev_growth_3yr = None
 
     # Fixed assets comparison
     fa_cur = fa[0] if fa[0] else None

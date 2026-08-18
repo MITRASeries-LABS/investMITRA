@@ -1,12 +1,6 @@
-"""
-investMITRA — Fetch Financial Data via yfinance
-Loads quarterly financials for all NSE stocks into company_financials table.
-
-Run: python scripts/fetch_financials_yfinance.py
-"""
+"""investMITRA — Fetch Financial Data via yfinance v3 (fixed)"""
 from __future__ import annotations
 import logging, os, time
-from datetime import datetime, timezone, timedelta
 import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
@@ -20,21 +14,28 @@ NEON_URL = os.getenv("CC_POSTGRES_URL")
 
 
 def get_nse_symbols() -> list[tuple[str, str]]:
-    """Get all active ISIN, NSE symbol pairs from company_master."""
     conn = psycopg2.connect(NEON_URL, connect_timeout=15)
     cur  = conn.cursor()
-    cur.execute(
-        "SELECT isin, nse_symbol FROM investmitra.company_master "
-        "WHERE is_active=TRUE AND nse_symbol IS NOT NULL ORDER BY isin"
-    )
+    cur.execute("SELECT isin, nse_symbol FROM investmitra.company_master WHERE is_active=TRUE AND nse_symbol IS NOT NULL ORDER BY isin")
     rows = cur.fetchall()
     cur.close(); conn.close()
     logger.info("Loaded %d symbols", len(rows))
     return rows
 
 
+def safe_cr(df, key, period):
+    """Safely get value from dataframe in crore."""
+    try:
+        if key in df.index and period in df.columns:
+            v = df.at[key, period]
+            if pd.notna(v):
+                return round(float(v) / 10000000, 4)
+    except:
+        pass
+    return None
+
+
 def fetch_yfinance(isin: str, symbol: str) -> list[dict]:
-    """Fetch quarterly financials for one stock."""
     ticker = f"{symbol}.NS"
     try:
         t   = yf.Ticker(ticker)
@@ -44,41 +45,42 @@ def fetch_yfinance(isin: str, symbol: str) -> list[dict]:
         if fin.empty and bs.empty:
             return []
 
-        records = []
-        # Get all available quarters
+        # Collect all unique periods
         periods = set()
-        if not fin.empty:
-            periods.update(fin.columns.tolist())
-        if not bs.empty:
-            periods.update(bs.columns.tolist())
+        if not fin.empty: periods.update(fin.columns.tolist())
+        if not bs.empty:  periods.update(bs.columns.tolist())
 
-        for period in periods:
-            def get_val(df, key):
-                try:
-                    if key in df.index and period in df.columns:
-                        v = df.loc[key, period]
-                        return float(v) / 10000000 if pd.notna(v) else None  # Convert to crore
-                except: pass
-                return None
+        records = []
+        for period in sorted(periods, reverse=True)[:8]:  # last 8 quarters
+            period_date = period.date() if hasattr(period, 'date') else None
+            if not period_date:
+                continue
 
-            rec = {
-                "isin":           isin,
-                "period_end":     period.date() if hasattr(period, 'date') else None,
-                "period_type":    "Q",
-                "revenue_cr":     get_val(fin, "Total Revenue"),
-                "ebitda_cr":      get_val(fin, "EBITDA"),
-                "ebit_cr":        get_val(fin, "EBIT"),
-                "pat_cr":         get_val(fin, "Net Income From Continuing Operation Net Minority Interest"),
-                "total_debt_cr":  get_val(bs, "Total Debt"),
-                "cash_cr":        get_val(bs, "Cash And Cash Equivalents"),
-                "equity_cr":      get_val(bs, "Common Stock Equity"),
-                "source_id":      "yfinance",
-                "quality_score":  80,
-            }
+            revenue    = safe_cr(fin, "Total Revenue",    period)
+            ebitda     = safe_cr(fin, "EBITDA",           period)
+            ebit       = safe_cr(fin, "Operating Income", period)
+            pat        = safe_cr(fin, "Net Income",       period)
+            total_debt = safe_cr(bs,  "Total Debt",       period)
+            cash       = safe_cr(bs,  "Cash And Cash Equivalents", period)
+            equity     = safe_cr(bs,  "Common Stock Equity", period)
 
-            if rec["period_end"] and any(v is not None for k, v in rec.items()
-                                          if k not in ["isin","period_end","period_type","source_id","quality_score"]):
-                records.append(rec)
+            # Skip if no useful data
+            if not any([revenue, ebitda, ebit, pat, total_debt, cash, equity]):
+                continue
+
+            records.append({
+                "isin":          isin,
+                "period_end":    period_date,
+                "period_type":   "Q",
+                "filing_date":   period_date,
+                "revenue_cr":    revenue,
+                "ebitda_cr":     ebitda,
+                "ebit_cr":       ebit,
+                "pat_cr":        pat,
+                "total_debt_cr": total_debt,
+                "cash_cr":       cash,
+                "equity_cr":     equity,
+            })
 
         return records
 
@@ -89,27 +91,40 @@ def fetch_yfinance(isin: str, symbol: str) -> list[dict]:
 
 def write_to_neon(records: list[dict]) -> int:
     if not records: return 0
+
     conn = psycopg2.connect(NEON_URL, connect_timeout=15)
     conn.autocommit = False
     cur  = conn.cursor()
 
     rows = [
-        (r["isin"], r["period_end"], r["period_type"], None,
+        (r["isin"], r["period_end"], r["period_type"], r["filing_date"],
          r.get("revenue_cr"), r.get("ebitda_cr"), r.get("ebit_cr"), r.get("pat_cr"),
-         None, None, None, r.get("total_debt_cr"), r.get("cash_cr"), r.get("equity_cr"),
-         None, None, None, True, None, r.get("quality_score", 80), r.get("source_id"), None)
-        for r in records if r.get("period_end")
+         None, None,
+         r.get("total_debt_cr"),
+         r.get("cash_cr"),
+         r.get("equity_cr"),
+         None, None, None,
+         True, None, 80, "yfinance", None)
+        for r in records
     ]
 
     execute_values(cur, """
         INSERT INTO investmitra.company_financials
             (isin, period_end, period_type, filing_date,
              revenue_cr, ebitda_cr, ebit_cr, pat_cr,
-             eps, total_assets_cr, total_debt_cr, total_debt_cr,
-             cash_cr, equity_cr, cfo_cr, capex_cr, fcf_cr,
+             eps, total_assets_cr, total_debt_cr,
+             cash_cr, equity_cr,
+             cfo_cr, capex_cr, fcf_cr,
              is_consolidated, taxonomy, quality_score, source_id, source_doc_url)
         VALUES %s
-        ON CONFLICT DO NOTHING
+        ON CONFLICT (isin, period_end, period_type, COALESCE(source_id, 'unknown')) DO UPDATE SET
+            revenue_cr    = COALESCE(EXCLUDED.revenue_cr,    company_financials.revenue_cr),
+            ebitda_cr     = COALESCE(EXCLUDED.ebitda_cr,     company_financials.ebitda_cr),
+            ebit_cr       = COALESCE(EXCLUDED.ebit_cr,       company_financials.ebit_cr),
+            pat_cr        = COALESCE(EXCLUDED.pat_cr,        company_financials.pat_cr),
+            total_debt_cr = COALESCE(EXCLUDED.total_debt_cr, company_financials.total_debt_cr),
+            cash_cr       = COALESCE(EXCLUDED.cash_cr,       company_financials.cash_cr),
+            equity_cr     = COALESCE(EXCLUDED.equity_cr,     company_financials.equity_cr)
     """, rows, page_size=100)
 
     conn.commit(); cur.close(); conn.close()
@@ -117,29 +132,40 @@ def write_to_neon(records: list[dict]) -> int:
 
 
 def main():
-    symbols = get_nse_symbols()
+    symbols       = get_nse_symbols()
     total_records = 0
-    failed = 0
+    failed        = 0
 
-    logger.info("Fetching financials for %d stocks via yfinance...", len(symbols))
+    logger.info("Fetching financials for %d stocks...", len(symbols))
+
+    # Test with first stock
+    isin, symbol = symbols[0]
+    test_records = fetch_yfinance(isin, symbol)
+    logger.info("Test %s: %d records", symbol, len(test_records))
+    if test_records:
+        logger.info("Sample: %s", test_records[0])
+    else:
+        logger.error("No records for test stock — check yfinance")
+        return
 
     for i, (isin, symbol) in enumerate(symbols):
         try:
             records = fetch_yfinance(isin, symbol)
             if records:
-                written = write_to_neon(records)
+                written        = write_to_neon(records)
                 total_records += written
-                if i % 50 == 0:
-                    logger.info("Progress: %d/%d — records: %d failed: %d",
-                                i, len(symbols), total_records, failed)
+            else:
+                failed += 1
+            if i % 100 == 0 and i > 0:
+                logger.info("Progress: %d/%d — records: %d failed: %d",
+                            i, len(symbols), total_records, failed)
             time.sleep(0.3)
         except Exception as e:
-            logger.debug("Error %s: %s", symbol, e)
+            logger.warning("Error %s: %s", symbol, e)
             failed += 1
 
     logger.info("Done: %d records written, %d failed", total_records, failed)
 
-    # Verify
     conn = psycopg2.connect(NEON_URL, connect_timeout=15)
     cur  = conn.cursor()
     cur.execute("SELECT COUNT(*), COUNT(DISTINCT isin) FROM investmitra.company_financials")
