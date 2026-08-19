@@ -934,6 +934,98 @@ class IntradayEngine:
         print(f"{'='*65}\n")
 
 
+
+# ── Daily P&L Save ─────────────────────────────────────────────────────────────
+
+def ensure_pnl_table(conn):
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS investmitra.intraday_pnl (
+            id               SERIAL PRIMARY KEY,
+            trade_date       DATE NOT NULL UNIQUE,
+            trades           INTEGER DEFAULT 0,
+            capital_deployed DECIMAL(12,2) DEFAULT 0,
+            gross_pnl        DECIMAL(12,2) DEFAULT 0,
+            brokerage        DECIMAL(12,2) DEFAULT 0,
+            net_pnl          DECIMAL(12,2) DEFAULT 0,
+            win_trades       INTEGER DEFAULT 0,
+            loss_trades      INTEGER DEFAULT 0,
+            market_direction VARCHAR(20),
+            vix_level        DECIMAL(8,2),
+            signals          JSONB,
+            saved_at         TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+    cur.close()
+
+
+def save_daily_pnl(risk_manager, signals: dict, market_direction: str, vix: float):
+    """Save end-of-day P&L summary to Neon for Grafana."""
+    import json
+    try:
+        conn = psycopg2.connect(NEON_URL, connect_timeout=15)
+        ensure_pnl_table(conn)
+        conn.autocommit = True
+        cur  = conn.cursor()
+
+        today = datetime.now(IST).date()
+
+        # Signals summary
+        sig_summary = [{
+            "symbol":    sym,
+            "direction": s.get("direction"),
+            "entry":     s.get("entry"),
+            "target":    s.get("target"),
+            "stoploss":  s.get("stoploss"),
+            "gap":       round(s.get("true_gap", s.get("gap_pct", 0)), 2),
+            "cap":       s.get("cap"),
+            "score":     round(s.get("final_score", 0), 1),
+            "atr":       s.get("atr"),
+            "size":      s.get("position_size"),
+        } for sym, s in signals.items()]
+
+        # Capital deployed
+        capital = sum(
+            s.get("position_size", 0) * s.get("entry", 0)
+            for s in signals.values()
+        )
+
+        # Win/loss
+        total  = risk_manager.trades_today
+        losses = risk_manager.consecutive_losses
+        wins   = max(total - losses, 0)
+
+        cur.execute("""
+            INSERT INTO investmitra.intraday_pnl
+                (trade_date, trades, capital_deployed, gross_pnl, brokerage,
+                 net_pnl, win_trades, loss_trades, market_direction, vix_level, signals)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (trade_date) DO UPDATE SET
+                trades=EXCLUDED.trades,
+                capital_deployed=EXCLUDED.capital_deployed,
+                gross_pnl=EXCLUDED.gross_pnl,
+                brokerage=EXCLUDED.brokerage,
+                net_pnl=EXCLUDED.net_pnl,
+                win_trades=EXCLUDED.win_trades,
+                loss_trades=EXCLUDED.loss_trades,
+                signals=EXCLUDED.signals,
+                saved_at=NOW()
+        """, (
+            today, total, round(capital,2),
+            round(risk_manager.daily_pnl, 2),
+            round(risk_manager.daily_brokerage, 2),
+            round(risk_manager.net_pnl, 2),
+            wins, losses,
+            market_direction, vix,
+            json.dumps(sig_summary)
+        ))
+        cur.close(); conn.close()
+        print(f"\n  💾 Daily P&L saved → Neon (date: {today})")
+        print(f"  Trades: {total} | Net: ₹{risk_manager.net_pnl:.0f} | Capital: ₹{capital:,.0f}")
+    except Exception as e:
+        logger.warning("P&L save failed: %s", e)
+
 def main():
     if not API_KEY or not ACCESS_TOKEN:
         print("❌ Run: python scripts/kite_login.py first"); sys.exit(1)
@@ -1021,6 +1113,8 @@ def main():
             if now.hour >= 15 and now.minute >= 5:
                 engine.print_summary()
                 logger.info("3:05 PM — square off")
+                save_daily_pnl(engine.risk, engine.signals,
+                               market_direction, ctx.get("india_vix", 0) or 0)
                 break
             time.sleep(10)
     except KeyboardInterrupt:
