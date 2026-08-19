@@ -1,24 +1,15 @@
 """
-investMITRA — Intraday Signal Engine v3
-Market direction filter using Nifty 50 via Kite.
+investMITRA — Intraday Signal Engine v4
+Uses Nifty Futures (nearest expiry) for pre-market direction.
+Falls back to Nifty 50 spot if futures unavailable.
 
-Pre-market (before 9:15 AM):
-  - Fetches Nifty 50 previous close vs current futures
-  - BULLISH → only LONG signals
-  - BEARISH → only SHORT signals
-  - NEUTRAL → both
+Market direction filter:
+  BULLISH (futures +0.3%+) → LONG signals only
+  BEARISH (futures -0.3%+) → SHORT signals only
+  NEUTRAL (flat)           → both LONG and SHORT
 
-Watchlist criteria:
-  - MID/LARGE cap (liquid stocks)
-  - Avg daily volume > 2 lakh shares
-  - Price ₹50-₹5000
-  - LONG candidates: investMITRA score >= 60
-  - SHORT candidates: investMITRA score <= 35
-
-Signal logic:
-  LONG:  Gap up 0.3%+ | Above VWAP | Volume surge | Market BULLISH/NEUTRAL
-  SHORT: Gap down 0.3%+ | Below VWAP | Volume surge | Market BEARISH/NEUTRAL
-
+Watchlist: MID/LARGE cap, avg vol > 2L, price ₹50-5000
+Signal: Gap 0.3%+ | VWAP confirmation | Volume surge
 Target: 1.5% | Stoploss: 0.5% | RR: 3:1
 Square off: 3:15 PM mandatory
 
@@ -45,46 +36,68 @@ IST          = timezone(timedelta(hours=5, minutes=30))
 
 def get_market_direction(kite: KiteConnect) -> tuple[str, float]:
     """
-    Fetch Nifty 50 and determine market direction.
+    Fetch Nifty Futures (nearest expiry) for true pre-market direction.
+    Falls back to Nifty 50 spot if futures unavailable.
     Returns: (direction, change_pct)
-      direction: 'BULLISH', 'BEARISH', 'NEUTRAL'
     """
     try:
-        quote      = kite.quote(["NSE:NIFTY 50"])
-        nifty      = quote.get("NSE:NIFTY 50", {})
-        prev_close = nifty.get("ohlc", {}).get("close", 0)
-        last_price = nifty.get("last_price", 0)
+        # Try Nifty Futures first — true pre-market indicator like GIFT Nifty
+        instruments = kite.instruments("NFO")
+        nifty_futs  = [i for i in instruments
+                       if i["name"] == "NIFTY" and i["instrument_type"] == "FUT"]
+        nifty_futs.sort(key=lambda x: x["expiry"])
 
-        if not prev_close or not last_price:
-            return "NEUTRAL", 0.0
-
-        change_pct = (last_price - prev_close) / prev_close * 100
-
-        if change_pct > 0.3:
-            direction = "BULLISH"
-            emoji     = "🟢"
-            advice    = "Taking LONG signals only"
-        elif change_pct < -0.3:
-            direction = "BEARISH"
-            emoji     = "🔴"
-            advice    = "Taking SHORT signals only"
+        if nifty_futs:
+            near_fut   = nifty_futs[0]
+            fut_symbol = f"NFO:{near_fut['tradingsymbol']}"
+            logger.info("Using Nifty Futures: %s (expiry: %s)",
+                        near_fut['tradingsymbol'], near_fut['expiry'])
+            quote      = kite.quote([fut_symbol])
+            fut_data   = quote.get(fut_symbol, {})
+            prev_close = fut_data.get("ohlc", {}).get("close", 0)
+            last_price = fut_data.get("last_price", 0)
+            source     = f"Nifty Fut ({near_fut['tradingsymbol']})"
         else:
-            direction = "NEUTRAL"
-            emoji     = "🟡"
-            advice    = "Taking both LONG and SHORT signals"
-
-        print(f"\n{'='*58}")
-        print(f"  {emoji} MARKET DIRECTION: {direction}")
-        print(f"  Nifty 50:  ₹{last_price:,.2f}  ({change_pct:+.2f}%)")
-        print(f"  Prev Close:₹{prev_close:,.2f}")
-        print(f"  Strategy:  {advice}")
-        print(f"{'='*58}\n")
-
-        return direction, change_pct
+            raise Exception("No Nifty futures found")
 
     except Exception as e:
-        logger.warning("Market direction fetch failed: %s — defaulting to NEUTRAL", e)
+        logger.warning("Futures fetch failed (%s) — using Nifty 50 spot", e)
+        try:
+            quote      = kite.quote(["NSE:NIFTY 50"])
+            spot       = quote.get("NSE:NIFTY 50", {})
+            prev_close = spot.get("ohlc", {}).get("close", 0)
+            last_price = spot.get("last_price", 0)
+            source     = "Nifty 50 Spot"
+        except:
+            return "NEUTRAL", 0.0
+
+    if not prev_close or not last_price:
         return "NEUTRAL", 0.0
+
+    change_pct = (last_price - prev_close) / prev_close * 100
+
+    if change_pct > 0.3:
+        direction = "BULLISH"
+        emoji     = "🟢"
+        advice    = "Taking LONG signals only"
+    elif change_pct < -0.3:
+        direction = "BEARISH"
+        emoji     = "🔴"
+        advice    = "Taking SHORT signals only"
+    else:
+        direction = "NEUTRAL"
+        emoji     = "🟡"
+        advice    = "Taking both LONG and SHORT signals"
+
+    print(f"\n{'='*58}")
+    print(f"  {emoji} MARKET DIRECTION: {direction}")
+    print(f"  Source:    {source}")
+    print(f"  Last:      ₹{last_price:,.2f}  ({change_pct:+.2f}%)")
+    print(f"  Prev Close:₹{prev_close:,.2f}")
+    print(f"  Strategy:  {advice}")
+    print(f"{'='*58}\n")
+
+    return direction, change_pct
 
 
 def get_intraday_watchlist() -> tuple[list[dict], list[dict]]:
@@ -166,6 +179,7 @@ def get_instrument_tokens(kite: KiteConnect, symbols: list[str]) -> dict[str, in
         for inst in instruments:
             if inst["tradingsymbol"] in symbols and inst["segment"] == "NSE":
                 token_map[inst["tradingsymbol"]] = inst["instrument_token"]
+        logger.info("Mapped %d/%d symbols", len(token_map), len(symbols))
         return token_map
     except Exception as e:
         logger.error("Instruments failed: %s", e)
@@ -216,7 +230,7 @@ class IntradayEngine:
             if not self.first_tick[symbol]:
                 self.first_tick[symbol] = True
 
-            # VWAP
+            # Update VWAP
             prev_vol = self.cum_vol[symbol]
             new_vol  = max(0, volume - prev_vol)
             if new_vol > 0:
@@ -257,7 +271,7 @@ class IntradayEngine:
         if (symbol in self.long_map and can_long and
                 gap_pct > 0.3 and above_vwap and score >= 60):
             target   = round(ltp * 1.015, 2)
-            stoploss = round(ltp * 0.995, 2)
+            stoploss = round(ltp * 1.005, 2) if False else round(ltp * 0.995, 2)
             self._emit_signal(symbol, "LONG", ltp, target, stoploss,
                               gap_pct, vwap, score, stock, now, vol_surge)
 
@@ -281,9 +295,9 @@ class IntradayEngine:
             "time": now.strftime("%H:%M:%S"),
         }
 
-        emoji = "🟢 LONG " if direction == "LONG" else "🔴 SHORT"
-        pct   = abs(ltp - target) / ltp * 100
-        sl_pct= abs(ltp - stoploss) / ltp * 100
+        emoji  = "🟢 LONG " if direction == "LONG" else "🔴 SHORT"
+        pct    = abs(ltp - target) / ltp * 100
+        sl_pct = abs(ltp - stoploss) / ltp * 100
 
         print(f"\n{'='*58}")
         print(f"  {emoji} SIGNAL — {symbol} [{stock.get('cap')}]")
@@ -304,7 +318,7 @@ class IntradayEngine:
         longs  = [s for s in self.signals.values() if s["direction"] == "LONG"]
         shorts = [s for s in self.signals.values() if s["direction"] == "SHORT"]
         print(f"\n{'='*58}")
-        print(f"  INTRADAY SUMMARY — {date.today()} | Market: {self.market_direction}")
+        print(f"  INTRADAY SUMMARY — {date.today()} | {self.market_direction}")
         print(f"{'='*58}")
         if longs:
             print(f"\n  🟢 LONG ({len(longs)}):")
@@ -328,7 +342,7 @@ def main():
     kite = KiteConnect(api_key=API_KEY)
     kite.set_access_token(ACCESS_TOKEN)
 
-    # Get market direction first
+    # Get market direction from Nifty Futures
     market_direction, nifty_change = get_market_direction(kite)
 
     # Get watchlist
@@ -337,10 +351,10 @@ def main():
 
     # Filter based on market direction
     if market_direction == "BULLISH":
-        logger.info("Market BULLISH — showing LONG candidates only")
+        logger.info("Market BULLISH — LONG candidates only")
         short_list = []
     elif market_direction == "BEARISH":
-        logger.info("Market BEARISH — showing SHORT candidates only")
+        logger.info("Market BEARISH — SHORT candidates only")
         long_list = []
 
     all_stocks = long_list + short_list
@@ -355,26 +369,29 @@ def main():
     # Print watchlist
     print(f"\n{'='*58}")
     print(f"  investMITRA INTRADAY — {date.today()}")
-    print(f"  Market: {market_direction} | Nifty: {nifty_change:+.2f}%")
+    print(f"  Market: {market_direction} | Nifty Fut: {nifty_change:+.2f}%")
     print(f"{'='*58}")
 
     if long_list:
         print(f"\n  🟢 LONG CANDIDATES ({len(long_list)}):")
-        print(f"  {'Symbol':<15} {'Score':>6} {'Screens':>8} {'Avg Vol':>10}")
-        print(f"  {'─'*45}")
+        print(f"  {'Symbol':<15} {'Score':>6} {'Screens':>8} {'Avg Vol':>10} {'Price':>8}")
+        print(f"  {'─'*52}")
         for s in long_list:
             if s["symbol"] in token_map:
-                print(f"  {s['symbol']:<15} {s['investmitra_score']:>6.1f} {s['screen_count']:>8} {s['avg_volume']:>10,}")
+                print(f"  {s['symbol']:<15} {s['investmitra_score']:>6.1f} {s['screen_count']:>8} "
+                      f"{s['avg_volume']:>10,} ₹{s['avg_price']:>7,.0f}")
 
     if short_list:
         print(f"\n  🔴 SHORT CANDIDATES ({len(short_list)}):")
-        print(f"  {'Symbol':<15} {'Score':>6} {'Screens':>8} {'Avg Vol':>10}")
-        print(f"  {'─'*45}")
+        print(f"  {'Symbol':<15} {'Score':>6} {'Screens':>8} {'Avg Vol':>10} {'Price':>8}")
+        print(f"  {'─'*52}")
         for s in short_list:
             if s["symbol"] in token_map:
-                print(f"  {s['symbol']:<15} {s['investmitra_score']:>6.1f} {s['screen_count']:>8} {s['avg_volume']:>10,}")
+                print(f"  {s['symbol']:<15} {s['investmitra_score']:>6.1f} {s['screen_count']:>8} "
+                      f"{s['avg_volume']:>10,} ₹{s['avg_price']:>7,.0f}")
 
     print(f"\n  Signals appear after 9:30 AM")
+    print(f"  Gap threshold: LONG >0.3% | SHORT <-0.3%")
     print(f"{'='*58}\n")
 
     tokens = list(token_map.values())
@@ -400,14 +417,14 @@ def main():
     ticker.on_close   = on_close
     ticker.on_error   = on_error
 
-    logger.info("Starting live feed...")
+    logger.info("Starting live feed... signals after 9:30 AM")
     try:
         ticker.connect(threaded=True)
         while True:
             now = datetime.now(IST)
             if now.hour >= 15 and now.minute >= 20:
                 engine.print_summary()
-                logger.info("Market closed — square off!")
+                logger.info("Market closed — square off all positions!")
                 break
             time.sleep(10)
     except KeyboardInterrupt:
