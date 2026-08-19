@@ -1026,9 +1026,74 @@ def save_daily_pnl(risk_manager, signals: dict, market_direction: str, vix: floa
     except Exception as e:
         logger.warning("P&L save failed: %s", e)
 
+
+def preflight_check() -> bool:
+    """Run pre-flight checks before market opens."""
+    print(f"
+{'='*65}")
+    print(f"  investMITRA PRE-FLIGHT CHECK — {date.today()}")
+    print(f"{'='*65}")
+    all_ok = True
+
+    # 1. Kite token
+    if API_KEY and ACCESS_TOKEN:
+        print(f"  ✅ Kite token present")
+    else:
+        print(f"  ❌ Kite token MISSING — run: python scripts/kite_login.py")
+        all_ok = False
+
+    # 2. Neon connection + data freshness
+    try:
+        conn = psycopg2.connect(NEON_URL, connect_timeout=5)
+        cur  = conn.cursor()
+        cur.execute("SELECT MAX(score_date) FROM investmitra.daily_scores")
+        score_date = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM investmitra.equity_prices WHERE trade_date >= CURRENT_DATE - INTERVAL '30 days'")
+        price_rows = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM investmitra.market_indices WHERE fetch_date = CURRENT_DATE")
+        indices_today = cur.fetchone()[0]
+        conn.close()
+        fresh = score_date and (date.today() - score_date).days <= 3
+        print(f"  {'✅' if fresh else '⚠️ '} Scores: latest {score_date} {'(fresh)' if fresh else '(stale — check pipeline)'}")
+        print(f"  {'✅' if price_rows > 10000 else '⚠️ '} Price data: {price_rows:,} rows")
+        print(f"  {'✅' if indices_today > 0 else '⚠️ '} Market indices: {'fetched today' if indices_today > 0 else 'NOT fetched today'}")
+    except Exception as e:
+        print(f"  ❌ Neon connection failed: {e}")
+        all_ok = False
+
+    # 3. kiteconnect library
+    try:
+        from kiteconnect import KiteConnect, KiteTicker
+        print(f"  ✅ kiteconnect installed")
+    except ImportError:
+        print(f"  ❌ kiteconnect missing — pip install kiteconnect")
+        all_ok = False
+
+    # 4. Required env vars
+    missing = [v for v in ['KITE_API_KEY','CC_POSTGRES_URL'] if not os.getenv(v)]
+    if missing:
+        print(f"  ❌ Missing env vars: {missing}")
+        all_ok = False
+    else:
+        print(f"  ✅ Environment variables OK")
+
+    print(f"{'='*65}")
+    if all_ok:
+        print(f"  🟢 ALL CHECKS PASSED — Ready to trade")
+    else:
+        print(f"  🔴 CHECKS FAILED — Fix issues above before trading")
+    print(f"{'='*65}
+")
+    return all_ok
+
+
 def main():
     if not API_KEY or not ACCESS_TOKEN:
         print("❌ Run: python scripts/kite_login.py first"); sys.exit(1)
+
+    # Pre-flight check
+    if not preflight_check():
+        sys.exit(1)
 
     kite = KiteConnect(api_key=API_KEY)
     kite.set_access_token(ACCESS_TOKEN)
