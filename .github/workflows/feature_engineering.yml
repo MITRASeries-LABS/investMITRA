@@ -178,3 +178,8 @@ jobs:
             python scripts/daily_top_picks.py --top 10 --cap ALL --no-ta
             python scripts/daily_top_picks.py --top 10 --cap SMALLMICRO --no-ta
           fi
+
+      - name: Fetch market indices
+        env:
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+        run: python scripts/fetch_market_indices.py
