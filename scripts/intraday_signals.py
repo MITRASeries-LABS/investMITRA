@@ -1029,8 +1029,7 @@ def save_daily_pnl(risk_manager, signals: dict, market_direction: str, vix: floa
 
 def preflight_check() -> bool:
     """Run pre-flight checks before market opens."""
-    print(f"
-{'='*65}")
+    print(f"\n{'='*65}")
     print(f"  investMITRA PRE-FLIGHT CHECK — {date.today()}")
     print(f"{'='*65}")
     all_ok = True
@@ -1082,8 +1081,8 @@ def preflight_check() -> bool:
         print(f"  🟢 ALL CHECKS PASSED — Ready to trade")
     else:
         print(f"  🔴 CHECKS FAILED — Fix issues above before trading")
-    print(f"{'='*65}
-")
+    print(f"{'='*65}")
+
     return all_ok
 
 
