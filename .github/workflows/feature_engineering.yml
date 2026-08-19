@@ -183,3 +183,8 @@ jobs:
         env:
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
         run: python scripts/fetch_market_indices.py
+
+      - name: Fetch global sentiment
+        env:
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+        run: python scripts/fetch_global_sentiment.py
