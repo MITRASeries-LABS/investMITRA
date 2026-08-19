@@ -1,0 +1,17 @@
+import yfinance as yf
+from datetime import date
+ticker = yf.Ticker('MARICO.NS')
+hist = ticker.history(period='1d', interval='5m')
+print('Today MARICO intraday:')
+print(f'Open:  {hist.Open.iloc[0]:.2f}')
+print(f'High:  {hist.High.max():.2f}')
+print(f'Low:   {hist.Low.min():.2f}')
+print(f'Close: {hist.Close.iloc[-1]:.2f}')
+print()
+print('Key levels:')
+print(f'Signal entry:    852.25')
+print(f'1R target (v9):  873.25')
+print(f'Full target:     894.25')
+print(f'Stop:            831.25')
+print(f'Did it hit 1R?   {hist.High.max() >= 873.25}')
+print(f'Did it hit stop? {hist.Low.min() <= 831.25}')
