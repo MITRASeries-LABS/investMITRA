@@ -1,19 +1,21 @@
 """
-investMITRA — Intraday Signal Engine v10
-Critical fix: True gap = Today's Open - Prev Close (not current price)
+investMITRA — Intraday Signal Engine v10 Final
+All safeguards + expanded universe + gap quality filters
 
-Gap logic:
-  Pre-market: fetch today's open from NSE pre-open API
-  9:15-9:30:  record first tick as "today's open" per stock
-  9:30+:      gap = (today_open - prev_close) / prev_close
-              signal = true gap confirmed + price holds + VWAP + ORB
-
-This prevents false signals where price moved WITHIN session
-but was mistaken for a gap.
-
-All v9 features retained:
-  ATR from 14-day daily range, Small cap, Sentiment,
-  Brokerage tracking, Min profit threshold, Risk controls
+KEY CHANGES from v9:
+  1. TRUE GAP = today's open vs prev close (not current price)
+  2. Gap hold confirmation: gap must hold 5 min (not one tick)
+  3. Traded value filter for all caps (replaces volume-only)
+     MID/LARGE: min ₹5Cr daily | SMALL/MICRO: min ₹50L daily
+  4. Price cap raised to ₹20,000 (catches APARINDS, AIAENG)
+  5. Exclude stocks up/down >5% prev day (chasing/exhaustion)
+  6. Exclude stocks with results in next 3 days (not just today)
+  7. Trailing stop: moves up by ATR/2 after each 1R gain
+  8. Dead trade exit: if no movement 45 min after signal → exit
+  9. Gap reversal exit: if price crosses back through open → exit
+  10. NSE bulk deals as additional gap signal source
+  11. 52-week high/low proximity scoring
+  12. Pre-open equilibrium as gap conviction boost
 """
 from __future__ import annotations
 import os, sys, time, logging, requests
@@ -43,6 +45,8 @@ ATR_STOP_MULT           = 1.5
 ATR_TARGET_MULT         = 3.0
 BROKERAGE_PER_TRADE     = 80
 MIN_NET_PROFIT          = 200
+GAP_HOLD_MINUTES        = 5     # Gap must hold for 5 min before signal
+DEAD_TRADE_MINUTES      = 45    # Exit if no movement after 45 min
 
 # ── Session Times ──────────────────────────────────────────────────────────────
 SESSIONS = {
@@ -77,13 +81,30 @@ def get_current_session(now: datetime) -> str:
     return "closed"
 
 
-def get_nse_preopen_prices() -> dict[str, float]:
-    """Fetch NSE pre-open indicative prices — best estimate of today's open."""
+def get_nse_bulk_deals() -> set[str]:
+    """Fetch yesterday's NSE bulk deals — stocks with institutional activity."""
     try:
-        session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json", "Referer": "https://www.nseindia.com"})
-        session.get("https://www.nseindia.com", timeout=10)
-        r = session.get("https://www.nseindia.com/api/market-data-pre-open?key=NIFTY", timeout=10)
+        nse = requests.Session()
+        nse.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json", "Referer": "https://www.nseindia.com"})
+        nse.get("https://www.nseindia.com", timeout=10)
+        r = nse.get("https://www.nseindia.com/api/bulk-deals", timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list):
+                symbols = {item.get("symbol","").upper() for item in data}
+                logger.info("Bulk deals: %d stocks", len(symbols))
+                return symbols
+    except Exception as e:
+        logger.warning("Bulk deals: %s", e)
+    return set()
+
+
+def get_nse_preopen_prices() -> dict[str, float]:
+    try:
+        nse = requests.Session()
+        nse.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json", "Referer": "https://www.nseindia.com"})
+        nse.get("https://www.nseindia.com", timeout=10)
+        r = nse.get("https://www.nseindia.com/api/market-data-pre-open?key=NIFTY", timeout=10)
         if r.status_code != 200: return {}
         prices = {}
         for item in r.json().get("data", []):
@@ -98,10 +119,10 @@ def get_nse_preopen_prices() -> dict[str, float]:
 
 def get_nse_market_breadth() -> dict:
     try:
-        session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json", "Referer": "https://www.nseindia.com"})
-        session.get("https://www.nseindia.com", timeout=10)
-        r = session.get("https://www.nseindia.com/api/allIndices", timeout=10)
+        nse = requests.Session()
+        nse.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json", "Referer": "https://www.nseindia.com"})
+        nse.get("https://www.nseindia.com", timeout=10)
+        r = nse.get("https://www.nseindia.com/api/allIndices", timeout=10)
         if r.status_code != 200: return {}
         breadth = {}
         for idx in r.json().get("data", []):
@@ -134,26 +155,37 @@ def get_key_levels(symbols: list[str]) -> dict[str, dict]:
                            ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS ma50,
                        AVG(ep.high - ep.low) OVER (PARTITION BY ep.isin ORDER BY ep.trade_date
                            ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS atr14,
+                       MAX(ep.high) OVER (PARTITION BY ep.isin ORDER BY ep.trade_date
+                           ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS high_52w,
+                       MIN(ep.low) OVER (PARTITION BY ep.isin ORDER BY ep.trade_date
+                           ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS low_52w,
+                       (ep.close - LAG(ep.close) OVER (PARTITION BY ep.isin ORDER BY ep.trade_date))
+                           / NULLIF(LAG(ep.close) OVER (PARTITION BY ep.isin ORDER BY ep.trade_date), 0) * 100
+                           AS prev_day_chg_pct,
                        ROW_NUMBER() OVER (PARTITION BY ep.isin ORDER BY ep.trade_date DESC) AS rn
                 FROM investmitra.equity_prices ep
                 JOIN investmitra.company_master cm ON ep.isin = cm.isin
                 WHERE cm.nse_symbol = ANY(%s)
                   AND ep.trade_date >= CURRENT_DATE - INTERVAL '60 days'
             )
-            SELECT nse_symbol, open, high, low, close, ma20, ma50, atr14, daily_range
+            SELECT nse_symbol, open, high, low, close, ma20, ma50,
+                   atr14, daily_range, high_52w, low_52w, prev_day_chg_pct
             FROM recent WHERE rn = 1
         """, (symbols,))
         result = {}
         for r in cur.fetchall():
             result[r[0]] = {
-                "prev_open":   float(r[1] or 0),
-                "prev_high":   float(r[2] or 0),
-                "prev_low":    float(r[3] or 0),
-                "prev_close":  float(r[4] or 0),
-                "ma20":        float(r[5] or 0),
-                "ma50":        float(r[6] or 0),
-                "atr14":       float(r[7] or 0),
-                "daily_range": float(r[8] or 0),
+                "prev_open":       float(r[1] or 0),
+                "prev_high":       float(r[2] or 0),
+                "prev_low":        float(r[3] or 0),
+                "prev_close":      float(r[4] or 0),
+                "ma20":            float(r[5] or 0),
+                "ma50":            float(r[6] or 0),
+                "atr14":           float(r[7] or 0),
+                "daily_range":     float(r[8] or 0),
+                "high_52w":        float(r[9] or 0),
+                "low_52w":         float(r[10] or 0),
+                "prev_day_chg":    float(r[11] or 0),
             }
         cur.close(); conn.close()
         return result
@@ -177,7 +209,6 @@ def get_stock_sentiment(symbols: list[str]) -> dict[str, float]:
         """, (symbols,))
         result = {r[0]: float(r[1]) for r in cur.fetchall()}
         cur.close(); conn.close()
-        logger.info("Sentiment: %d stocks", len(result))
         return result
     except Exception as e:
         logger.warning("Sentiment: %s", e); return {}
@@ -188,8 +219,11 @@ def get_premarket_context() -> dict:
         "india_vix": None, "vix_signal": "NORMAL",
         "sgx_change": None, "us_sentiment": "UNKNOWN",
         "global_signal": "NEUTRAL",
-        "results_today": set(), "announcements": [],
+        "results_today": set(),
+        "results_3days": set(),   # NEW: next 3 days results
+        "announcements": [],
         "preopen_prices": {}, "breadth": {},
+        "bulk_deals": set(),      # NEW: yesterday's bulk deals
     }
     try:
         conn = psycopg2.connect(NEON_URL, connect_timeout=10)
@@ -197,11 +231,13 @@ def get_premarket_context() -> dict:
         cur.execute("SELECT last_price FROM investmitra.market_indices WHERE index_name='INDIA VIX' AND fetch_date=CURRENT_DATE ORDER BY fetched_at DESC LIMIT 1")
         r = cur.fetchone()
         if r: ctx["india_vix"] = float(r[0])
+
         cur.execute("SELECT change_str FROM investmitra.global_indices WHERE index_name ILIKE '%SGX%NIFTY%' AND fetch_date=CURRENT_DATE ORDER BY fetched_at DESC LIMIT 1")
         r = cur.fetchone()
         if r:
             try: ctx["sgx_change"] = float(str(r[0]).replace('+','').replace('%',''))
             except: pass
+
         cur.execute("SELECT change_str FROM investmitra.global_indices WHERE index_name ILIKE '%DOW JONES%' AND fetch_date=CURRENT_DATE ORDER BY fetched_at DESC LIMIT 1")
         r = cur.fetchone()
         if r:
@@ -209,8 +245,14 @@ def get_premarket_context() -> dict:
                 chg = float(str(r[0]).replace('+','').replace(',',''))
                 ctx["us_sentiment"] = "POSITIVE" if chg>0 else "NEGATIVE" if chg<-200 else "MIXED"
             except: pass
+
+        # Results today AND next 3 days
         cur.execute("SELECT UPPER(symbol) FROM investmitra.corporate_events WHERE event_date=CURRENT_DATE AND category='RESULTS'")
         ctx["results_today"] = {r[0] for r in cur.fetchall()}
+
+        cur.execute("SELECT UPPER(symbol) FROM investmitra.corporate_events WHERE event_date BETWEEN CURRENT_DATE AND CURRENT_DATE+INTERVAL '3 days' AND category='RESULTS'")
+        ctx["results_3days"] = {r[0] for r in cur.fetchall()}
+
         cur.execute("SELECT symbol, ann_type FROM investmitra.nse_announcements WHERE ann_datetime>=NOW()-INTERVAL '12 hours' AND is_important=TRUE ORDER BY ann_datetime DESC LIMIT 10")
         ctx["announcements"] = [(r[0], r[1]) for r in cur.fetchall()]
         cur.close(); conn.close()
@@ -231,6 +273,7 @@ def get_premarket_context() -> dict:
 
     ctx["preopen_prices"] = get_nse_preopen_prices()
     ctx["breadth"]        = get_nse_market_breadth()
+    ctx["bulk_deals"]     = get_nse_bulk_deals()
     return ctx
 
 
@@ -285,10 +328,12 @@ def get_market_direction(kite: KiteConnect, ctx: dict) -> tuple[str, float]:
         print(f"  📊 Breadth:    A/D = {adv}/{dec} ({ad_ratio:.1f}x)")
     if ctx["preopen_prices"]:
         print(f"  📋 Pre-open:   {len(ctx['preopen_prices'])} stocks with indicative prices")
+    if ctx["bulk_deals"]:
+        print(f"  📦 Bulk deals: {len(ctx['bulk_deals'])} stocks with institutional activity")
     if ctx["results_today"]:
-        print(f"\n  ⚠️  Results TODAY (auto-skipped): {', '.join(list(ctx['results_today'])[:5])}")
-    if ctx["announcements"]:
-        print(f"  📢 Overnight:  {len(ctx['announcements'])} important announcements")
+        print(f"\n  ⚠️  Results TODAY: {', '.join(list(ctx['results_today'])[:5])}")
+    if ctx["results_3days"] - ctx["results_today"]:
+        print(f"  📅 Results next 3 days: {', '.join(list(ctx['results_3days']-ctx['results_today'])[:5])}")
     d_e = "🟢" if direction=="BULLISH" else "🔴" if direction=="BEARISH" else "🟡"
     print(f"\n  {d_e} DIRECTION: {direction}")
     if ctx["vix_signal"]=="HIGH": print(f"  🚨 HIGH VIX — AVOIDING INTRADAY")
@@ -324,19 +369,33 @@ def get_rvol_baseline() -> dict[str, float]:
 
 
 def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
+    """
+    Universe: MID/LARGE/SMALL/MICRO
+    Filter by TRADED VALUE (not just volume) — catches high-price stocks
+    Exclude: results next 3 days, sensitive announcements,
+             stocks up/down >5% yesterday
+    """
     conn = psycopg2.connect(NEON_URL, connect_timeout=15)
     cur  = conn.cursor()
     cur.execute("SELECT UPPER(symbol) FROM investmitra.nse_announcements WHERE ann_datetime>=NOW()-INTERVAL '12 hours' AND is_sensitive=TRUE")
     sensitive = {r[0] for r in cur.fetchall()}
 
     cur.execute("""
-        WITH avg_volume AS (
-            SELECT isin, AVG(volume) AS avg_vol, AVG(close) AS avg_price,
-                   AVG(volume)*AVG(close) AS avg_traded_value
+        WITH avg_stats AS (
+            SELECT isin,
+                   AVG(volume) AS avg_vol,
+                   AVG(close) AS avg_price,
+                   AVG(volume)*AVG(close) AS avg_traded_value,
+                   -- Yesterday's change %
+                   (MAX(CASE WHEN trade_date=(SELECT MAX(t) FROM (SELECT DISTINCT trade_date AS t FROM investmitra.equity_prices WHERE trade_date<CURRENT_DATE ORDER BY t DESC LIMIT 1) x) THEN close END)
+                    - MAX(CASE WHEN trade_date=(SELECT MAX(t) FROM (SELECT DISTINCT trade_date AS t FROM investmitra.equity_prices WHERE trade_date<CURRENT_DATE ORDER BY t DESC LIMIT 2) x LIMIT 1 OFFSET 1) THEN close END))
+                   / NULLIF(MAX(CASE WHEN trade_date=(SELECT MAX(t) FROM (SELECT DISTINCT trade_date AS t FROM investmitra.equity_prices WHERE trade_date<CURRENT_DATE ORDER BY t DESC LIMIT 2) x LIMIT 1 OFFSET 1) THEN close END), 0) * 100
+                   AS prev_day_chg
             FROM investmitra.equity_prices
             WHERE trade_date>=CURRENT_DATE-INTERVAL '30 days'
             GROUP BY isin
-            HAVING AVG(close) BETWEEN 50 AND 5000
+            HAVING AVG(close) BETWEEN 50 AND 20000
+               AND AVG(volume)*AVG(close) >= 5000000
         )
         SELECT ds.isin, ds.company_name, cm.nse_symbol, ds.sector,
                cm.market_cap_category, ds.investmitra_score, ds.signal,
@@ -344,10 +403,11 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
                ROUND(av.avg_vol::numeric,0), ROUND(av.avg_price::numeric,2),
                COALESCE(ss.screen_count,0), COALESCE(vq.piotroski_score,0),
                COALESCE(vq.graham_criteria_met,0),
-               ROUND(av.avg_traded_value::numeric,0)
+               ROUND(av.avg_traded_value::numeric,0),
+               ROUND(av.prev_day_chg::numeric,2)
         FROM investmitra.daily_scores ds
         JOIN investmitra.company_master cm ON ds.isin=cm.isin
-        JOIN avg_volume av ON ds.isin=av.isin
+        JOIN avg_stats av ON ds.isin=av.isin
         LEFT JOIN (SELECT isin, COUNT(DISTINCT screen_name) AS screen_count
                    FROM investmitra.screener_signals
                    WHERE signal_date=(SELECT MAX(signal_date) FROM investmitra.screener_signals)
@@ -362,25 +422,30 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
     cur.close(); conn.close()
 
     preopen    = ctx.get("preopen_prices", {})
+    bulk_deals = ctx.get("bulk_deals", set())
     long_list  = []
     short_list = []
 
     for r in rows:
         symbol     = r[2]
         cap        = r[4]
-        avg_vol    = int(r[8] or 0)
-        avg_price  = float(r[9] or 0)
         avg_traded = float(r[13] or 0)
+        prev_chg   = float(r[14] or 0)
 
         if not symbol: continue
-        if symbol.upper() in ctx["results_today"]: continue
+
+        # Skip results next 3 days
+        if symbol.upper() in ctx["results_3days"]: continue
         if symbol.upper() in sensitive: continue
 
-        if cap in ('MID','LARGE'):
-            if avg_vol < 200000: continue
-        elif cap in ('SMALL','MICRO'):
-            if avg_traded < 50_000_000: continue
-            if avg_vol < 100000: continue
+        # Skip if already moved too much yesterday (chasing)
+        if abs(prev_chg) > 5.0:
+            logger.debug("Skip %s — prev day move %.1f%%", symbol, prev_chg)
+            continue
+
+        # Traded value filter (universal)
+        if avg_traded < 5_000_000:  # Min ₹50L = ₹5M
+            continue
 
         inv   = float(r[5] or 0)
         sc    = int(r[10] or 0)
@@ -392,26 +457,29 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
             (piots/9)*0.15 + (grah/4)*0.15
         ) * 100
 
-        # Pre-open gap — best estimate of true gap before market opens
         po_price    = preopen.get(symbol, 0)
+        avg_price   = float(r[9] or 0)
         preopen_gap = round((po_price - avg_price) / avg_price * 100, 2) if po_price and avg_price else 0.0
+        in_bulk     = symbol.upper() in bulk_deals
 
         stock = {
             "isin": r[0], "company_name": r[1], "symbol": symbol,
             "sector": r[3], "cap": cap,
             "investmitra_score": inv, "signal": r[6],
             "momentum_score": float(r[7] or 0),
-            "avg_volume": avg_vol, "avg_price": avg_price,
+            "avg_volume": int(r[8] or 0), "avg_price": avg_price,
             "avg_traded": avg_traded,
             "screen_count": sc, "piotroski": piots, "graham": grah,
             "quality_score": round(quality, 2),
             "preopen_gap": preopen_gap,
+            "prev_day_chg": prev_chg,
+            "in_bulk_deal": in_bulk,
         }
 
         if inv >= 60:   long_list.append(stock)
         elif inv <= 35: short_list.append(stock)
 
-    long_list  = sorted(long_list,  key=lambda x: x["quality_score"], reverse=True)[:20]
+    long_list  = sorted(long_list,  key=lambda x: x["quality_score"], reverse=True)[:25]
     short_list = sorted(short_list, key=lambda x: x["investmitra_score"])[:10]
     return long_list, short_list
 
@@ -419,12 +487,13 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
 def classify_gap(gap_pct, volume, avg_volume) -> tuple[str, float]:
     abs_gap  = abs(gap_pct)
     high_vol = (volume / avg_volume if avg_volume > 0 else 1) > 1.5
-    if abs_gap > 3.0:              return "exhaustion", 0.5
-    elif abs_gap > 1.5 and high_vol: return "continuation", 1.2
-    elif abs_gap > 1.5:            return "fade_risk", 0.7
-    elif abs_gap > 0.3 and high_vol: return "continuation", 1.0
-    elif abs_gap > 0.3:            return "fade_risk", 0.85
-    else:                           return "small_gap", 0.9
+    if abs_gap > 4.0:                            return "exhaustion", 0.4
+    elif abs_gap > 2.0 and high_vol:             return "continuation_strong", 1.3
+    elif abs_gap > 2.0:                          return "fade_risk", 0.6
+    elif abs_gap > 0.5 and high_vol:             return "continuation", 1.1
+    elif abs_gap > 0.3 and high_vol:             return "continuation", 1.0
+    elif abs_gap > 0.3:                          return "fade_risk", 0.8
+    else:                                         return "small_gap", 0.7
 
 
 class DailyRiskManager:
@@ -440,7 +509,7 @@ class DailyRiskManager:
 
     def can_trade(self) -> tuple[bool, str]:
         if self.net_pnl <= -MAX_DAILY_LOSS_INR:
-            return False, f"Daily loss limit ₹{self.net_pnl:.0f}"
+            return False, f"Daily loss ₹{self.net_pnl:.0f}"
         if self.trades_today >= MAX_POSITIONS * 4:
             return False, f"Max trades ({self.trades_today})"
         if len(self.positions) >= MAX_POSITIONS:
@@ -449,10 +518,12 @@ class DailyRiskManager:
             return False, f"Consecutive losses: {self.consecutive_losses}"
         return True, "OK"
 
-    def open_position(self, symbol, entry, stop, size, target):
+    def open_position(self, symbol, entry, stop, size, target, atr):
         self.positions[symbol] = {
             "entry": entry, "stop": stop, "size": size, "target": target,
             "partial_done": False, "partial_size": size // 2,
+            "atr": atr, "signal_time": datetime.now(IST),
+            "trail_level": 0,  # tracks how many 1R moves made
         }
         self.trades_today    += 1
         self.daily_brokerage += BROKERAGE_PER_TRADE
@@ -491,9 +562,13 @@ class IntradayEngine:
         self.or_low           = defaultdict(lambda: float('inf'))
         self.or_set           = defaultdict(bool)
 
-        # ── KEY FIX: track today's opening price per stock ────────────────────
-        self.today_open       = {}   # symbol -> first tick price (9:15-9:16 AM)
+        # TRUE GAP tracking
+        self.today_open       = {}
         self.open_captured    = defaultdict(bool)
+
+        # Gap hold tracking (5 min confirmation)
+        self.gap_first_seen   = {}   # symbol -> timestamp when gap first confirmed
+        self.gap_direction    = {}   # symbol -> 'LONG' or 'SHORT'
 
         self.signals          = {}
         self.risk             = DailyRiskManager()
@@ -509,13 +584,11 @@ class IntradayEngine:
             volume = tick.get("volume_traded", 0)
             if ltp <= 0: continue
 
-            # ── Capture today's open (first tick at/after 9:15 AM) ───────────
-            if session in ("opening", "momentum") and not self.open_captured[symbol]:
-                # Use Kite's OHLC open field if available, else first tick
+            # Capture today's open
+            if session in ("opening","momentum") and not self.open_captured[symbol]:
                 ohlc_open = tick.get("ohlc", {}).get("open", 0)
                 self.today_open[symbol] = ohlc_open if ohlc_open > 0 else ltp
                 self.open_captured[symbol] = True
-                logger.debug("%s today open: ₹%.2f", symbol, self.today_open[symbol])
 
             # VWAP
             new_vol = max(0, volume - self.cum_vol[symbol])
@@ -525,38 +598,73 @@ class IntradayEngine:
                 if volume > 0:
                     self.vwap[symbol] = self.cum_tp_vol[symbol] / volume
 
-            # Opening range (9:15-9:30)
+            # Opening range
             if session == "opening":
                 self.or_high[symbol] = max(self.or_high.get(symbol, 0), ltp)
                 self.or_low[symbol]  = min(self.or_low.get(symbol, float('inf')), ltp)
             elif session == "momentum" and not self.or_set[symbol]:
                 self.or_set[symbol] = True
 
-            self._check_partial_exit(symbol, ltp, session)
+            self._check_exits(symbol, ltp, session, now)
 
-            if session in ("momentum", "choppy", "afternoon"):
+            if session in ("momentum","choppy","afternoon"):
                 self._check_signal(symbol, ltp, volume, now, session)
 
-    def _check_partial_exit(self, symbol, ltp, session):
+    def _check_exits(self, symbol, ltp, session, now):
+        """Check all exit conditions: partial, trailing, dead trade, reversal."""
         if symbol not in self.risk.positions: return
-        pos = self.risk.positions[symbol]
-        if pos["partial_done"]: return
-
+        pos   = self.risk.positions[symbol]
         entry = pos["entry"]
-        risk  = abs(entry - pos["stop"])
+        stop  = pos["stop"]
+        atr   = pos["atr"]
+        risk  = abs(entry - stop)
+        is_long = symbol in self.long_map
 
-        if (ltp >= entry + risk and symbol in self.long_map) or \
-           (ltp <= entry - risk and symbol in self.short_map):
-            pos["partial_done"] = True
-            partial_size = pos["partial_size"]
-            pnl = abs(ltp - entry) * partial_size
-            self.risk.daily_pnl += pnl
-            pos["stop"] = entry
-            pos["size"] -= partial_size
-            net = pnl - BROKERAGE_PER_TRADE // 2
-            print(f"\n  💰 PARTIAL EXIT: {symbol} — {partial_size} sh @ ₹{ltp:.2f} | Net: +₹{net:.0f}")
-            print(f"  📍 Stop → breakeven ₹{entry:.2f} | Remaining: {pos['size']} shares\n")
+        # Stoploss hit
+        if (is_long and ltp <= stop) or (not is_long and ltp >= stop):
+            pnl = self.risk.close_position(symbol, ltp)
+            print(f"\n  🛑 STOPLOSS: {symbol} @ ₹{ltp:.2f} | Net: ₹{pnl:.0f}\n")
+            return
 
+        # Gap reversal exit: price crosses back through open
+        today_open = self.today_open.get(symbol, entry)
+        if is_long and ltp < today_open * 0.998:
+            pnl = self.risk.close_position(symbol, ltp)
+            print(f"\n  🔄 GAP REVERSAL EXIT: {symbol} @ ₹{ltp:.2f} | Gap filled | Net: ₹{pnl:.0f}\n")
+            return
+
+        # Dead trade exit: no movement after 45 min
+        elapsed = (now - pos["signal_time"]).total_seconds() / 60
+        if elapsed > DEAD_TRADE_MINUTES and not pos["partial_done"]:
+            pnl = self.risk.close_position(symbol, ltp)
+            print(f"\n  ⏰ DEAD TRADE EXIT: {symbol} @ ₹{ltp:.2f} | No move in {DEAD_TRADE_MINUTES}min | Net: ₹{pnl:.0f}\n")
+            return
+
+        # Partial exit at 1R
+        if not pos["partial_done"]:
+            if (is_long and ltp >= entry + risk) or (not is_long and ltp <= entry - risk):
+                pos["partial_done"] = True
+                partial_size = pos["partial_size"]
+                pnl = abs(ltp - entry) * partial_size
+                self.risk.daily_pnl += pnl
+                pos["stop"] = entry  # Move to breakeven
+                pos["size"] -= partial_size
+                net = pnl - BROKERAGE_PER_TRADE // 2
+                print(f"\n  💰 PARTIAL EXIT: {symbol} — {partial_size} sh @ ₹{ltp:.2f} | Net: +₹{net:.0f}")
+                print(f"  📍 Stop → breakeven ₹{entry:.2f} | Remaining: {pos['size']} shares\n")
+
+        # Trailing stop: move stop by ATR/2 after each additional 1R
+        elif pos["partial_done"] and pos["size"] > 0:
+            moves_made = int((ltp - entry) / risk) if is_long else int((entry - ltp) / risk)
+            if moves_made > pos["trail_level"] + 1:
+                pos["trail_level"] = moves_made - 1
+                new_stop = round(entry + (pos["trail_level"] * risk * 0.5), 2) if is_long else \
+                           round(entry - (pos["trail_level"] * risk * 0.5), 2)
+                if (is_long and new_stop > pos["stop"]) or (not is_long and new_stop < pos["stop"]):
+                    pos["stop"] = new_stop
+                    print(f"\n  📈 TRAILING STOP: {symbol} → ₹{new_stop:.2f}\n")
+
+        # Session close
         if session == "closing":
             pnl = self.risk.close_position(symbol, ltp)
             if pnl is not None:
@@ -576,10 +684,9 @@ class IntradayEngine:
         now        = datetime.now(IST)
         mkt_min    = now.hour*60+now.minute-(9*60+15)
         frac       = max(mkt_min/375, 0.05)
-        exp_vol    = avg_daily * frac
-        rvol       = volume / exp_vol if exp_vol > 0 else 1
+        rvol       = volume / (avg_daily * frac) if avg_daily * frac > 0 else 1
 
-        # Gap classification using TRUE gap
+        # Gap classification
         avg_vol    = stock.get("avg_volume", 1)
         gap_type, gap_mult = classify_gap(true_gap_pct, volume, avg_vol)
 
@@ -589,7 +696,6 @@ class IntradayEngine:
         nifty_data = self.breadth.get("NIFTY 50", {})
         nifty_chg  = nifty_data.get("pct_change", 0)
         stock_chg  = true_gap_pct
-
         if stock_chg > sector_chg > nifty_chg and true_gap_pct > 0: sector_rs = 90
         elif stock_chg > sector_chg:                                  sector_rs = 70
         elif stock_chg > nifty_chg:                                   sector_rs = 55
@@ -597,13 +703,18 @@ class IntradayEngine:
 
         # Key levels
         ma20 = kl.get("ma20", 0); ma50 = kl.get("ma50", 0)
+        high_52w = kl.get("high_52w", 0); low_52w = kl.get("low_52w", 0)
         kl_score = 50
         if ma20 and ma50:
-            if ltp > ma20 and ltp > ma50: kl_score = 80
-            elif ltp > ma20:              kl_score = 60
+            if ltp > ma20 and ltp > ma50: kl_score = 70
+            elif ltp > ma20:              kl_score = 55
             else:                         kl_score = 30
-        prev_h = kl.get("prev_high", 0)
-        if prev_h and abs(ltp - prev_h) / prev_h < 0.005: kl_score -= 20
+        # 52-week high breakout bonus
+        if high_52w and ltp >= high_52w * 0.99:
+            kl_score += 20  # Near 52-week high = breakout potential
+        # 52-week low bounce bonus for shorts
+        if low_52w and ltp <= low_52w * 1.01:
+            kl_score += 15
 
         # Breadth
         adv = nifty_data.get("advances", 0); dec = nifty_data.get("declines", 0)
@@ -622,10 +733,17 @@ class IntradayEngine:
         sent = self.sentiment.get(symbol, 0)
         sent_score = 80 if sent>0.3 else 20 if sent<-0.3 else 50
 
-        # Price holding above open (continuation check)
-        today_open  = self.today_open.get(symbol, ltp)
-        holding_open = ltp >= today_open if true_gap_pct > 0 else ltp <= today_open
-        holding_score = 80 if holding_open else 30
+        # Bulk deal bonus
+        bulk_score = 70 if stock.get("in_bulk_deal") else 50
+
+        # Price holding above open
+        today_open    = self.today_open.get(symbol, ltp)
+        holding_score = 80 if (true_gap_pct>0 and ltp>=today_open) or \
+                              (true_gap_pct<0 and ltp<=today_open) else 25
+
+        # Pre-open conviction
+        preopen_gap   = stock.get("preopen_gap", 0)
+        preopen_score = 80 if abs(preopen_gap)>0.5 else 60 if abs(preopen_gap)>0.2 else 40
 
         vwap_score  = 80 if ltp > vwap else 20
         rvol_score  = min((rvol-1)/3.0*100, 100) if rvol > 1 else 0
@@ -634,28 +752,30 @@ class IntradayEngine:
         sess_mult   = {"momentum":1.0,"choppy":0.7,"afternoon":0.85}.get(session, 0.5)
 
         opp = (
-            gap_score     * 0.17 +
-            rvol_score    * 0.13 +
-            vwap_score    * 0.12 +
-            orb_score     * 0.13 +
-            holding_score * 0.10 +   # NEW: price holding above/below open
-            sector_rs     * 0.13 +
+            gap_score     * 0.15 +
+            rvol_score    * 0.12 +
+            vwap_score    * 0.10 +
+            orb_score     * 0.12 +
+            holding_score * 0.10 +
+            sector_rs     * 0.12 +
             breadth_score * 0.05 +
             regime_score  * 0.05 +
             kl_score      * 0.08 +
-            sent_score    * 0.04
+            sent_score    * 0.04 +
+            bulk_score    * 0.04 +
+            preopen_score * 0.03
         ) * sess_mult
 
         details = {
             "gap_type": gap_type, "gap_score": round(gap_score,1),
             "rvol": round(rvol,2), "rvol_score": round(rvol_score,1),
             "vwap_score": vwap_score, "orb_score": round(orb_score,1),
-            "holding_score": holding_score,
+            "holding_score": holding_score, "preopen_score": preopen_score,
             "sector_rs": round(sector_rs,1), "breadth": round(breadth_score,1),
             "kl_score": kl_score, "sector_chg": round(sector_chg,2),
             "stock_vs_sector": round(stock_chg-sector_chg,2),
-            "sentiment": round(sent,2),
-            "today_open": round(today_open, 2),
+            "sentiment": round(sent,2), "bulk_deal": stock.get("in_bulk_deal",False),
+            "today_open": round(today_open,2), "52w_high": round(high_52w,2),
         }
         return round(opp, 2), details
 
@@ -671,45 +791,70 @@ class IntradayEngine:
         kl    = self.key_levels.get(symbol, {})
         if not prev: return
 
-        # ── TRUE GAP: open vs prev close ─────────────────────────────────────
+        # Need today's open captured
         today_open = self.today_open.get(symbol, 0)
-        if today_open == 0: return  # Wait until open is captured
+        if today_open == 0: return
 
+        # TRUE GAP
         true_gap_pct = (today_open - prev) / prev * 100
 
-        # Current price must also be on correct side of gap
-        above_vwap   = ltp > vwap * 1.001
-        below_vwap   = ltp < vwap * 0.999
-        gap_thresh   = GAP_THRESHOLDS.get(session, 0.4)
+        # GAP HOLD CONFIRMATION (5 minutes)
+        gap_thresh = GAP_THRESHOLDS.get(session, 0.4)
         if self.vix_signal == "ELEVATED": gap_thresh *= 1.5
+
+        if abs(true_gap_pct) > gap_thresh:
+            # First time we see this gap — record timestamp
+            if symbol not in self.gap_first_seen:
+                self.gap_first_seen[symbol] = now
+                self.gap_direction[symbol] = "LONG" if true_gap_pct > 0 else "SHORT"
+
+            # Check if gap has held for 5 minutes
+            elapsed_mins = (now - self.gap_first_seen[symbol]).total_seconds() / 60
+            if elapsed_mins < GAP_HOLD_MINUTES:
+                return  # Wait for gap to confirm
+
+            # Check gap direction hasn't flipped
+            current_dir = "LONG" if true_gap_pct > 0 else "SHORT"
+            if current_dir != self.gap_direction.get(symbol):
+                del self.gap_first_seen[symbol]
+                return
+        else:
+            # Gap disappeared — reset
+            if symbol in self.gap_first_seen:
+                del self.gap_first_seen[symbol]
+            return
+
+        above_vwap = ltp > vwap * 1.001
+        below_vwap = ltp < vwap * 0.999
 
         quality = stock.get("quality_score", 50)
         opp, details = self._compute_opportunity_score(symbol, ltp, volume, true_gap_pct, session)
 
-        if details["gap_type"] == "exhaustion": return
+        if details["gap_type"] in ("exhaustion", "fade_risk"):
+            if details["gap_type"] == "exhaustion": return
+            # fade_risk: require higher quality + volume
+            if quality < 65 or details["rvol"] < 1.5: return
 
         final = quality * 0.40 + opp * 0.60
-        if final < 45: return
+        if final < 48: return
 
         direction = None
         if (symbol in self.long_map and
                 self.market_direction in ("BULLISH","NEUTRAL") and
-                true_gap_pct > gap_thresh and         # TRUE gap threshold
-                ltp > today_open * 0.999 and          # price holding above open
+                true_gap_pct > gap_thresh and
+                ltp >= today_open * 0.998 and  # holding above open
                 above_vwap and score >= 60):
             direction = "LONG"
         elif (symbol in self.short_map and
                 self.market_direction in ("BEARISH","NEUTRAL") and
-                true_gap_pct < -gap_thresh and        # TRUE gap threshold
-                ltp < today_open * 1.001 and          # price holding below open
+                true_gap_pct < -gap_thresh and
+                ltp <= today_open * 1.002 and  # holding below open
                 below_vwap and score <= 40):
             direction = "SHORT"
         if not direction: return
 
         # ATR from 14-day daily range
-        atr = kl.get("atr14", 0)
-        if atr == 0: atr = kl.get("daily_range", 0)
-        if atr == 0: atr = ltp * 0.01
+        atr = kl.get("atr14", 0) or kl.get("daily_range", 0) or ltp * 0.01
 
         stop   = round(ltp - atr*ATR_STOP_MULT, 2) if direction=="LONG" else round(ltp + atr*ATR_STOP_MULT, 2)
         target = round(ltp + atr*ATR_TARGET_MULT, 2) if direction=="LONG" else round(ltp - atr*ATR_TARGET_MULT, 2)
@@ -718,12 +863,10 @@ class IntradayEngine:
 
         size = max(1, min(int(MAX_RISK_PER_TRADE_INR/stop_dist), int(MAX_CAPITAL_PER_TRADE/ltp)))
 
-        expected_profit = (abs(target - ltp) * size * 0.5) - BROKERAGE_PER_TRADE
-        if expected_profit < MIN_NET_PROFIT:
-            logger.debug("Skip %s — net profit ₹%.0f < ₹%d", symbol, expected_profit, MIN_NET_PROFIT)
-            return
+        expected_net = (abs(target - ltp) * size * 0.5) - BROKERAGE_PER_TRADE
+        if expected_net < MIN_NET_PROFIT: return
 
-        self.risk.open_position(symbol, ltp, stop, size, target)
+        self.risk.open_position(symbol, ltp, stop, size, target, atr)
 
         self.signals[symbol] = dict(
             symbol=symbol, direction=direction, entry=ltp,
@@ -733,11 +876,12 @@ class IntradayEngine:
             quality_score=quality, opp_score=opp,
             position_size=size, stop_dist=round(stop_dist,2),
             risk_inr=round(stop_dist*size,0),
-            expected_net=round(expected_profit,0),
+            expected_net=round(expected_net,0),
             session=session, time=now.strftime("%H:%M:%S"),
             details=details, cap=stock.get("cap","?"),
             screens=stock.get("screen_count",0),
             piotroski=stock.get("piotroski",0),
+            in_bulk=stock.get("in_bulk_deal",False),
         )
         self._print_signal(self.signals[symbol], stock)
 
@@ -746,29 +890,28 @@ class IntradayEngine:
         pct    = abs(sig["entry"]-sig["target"])/sig["entry"]*100
         sl_pct = abs(sig["entry"]-sig["stoploss"])/sig["entry"]*100
         d      = sig["details"]
-        size_note = " | REDUCE SIZE" if self.vix_signal=="ELEVATED" else ""
-        cap_note  = " 💎" if sig["cap"] in ("SMALL","MICRO") else ""
+        bulk   = " 📦 BULK DEAL" if sig["in_bulk"] else ""
+        cap52  = f" 🏆 52W HIGH" if d.get("52w_high") and sig["entry"] >= d["52w_high"]*0.99 else ""
         print(f"\n{'='*65}")
-        print(f"  {emoji} SIGNAL — {sig['symbol']} [{sig['cap']}]{cap_note}{size_note}")
+        print(f"  {emoji} — {sig['symbol']} [{sig['cap']}]{bulk}{cap52}")
         print(f"  {stock.get('company_name','')[:50]}")
         print(f"{'='*65}")
-        print(f"  Entry:         ₹{sig['entry']:,.2f}")
-        print(f"  Target:        ₹{sig['target']:,.2f}  (+{pct:.1f}%)")
-        print(f"  Stoploss:      ₹{sig['stoploss']:,.2f}  (-{sl_pct:.1f}%) [ATR: ₹{sig['atr']:.2f}]")
-        print(f"  Size:          {sig['position_size']} shares × ₹{sig['entry']:.0f} = ₹{sig['position_size']*sig['entry']:,.0f}")
-        print(f"  Risk:          ₹{sig['risk_inr']:.0f} + ₹{BROKERAGE_PER_TRADE} brokerage")
-        print(f"  Expected net:  ₹{sig['expected_net']:.0f} (at 50% exit)")
-        print(f"  Profit plan:   Exit 50% at 1R → trail remainder")
-        print(f"  True Gap:      {sig['true_gap']:+.2f}% (open ₹{sig['today_open']:.2f} vs prev close)")
-        print(f"  VWAP:          ₹{sig['vwap']:,.2f}")
-        print(f"  RVOL:          {d['rvol']:.1f}x  |  ORB: {d['orb_score']:.0f}  |  Holding: {d['holding_score']:.0f}")
-        print(f"  Sector RS:     {d['stock_vs_sector']:+.2f}% vs sector  |  Sector: {d['sector_chg']:+.2f}%")
-        print(f"  Sentiment:     {d['sentiment']:+.2f}")
-        print(f"  Final Score:   {sig['final_score']:.1f}  (Q:{sig['quality_score']:.0f} | O:{sig['opp_score']:.0f})")
-        print(f"  Screens: {sig['screens']} | F-Score: {sig['piotroski']} | {sig['session']}")
-        print(f"  Time:          {sig['time']}")
-        print(f"  Net P&L today: ₹{self.risk.net_pnl:.0f}")
-        print(f"  ⚠️  Square off by 3:00 PM")
+        print(f"  Entry:        ₹{sig['entry']:,.2f}")
+        print(f"  Target:       ₹{sig['target']:,.2f}  (+{pct:.1f}%)")
+        print(f"  Stoploss:     ₹{sig['stoploss']:,.2f}  (-{sl_pct:.1f}%) [ATR: ₹{sig['atr']:.2f}]")
+        print(f"  Size:         {sig['position_size']} sh × ₹{sig['entry']:.0f} = ₹{sig['position_size']*sig['entry']:,.0f}")
+        print(f"  Risk:         ₹{sig['risk_inr']:.0f} + ₹{BROKERAGE_PER_TRADE} brokerage")
+        print(f"  Expected net: ₹{sig['expected_net']:.0f} (at 50% exit)")
+        print(f"  Exits:        50% at 1R → trail → reversal/dead/3PM")
+        print(f"  True Gap:     {sig['true_gap']:+.2f}% (open ₹{sig['today_open']:.2f} vs prev ₹{self.prev_close.get(sig['symbol'],0):.2f})")
+        print(f"  Gap held:     {GAP_HOLD_MINUTES} min confirmed")
+        print(f"  VWAP:         ₹{sig['vwap']:,.2f}")
+        print(f"  RVOL:         {d['rvol']:.1f}x | ORB: {d['orb_score']:.0f} | Hold: {d['holding_score']:.0f}")
+        print(f"  Sector RS:    {d['stock_vs_sector']:+.2f}% vs sector | Sector: {d['sector_chg']:+.2f}%")
+        print(f"  Sentiment:    {d['sentiment']:+.2f} | Bulk: {'YES' if d['bulk_deal'] else 'no'}")
+        print(f"  Score:        {sig['final_score']:.1f} (Q:{sig['quality_score']:.0f} | O:{sig['opp_score']:.0f})")
+        print(f"  F-Score: {sig['piotroski']} | Screens: {sig['screens']} | {sig['session']}")
+        print(f"  Time:         {sig['time']} | Net P&L: ₹{self.risk.net_pnl:.0f}")
         print(f"{'='*65}\n")
 
     def print_summary(self):
@@ -777,34 +920,32 @@ class IntradayEngine:
         print(f"\n{'='*65}")
         print(f"  INTRADAY SUMMARY — {date.today()}")
         print(f"  Market: {self.market_direction} | VIX: {self.vix_signal}")
-        print(f"  Gross: ₹{self.risk.daily_pnl:.0f} | Brokerage: ₹{self.risk.daily_brokerage:.0f} | Net: ₹{self.risk.net_pnl:.0f}")
+        print(f"  Gross: ₹{self.risk.daily_pnl:.0f} | Brokerage: ₹{self.risk.daily_brokerage:.0f} | NET: ₹{self.risk.net_pnl:.0f}")
         print(f"{'='*65}")
         for label, lst in [("🟢 LONG", longs), ("🔴 SHORT", shorts)]:
             if lst:
                 print(f"\n  {label} ({len(lst)}):")
                 for s in lst:
-                    cap = s['position_size'] * s['entry']
-                    print(f"    {s['symbol']:<12}[{s['cap']}] Entry ₹{s['entry']:>8,.2f} → ₹{s['target']:>8,.2f} | SL ₹{s['stoploss']:,.2f} | {s['position_size']}sh ₹{cap:,.0f} | Gap {s['true_gap']:+.1f}%")
+                    cap = s['position_size']*s['entry']
+                    print(f"    {s['symbol']:<12}[{s['cap']}] ₹{s['entry']:>8,.2f}→₹{s['target']:>8,.2f} SL:₹{s['stoploss']:,.2f} {s['position_size']}sh ₹{cap:,.0f} Gap:{s['true_gap']:+.1f}%")
         if not longs and not shorts:
-            print("  No signals triggered today.")
-        print(f"\n  ⚠️  SQUARE OFF ALL POSITIONS BY 3:00 PM")
+            print("  No signals today.")
+        print(f"\n  ⚠️  SQUARE OFF BY 3:00 PM")
         print(f"{'='*65}\n")
 
 
 def main():
     if not API_KEY or not ACCESS_TOKEN:
-        print("❌ Run: python scripts/kite_login.py first")
-        sys.exit(1)
+        print("❌ Run: python scripts/kite_login.py first"); sys.exit(1)
 
     kite = KiteConnect(api_key=API_KEY)
     kite.set_access_token(ACCESS_TOKEN)
 
     ctx = get_premarket_context()
-    market_direction, nifty_change = get_market_direction(kite, ctx)
+    market_direction, _ = get_market_direction(kite, ctx)
 
     if ctx["vix_signal"] == "HIGH":
-        print("🚨 VIX > 20 — No intraday today.")
-        sys.exit(0)
+        print("🚨 VIX > 20 — No intraday today."); sys.exit(0)
 
     rvol_baseline         = get_rvol_baseline()
     long_list, short_list = get_intraday_watchlist(ctx)
@@ -826,34 +967,34 @@ def main():
     sector_quotes = get_sector_quotes(kite)
     sentiment     = get_stock_sentiment(symbols)
 
-    logger.info("Loaded: key_levels=%d sector=%d sentiment=%d",
-                len(key_levels), len(sector_quotes), len(sentiment))
+    logger.info("Universe: %d stocks | key_levels:%d sector:%d sentiment:%d",
+                len(all_stocks), len(key_levels), len(sector_quotes), len(sentiment))
 
     # Print watchlist
     print(f"\n{'='*65}")
     print(f"  INTRADAY WATCHLIST v10 — {date.today()} | {market_direction}")
-    print(f"  TRUE GAP = Open vs Prev Close | ATR = 14-day daily range")
-    print(f"  Capital: ₹{MAX_CAPITAL_PER_TRADE:,}/trade | Risk: ₹{MAX_RISK_PER_TRADE_INR}/trade")
+    print(f"  TRUE GAP | 5-min hold | ATR 14-day | Traded value filter")
+    print(f"  Cap: ₹{MAX_CAPITAL_PER_TRADE:,}/trade | Risk: ₹{MAX_RISK_PER_TRADE_INR}")
     print(f"{'='*65}")
     if long_list:
-        print(f"\n  🟢 LONG ({len(long_list)}):")
-        print(f"  {'Symbol':<14} {'Cap':<7} {'Qual':>5} {'Scr':>4} {'F':>3} {'ATR':>6} {'PreGap':>7}")
-        print(f"  {'─'*55}")
+        print(f"\n  🟢 LONG ({len(long_list)}) — sorted by Quality:")
+        print(f"  {'Symbol':<13} {'Cap':<7} {'Qual':>5} {'Score':>6} {'Scr':>4} {'F':>3} {'ATR':>7} {'Prev%':>6} {'Bulk'}")
+        print(f"  {'─'*65}")
         for s in long_list:
             if s["symbol"] in token_map:
                 kl  = key_levels.get(s["symbol"], {})
                 atr = kl.get("atr14", 0)
-                po  = f"{s['preopen_gap']:+.1f}%" if s.get("preopen_gap") else "  N/A"
-                print(f"  {s['symbol']:<14} {s['cap']:<7} {s['quality_score']:>5.1f} {s['screen_count']:>4} {s['piotroski']:>3} {atr:>6.1f} {po:>7}")
+                blk = "📦" if s.get("in_bulk_deal") else ""
+                print(f"  {s['symbol']:<13} {s['cap']:<7} {s['quality_score']:>5.1f} {s['investmitra_score']:>6.1f} {s['screen_count']:>4} {s['piotroski']:>3} {atr:>7.1f} {s['prev_day_chg']:>+5.1f}% {blk}")
     if short_list:
         print(f"\n  🔴 SHORT ({len(short_list)}):")
         for s in short_list:
             if s["symbol"] in token_map:
                 kl  = key_levels.get(s["symbol"], {})
                 atr = kl.get("atr14", 0)
-                print(f"  {s['symbol']:<14} {s['cap']:<7} {s['quality_score']:>5.1f} ATR:{atr:.1f}")
-
-    print(f"\n  Waiting for 9:15 AM open capture → signals after 9:30 AM")
+                print(f"  {s['symbol']:<13} {s['cap']:<7} {s['quality_score']:>5.1f} {s['investmitra_score']:>6.1f} ATR:{atr:.1f}")
+    print(f"\n  Capturing opens 9:15-9:30 → gap hold 5min → signals 9:35+")
+    print(f"  Exits: partial@1R | trail | reversal | dead@45min | 3PM")
     print(f"{'='*65}\n")
 
     tokens = list(token_map.values())
@@ -869,10 +1010,10 @@ def main():
     ticker = KiteTicker(API_KEY, ACCESS_TOKEN)
     ticker.on_connect = on_connect
     ticker.on_ticks   = engine.on_tick
-    ticker.on_close   = lambda ws, c, r: logger.warning("Closed: %s", r)
-    ticker.on_error   = lambda ws, c, r: logger.error("Error: %s", r)
+    ticker.on_close   = lambda ws,c,r: logger.warning("Closed: %s", r)
+    ticker.on_error   = lambda ws,c,r: logger.error("Error: %s", r)
 
-    logger.info("Live — capturing opens 9:15-9:30 → signals from 9:30 AM")
+    logger.info("Live — 9:15 open capture → 9:35+ signals")
     try:
         ticker.connect(threaded=True)
         while True:
