@@ -26,9 +26,12 @@ OPUS_MODEL   = "claude-opus-4-6"
 def call_claude(prompt: str, model: str = SONNET_MODEL, max_tokens: int = 1000) -> str:
     """Call Claude API and return response text."""
     try:
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json",
+                     "x-api-key": api_key,
+                     "anthropic-version": "2023-06-01"},
             json={
                 "model":      model,
                 "max_tokens": max_tokens,
@@ -68,21 +71,21 @@ TRADE DETAILS:
   Direction:  {direction}
   Outcome:    {outcome}
   Net P&L:    ₹{net_pnl:.0f}
-  Hold time:  {trade.get('hold_minutes', 0)} minutes
+  Hold time:  {int(trade.get('hold_minutes') or 0)} minutes
 
 SIGNAL CONTEXT AT ENTRY:
-  True Gap:      {trade.get('true_gap_pct', 0):+.2f}% (open vs prev close)
+  True Gap:      {float(trade.get('true_gap_pct') or 0):+.2f}% (open vs prev close)
   Gap Type:      {trade.get('gap_type', 'unknown')}
-  RVOL:          {trade.get('rvol', 0):.1f}x (relative volume)
-  Sector RS:     {trade.get('sector_rs', 0):.0f}/100
-  Sector Change: {trade.get('sector_chg', 0):+.2f}%
-  Final Score:   {trade.get('final_score', 0):.1f}/100
-  Quality Score: {trade.get('quality_score', 0):.1f}/100
-  Opp Score:     {trade.get('opp_score', 0):.1f}/100
+  RVOL:          {float(trade.get('rvol') or 0):.1f}x (relative volume)
+  Sector RS:     {float(trade.get('sector_rs') or 0):.0f}/100
+  Sector Change: {float(trade.get('sector_chg') or 0):+.2f}%
+  Final Score:   {float(trade.get('final_score') or 0):.1f}/100
+  Quality Score: {float(trade.get('quality_score') or 0):.1f}/100
+  Opp Score:     {float(trade.get('opp_score') or 0):.1f}/100
 
 MARKET CONTEXT:
   Direction:  {trade.get('market_direction', 'NEUTRAL')}
-  VIX:        {trade.get('vix_level', 0):.2f}
+  VIX:        {float(trade.get('vix_level') or 0):.2f}
   Session:    {trade.get('session', 'momentum')}
 
 Analyze this trade concisely. Respond in JSON only:

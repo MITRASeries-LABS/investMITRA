@@ -77,9 +77,12 @@ def get_todays_pnl() -> dict:
 
 def call_sonnet(prompt: str) -> str:
     try:
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json",
+                     "x-api-key": api_key,
+                     "anthropic-version": "2023-06-01"},
             json={
                 "model":      SONNET,
                 "max_tokens": 600,

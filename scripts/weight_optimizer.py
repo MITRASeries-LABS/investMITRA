@@ -24,9 +24,12 @@ OPUS_MODEL = "claude-opus-4-6"
 def call_opus(prompt: str, max_tokens: int = 2000) -> str:
     """Call Claude Opus for deep analysis."""
     try:
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json",
+                     "x-api-key": api_key,
+                     "anthropic-version": "2023-06-01"},
             json={
                 "model":      OPUS_MODEL,
                 "max_tokens": max_tokens,
