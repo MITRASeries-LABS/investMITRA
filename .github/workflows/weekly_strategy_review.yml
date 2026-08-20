@@ -1,0 +1,49 @@
+name: Weekly Strategy Review — Self-Healing Backtest
+
+on:
+  schedule:
+    # Every Sunday at 11:30 PM IST (18:00 UTC)
+    - cron: "0 18 * * 0"
+  workflow_dispatch:
+    inputs:
+      weeks:
+        description: "Weeks of data to analyze"
+        required: false
+        default: "1"
+
+jobs:
+  weekly-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-flow.txt psycopg2-binary requests python-dotenv
+
+      - name: Initialize trade tables
+        env:
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+        run: python scripts/trade_logger.py
+
+      - name: Analyze recent trades (Sonnet)
+        env:
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/trade_analyzer.py
+
+      - name: Run Opus weekly review + update weights
+        env:
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/weekly_review.py
