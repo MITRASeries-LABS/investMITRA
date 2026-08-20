@@ -415,7 +415,8 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
         LEFT JOIN investmitra.value_quality vq ON ds.isin=vq.isin
         WHERE ds.score_date=(SELECT MAX(score_date) FROM investmitra.daily_scores)
           AND cm.nse_symbol IS NOT NULL
-          AND cm.market_cap_category IN ('MID','LARGE','SMALL','MICRO')
+                    AND cm.market_cap_category IN ('MID','LARGE','SMALL','MICRO')
+          AND cm.nse_symbol IN (SELECT symbol FROM investmitra.fo_stocks)
         ORDER BY ds.investmitra_score DESC
     """)
     rows = cur.fetchall()

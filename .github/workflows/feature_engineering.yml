@@ -162,6 +162,21 @@ jobs:
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
         run: python scripts/fetch_sebi_rss.py
 
+      - name: Fetch F&O stock list
+        env:
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+        run: python scripts/fetch_fo_stocks.py
+
+      - name: Fetch market indices
+        env:
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+        run: python scripts/fetch_market_indices.py
+
+      - name: Fetch global sentiment
+        env:
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+        run: python scripts/fetch_global_sentiment.py
+
       - name: Compute daily top picks
         env:
           CC_ENV: prod
@@ -179,12 +194,10 @@ jobs:
             python scripts/daily_top_picks.py --top 10 --cap SMALLMICRO --no-ta
           fi
 
-      - name: Fetch market indices
+      - name: Daily trade analysis (Sonnet)
         env:
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
-        run: python scripts/fetch_market_indices.py
-
-      - name: Fetch global sentiment
-        env:
-          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
-        run: python scripts/fetch_global_sentiment.py
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/trade_analyzer.py
