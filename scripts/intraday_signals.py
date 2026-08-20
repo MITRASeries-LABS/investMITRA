@@ -632,6 +632,10 @@ class IntradayEngine:
         if (is_long and ltp <= stop) or (not is_long and ltp >= stop):
             pnl = self.risk.close_position(symbol, ltp)
             print(f"\n  🛑 STOPLOSS: {symbol} @ ₹{ltp:.2f} | Net: ₹{pnl:.0f}\n")
+            try:
+                from order_manager import notify as tg_notify
+                tg_notify(f"STOPLOSS - {symbol}\nExit: {ltp:.2f}\nNet: {pnl:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
+            except: pass
             return
 
         # Gap reversal exit: price crosses back through open
@@ -639,6 +643,10 @@ class IntradayEngine:
         if is_long and ltp < today_open * 0.998:
             pnl = self.risk.close_position(symbol, ltp)
             print(f"\n  🔄 GAP REVERSAL EXIT: {symbol} @ ₹{ltp:.2f} | Gap filled | Net: ₹{pnl:.0f}\n")
+            try:
+                from order_manager import notify as tg_notify
+                tg_notify(f"GAP REVERSAL EXIT - {symbol}\nExit: {ltp:.2f}\nNet: {pnl:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
+            except: pass
             return
 
         # Dead trade exit: no movement after 45 min
@@ -646,6 +654,10 @@ class IntradayEngine:
         if elapsed > DEAD_TRADE_MINUTES and not pos["partial_done"]:
             pnl = self.risk.close_position(symbol, ltp)
             print(f"\n  ⏰ DEAD TRADE EXIT: {symbol} @ ₹{ltp:.2f} | No move in {DEAD_TRADE_MINUTES}min | Net: ₹{pnl:.0f}\n")
+            try:
+                from order_manager import notify as tg_notify
+                tg_notify(f"DEAD TRADE EXIT - {symbol}\nNo move in {DEAD_TRADE_MINUTES}min\nExit: {ltp:.2f}\nNet: {pnl:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
+            except: pass
             return
 
         # Partial exit at 1R
@@ -659,6 +671,10 @@ class IntradayEngine:
                 pos["size"] -= partial_size
                 net = pnl - BROKERAGE_PER_TRADE // 2
                 print(f"\n  💰 PARTIAL EXIT: {symbol} — {partial_size} sh @ ₹{ltp:.2f} | Net: +₹{net:.0f}")
+                try:
+                    from order_manager import notify as tg_notify
+                    tg_notify(f"PARTIAL EXIT - {symbol}\\n{partial_size} shares @ {ltp:.2f}\\nNet: +{net:.0f}\\nStop -> breakeven\\nDaily P&L: {self.risk.net_pnl:.0f}")
+                except: pass
                 print(f"  📍 Stop → breakeven ₹{entry:.2f} | Remaining: {pos['size']} shares\n")
 
         # Trailing stop: move stop by ATR/2 after each additional 1R
@@ -677,6 +693,10 @@ class IntradayEngine:
             pnl = self.risk.close_position(symbol, ltp)
             if pnl is not None:
                 print(f"\n  🏁 SESSION EXIT: {symbol} @ ₹{ltp:.2f} | Net: ₹{pnl:.0f}\n")
+                try:
+                    from order_manager import notify as tg_notify
+                    tg_notify(f"3PM EXIT - {symbol}\nExit: {ltp:.2f}\nNet: {pnl:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
+                except: pass
 
     def _compute_opportunity_score(self, symbol, ltp, volume, true_gap_pct, session) -> tuple[float, dict]:
         stock      = self.all_stocks.get(symbol, {})
