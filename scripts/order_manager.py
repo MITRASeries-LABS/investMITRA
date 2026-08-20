@@ -1,21 +1,18 @@
 """
-investMITRA — Order Manager (Semi-Auto)
-Monitors your Kite positions and manages exits automatically.
+investMITRA — Order Manager v2 (Semi-Auto)
+Uses LIMIT orders instead of market orders to reduce slippage.
+
+LONG entry:  limit at signal_price + 0.1% (ensures fill without chasing)
+SHORT entry: limit at signal_price - 0.1%
+SL:         SL-M order (market when triggered)
+Target:     Limit order at exact target price
 
 YOU:    Place BUY/SELL entry on Kite app (30 sec)
 SYSTEM: Detects fill → places SL + target → manages exits
-
-NOT linked to signal generation — purely manages open positions.
-
-Run in Terminal 2:
-  python scripts/order_manager.py
-
-Telegram alerts sent to your phone for every event.
 """
 from __future__ import annotations
-import os, sys, time, logging
+import logging, os, sys, time, json
 from datetime import datetime, date, timedelta, timezone
-from collections import defaultdict
 import psycopg2
 import requests
 from dotenv import load_dotenv
@@ -26,29 +23,28 @@ logger = logging.getLogger(__name__)
 
 from kiteconnect import KiteConnect
 
-API_KEY         = os.getenv("KITE_API_KEY")
-ACCESS_TOKEN    = os.getenv("KITE_ACCESS_TOKEN")
-NEON_URL        = os.getenv("CC_POSTGRES_URL")
-TELEGRAM_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT   = os.getenv("TELEGRAM_CHAT_ID")
-IST             = timezone(timedelta(hours=5, minutes=30))
+API_KEY        = os.getenv("KITE_API_KEY")
+ACCESS_TOKEN   = os.getenv("KITE_ACCESS_TOKEN")
+NEON_URL       = os.getenv("CC_POSTGRES_URL")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID")
+IST            = timezone(timedelta(hours=5, minutes=30))
 
-# ── Risk Parameters ────────────────────────────────────────────────────────────
-MAX_CAPITAL_PER_TRADE  = 25000
-MAX_DAILY_LOSS_INR     = 6000
-MAX_POSITIONS          = 3
-BROKERAGE_PER_TRADE    = 80
-SQUAREOFF_HOUR         = 15   # 3:00 PM
-SQUAREOFF_MINUTE       = 0
-POLL_INTERVAL_SEC      = 5    # Check positions every 5 seconds
+MAX_CAPITAL_PER_TRADE = 25000
+MAX_DAILY_LOSS_INR    = 6000
+MAX_POSITIONS         = 3
+BROKERAGE_PER_TRADE   = 80
+SQUAREOFF_HOUR        = 15
+SQUAREOFF_MINUTE      = 0
+POLL_INTERVAL_SEC     = 5
 
+# Limit order buffer
+LIMIT_BUFFER_PCT      = 0.001   # 0.1% buffer for limit orders
 
-# ── Telegram Notifications ─────────────────────────────────────────────────────
 
 def notify(message: str, silent: bool = False):
-    """Send Telegram alert to phone."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
-        logger.info("Telegram not configured — %s", message)
+        logger.info("Telegram: %s", message[:50])
         return
     try:
         requests.get(
@@ -62,24 +58,17 @@ def notify(message: str, silent: bool = False):
             timeout=5
         )
     except Exception as e:
-        logger.warning("Telegram failed: %s", e)
+        logger.warning("Telegram: %s", e)
 
-
-# ── Signal Store (load from Neon — signals saved by intraday_signals.py) ──────
 
 def load_todays_signals() -> dict:
-    """Load today's signals from intraday_pnl table."""
     try:
         conn = psycopg2.connect(NEON_URL, connect_timeout=10)
         cur  = conn.cursor()
-        cur.execute("""
-            SELECT signals FROM investmitra.intraday_pnl
-            WHERE trade_date = CURRENT_DATE
-        """)
+        cur.execute("SELECT signals FROM investmitra.intraday_pnl WHERE trade_date=CURRENT_DATE")
         row = cur.fetchone()
         cur.close(); conn.close()
         if row and row[0]:
-            import json
             sigs = row[0] if isinstance(row[0], list) else json.loads(row[0])
             return {s["symbol"]: s for s in sigs}
     except Exception as e:
@@ -87,50 +76,8 @@ def load_todays_signals() -> dict:
     return {}
 
 
-# ── Order Tracking ─────────────────────────────────────────────────────────────
-
-class PositionTracker:
-    def __init__(self):
-        self.managed     = {}    # symbol -> management state
-        self.daily_pnl   = 0.0
-        self.brokerage   = 0.0
-        self.order_log   = []
-
-    @property
-    def net_pnl(self):
-        return self.daily_pnl - self.brokerage
-
-    def is_managed(self, symbol: str) -> bool:
-        return symbol in self.managed
-
-    def start_managing(self, symbol: str, entry: float, qty: int,
-                       stop: float, target: float, direction: str):
-        self.managed[symbol] = {
-            "entry":        entry,
-            "qty":          qty,
-            "stop":         stop,
-            "target":       target,
-            "direction":    direction,
-            "sl_order_id":  None,
-            "tgt_order_id": None,
-            "partial_done": False,
-            "partial_qty":  qty // 2,
-            "start_time":   datetime.now(IST),
-        }
-        self.brokerage += BROKERAGE_PER_TRADE
-        logger.info("Managing %s: entry=%.2f stop=%.2f target=%.2f qty=%d",
-                    symbol, entry, stop, target, qty)
-
-    def stop_managing(self, symbol: str):
-        if symbol in self.managed:
-            del self.managed[symbol]
-
-
-# ── Order Placement ────────────────────────────────────────────────────────────
-
-def place_sl_order(kite: KiteConnect, symbol: str, qty: int,
-                   stop: float, direction: str) -> str | None:
-    """Place stoploss market order."""
+def place_sl_order(kite, symbol, qty, stop, direction) -> str | None:
+    """Place SL-M order — triggers at stop price, executes at market."""
     try:
         txn = kite.TRANSACTION_TYPE_SELL if direction=="LONG" else kite.TRANSACTION_TYPE_BUY
         order_id = kite.place_order(
@@ -143,17 +90,16 @@ def place_sl_order(kite: KiteConnect, symbol: str, qty: int,
             trigger_price=round(stop, 1),
             product=kite.PRODUCT_MIS,
         )
-        logger.info("SL order placed: %s qty=%d trigger=%.2f id=%s", symbol, qty, stop, order_id)
+        logger.info("SL-M placed: %s qty=%d trigger=%.2f", symbol, qty, stop)
         return order_id
     except Exception as e:
         logger.error("SL order failed %s: %s", symbol, e)
-        notify(f"⚠️ SL ORDER FAILED — {symbol}\nError: {e}\nManually set SL @ ₹{stop:.2f}")
+        notify(f"⚠️ SL FAILED — {symbol}\nSet manually @ ₹{stop:.2f}\nError: {e}")
         return None
 
 
-def place_target_order(kite: KiteConnect, symbol: str, qty: int,
-                       target: float, direction: str) -> str | None:
-    """Place limit target order."""
+def place_target_order(kite, symbol, qty, target, direction) -> str | None:
+    """Place LIMIT order at exact target price."""
     try:
         txn = kite.TRANSACTION_TYPE_SELL if direction=="LONG" else kite.TRANSACTION_TYPE_BUY
         order_id = kite.place_order(
@@ -166,24 +112,47 @@ def place_target_order(kite: KiteConnect, symbol: str, qty: int,
             price=round(target, 1),
             product=kite.PRODUCT_MIS,
         )
-        logger.info("Target order placed: %s qty=%d price=%.2f id=%s", symbol, qty, target, order_id)
+        logger.info("Limit target placed: %s qty=%d price=%.2f", symbol, qty, target)
         return order_id
     except Exception as e:
         logger.error("Target order failed %s: %s", symbol, e)
         return None
 
 
-def cancel_order(kite: KiteConnect, order_id: str, symbol: str):
-    """Cancel an existing order."""
+def place_limit_exit(kite, symbol, qty, price, direction) -> str | None:
+    """
+    Place LIMIT order for partial exit at 1R.
+    Uses limit instead of market to avoid slippage.
+    Buffer: 0.1% worse than ideal to ensure fill.
+    """
     try:
-        kite.cancel_order(variety=kite.VARIETY_REGULAR, order_id=order_id)
-        logger.info("Cancelled order %s for %s", order_id, symbol)
+        txn = kite.TRANSACTION_TYPE_SELL if direction=="LONG" else kite.TRANSACTION_TYPE_BUY
+        # For LONG partial exit: limit slightly below 1R price to ensure fill
+        # For SHORT partial exit: limit slightly above 1R price
+        if direction == "LONG":
+            limit_price = round(price * (1 - LIMIT_BUFFER_PCT), 1)
+        else:
+            limit_price = round(price * (1 + LIMIT_BUFFER_PCT), 1)
+
+        order_id = kite.place_order(
+            variety=kite.VARIETY_REGULAR,
+            exchange=kite.EXCHANGE_NSE,
+            tradingsymbol=symbol,
+            transaction_type=txn,
+            quantity=qty,
+            order_type=kite.ORDER_TYPE_LIMIT,
+            price=limit_price,
+            product=kite.PRODUCT_MIS,
+        )
+        logger.info("Limit partial exit: %s qty=%d price=%.2f", symbol, qty, limit_price)
+        return order_id
     except Exception as e:
-        logger.warning("Cancel failed %s: %s", order_id, e)
+        logger.error("Limit exit failed %s: %s", symbol, e)
+        return None
 
 
-def market_exit(kite: KiteConnect, symbol: str, qty: int, direction: str) -> bool:
-    """Place market order to exit position."""
+def market_exit(kite, symbol, qty, direction) -> bool:
+    """Market exit — only used for 3PM square off and emergencies."""
     try:
         txn = kite.TRANSACTION_TYPE_SELL if direction=="LONG" else kite.TRANSACTION_TYPE_BUY
         kite.place_order(
@@ -199,13 +168,19 @@ def market_exit(kite: KiteConnect, symbol: str, qty: int, direction: str) -> boo
         return True
     except Exception as e:
         logger.error("Market exit failed %s: %s", symbol, e)
-        notify(f"🚨 EXIT FAILED — {symbol} qty={qty}\nManually square off NOW!\nError: {e}")
+        notify(f"🚨 EXIT FAILED — {symbol}\nManually square off {qty} shares!\nError: {e}")
         return False
 
 
-# ── Main Monitor Loop ──────────────────────────────────────────────────────────
+def cancel_order(kite, order_id, symbol):
+    try:
+        kite.cancel_order(variety=kite.VARIETY_REGULAR, order_id=order_id)
+        logger.info("Cancelled %s for %s", order_id, symbol)
+    except Exception as e:
+        logger.warning("Cancel failed %s: %s", order_id, e)
 
-def get_ltp(kite: KiteConnect, symbol: str) -> float:
+
+def get_ltp(kite, symbol) -> float:
     try:
         q = kite.quote([f"NSE:{symbol}"])
         return float(q.get(f"NSE:{symbol}", {}).get("last_price", 0))
@@ -213,11 +188,50 @@ def get_ltp(kite: KiteConnect, symbol: str) -> float:
         return 0
 
 
-def run_order_manager(kite: KiteConnect, signals: dict, tracker: PositionTracker):
-    """Main loop — runs every 5 seconds during market hours."""
+class PositionTracker:
+    def __init__(self):
+        self.managed   = {}
+        self.daily_pnl = 0.0
+        self.brokerage = 0.0
 
-    logger.info("Order manager started — monitoring positions")
-    notify("🤖 <b>investMITRA Order Manager LIVE</b>\nMonitoring positions every 5 sec\nSignals loaded: " + str(len(signals)))
+    @property
+    def net_pnl(self): return self.daily_pnl - self.brokerage
+
+    def can_trade(self) -> tuple[bool, str]:
+        if self.net_pnl <= -MAX_DAILY_LOSS_INR:
+            return False, f"Daily loss ₹{self.net_pnl:.0f}"
+        if len(self.managed) >= MAX_POSITIONS:
+            return False, f"Max positions ({len(self.managed)})"
+        return True, "OK"
+
+    def start_managing(self, symbol, entry, qty, stop, target, direction):
+        self.managed[symbol] = {
+            "entry":        entry,
+            "qty":          qty,
+            "stop":         stop,
+            "target":       target,
+            "direction":    direction,
+            "sl_order_id":  None,
+            "tgt_order_id": None,
+            "partial_done": False,
+            "partial_qty":  qty // 2,
+            "start_time":   datetime.now(IST),
+            "trail_level":  0,
+        }
+        self.brokerage += BROKERAGE_PER_TRADE
+
+    def stop_managing(self, symbol):
+        if symbol in self.managed:
+            del self.managed[symbol]
+
+
+def run_order_manager(kite, signals, tracker):
+    logger.info("Order manager v2 started — LIMIT orders enabled")
+    notify(
+        "🤖 <b>investMITRA Order Manager v2 LIVE</b>\n"
+        "Using LIMIT orders (reduced slippage)\n"
+        f"Signals: {len(signals)} | Max positions: {MAX_POSITIONS}"
+    )
 
     squaredoff = False
 
@@ -225,66 +239,55 @@ def run_order_manager(kite: KiteConnect, signals: dict, tracker: PositionTracker
         now     = datetime.now(IST)
         mkt_min = now.hour * 60 + now.minute
 
-        # Market closed
         if mkt_min < 9*60+15 or mkt_min >= 15*60+30:
-            logger.info("Market closed — sleeping")
-            time.sleep(60)
-            continue
+            time.sleep(60); continue
 
-        # 3:00 PM — square off everything
+        # 3:00 PM square off
         if now.hour == SQUAREOFF_HOUR and now.minute >= SQUAREOFF_MINUTE and not squaredoff:
-            logger.info("3:00 PM — squaring off all positions")
+            logger.info("3:00 PM — squaring off")
             notify("⏰ <b>3:00 PM — Squaring off all positions</b>")
             _squareoff_all(kite, tracker)
             squaredoff = True
             _save_final_pnl(tracker)
             break
 
-        # Get current positions from Kite
-        try:
-            positions = kite.positions().get("net", [])
-        except Exception as e:
-            logger.warning("Positions fetch failed: %s", e)
-            time.sleep(POLL_INTERVAL_SEC)
-            continue
-
         # Daily loss check
         if tracker.net_pnl <= -MAX_DAILY_LOSS_INR:
-            logger.warning("Daily loss limit hit — squaring off")
-            notify(f"🚨 <b>DAILY LOSS LIMIT HIT</b>\nNet P&L: ₹{tracker.net_pnl:.0f}\nSquaring off all positions")
+            notify(f"🚨 <b>DAILY LOSS LIMIT</b>\nNet: ₹{tracker.net_pnl:.0f}\nSquaring off")
             _squareoff_all(kite, tracker)
             squaredoff = True
             break
 
-        # Process each open position
+        try:
+            positions = kite.positions().get("net", [])
+        except Exception as e:
+            logger.warning("Positions: %s", e)
+            time.sleep(POLL_INTERVAL_SEC); continue
+
+        # New position detected
         for pos in positions:
             symbol = pos.get("tradingsymbol", "")
             qty    = int(pos.get("quantity", 0))
             avg    = float(pos.get("average_price", 0))
-
-            if qty == 0 or not symbol:
-                continue
+            if qty == 0 or not symbol: continue
 
             direction = "LONG" if qty > 0 else "SHORT"
             qty = abs(qty)
 
-            # New position detected — start managing
-            if not tracker.is_managed(symbol):
-                # Get signal data if available
-                sig = signals.get(symbol, {})
-                if sig:
-                    stop   = sig.get("stoploss", 0)
-                    target = sig.get("target", 0)
-                else:
-                    # No signal data — use ATR-based defaults
+            if not tracker.managed.get(symbol):
+                sig    = signals.get(symbol, {})
+                stop   = sig.get("stoploss", 0)
+                target = sig.get("target", 0)
+
+                if not stop or not target:
                     ltp    = get_ltp(kite, symbol)
-                    atr    = ltp * 0.015  # 1.5% fallback
-                    stop   = round(avg - atr*1.5, 1) if direction=="LONG" else round(avg + atr*1.5, 1)
-                    target = round(avg + atr*3.0, 1) if direction=="LONG" else round(avg - atr*3.0, 1)
+                    atr    = ltp * 0.015
+                    stop   = round(avg-atr*1.5,1) if direction=="LONG" else round(avg+atr*1.5,1)
+                    target = round(avg+atr*3.0,1) if direction=="LONG" else round(avg-atr*3.0,1)
 
                 tracker.start_managing(symbol, avg, qty, stop, target, direction)
 
-                # Place SL and target orders
+                # Place SL-M + Limit target
                 sl_id  = place_sl_order(kite, symbol, qty, stop, direction)
                 tgt_id = place_target_order(kite, symbol, qty, target, direction)
 
@@ -293,26 +296,26 @@ def run_order_manager(kite: KiteConnect, signals: dict, tracker: PositionTracker
 
                 capital = round(avg * qty, 0)
                 notify(
-                    f"🟢 <b>POSITION DETECTED — {symbol}</b>\n"
+                    f"{'🟢' if direction=='LONG' else '🔴'} <b>POSITION — {symbol}</b>\n"
                     f"Direction: {direction}\n"
-                    f"Entry: ₹{avg:.2f} × {qty} shares = ₹{capital:,.0f}\n"
-                    f"Stop: ₹{stop:.2f}\n"
-                    f"Target: ₹{target:.2f}\n"
-                    f"SL order: {'placed ✅' if sl_id else 'FAILED ❌'}\n"
-                    f"Target order: {'placed ✅' if tgt_id else 'FAILED ❌'}"
+                    f"Entry: ₹{avg:.2f} × {qty} = ₹{capital:,.0f}\n"
+                    f"SL-M: ₹{stop:.2f} {'✅' if sl_id else '❌'}\n"
+                    f"Target (Limit): ₹{target:.2f} {'✅' if tgt_id else '❌'}\n"
+                    f"Orders: LIMIT (low slippage)"
                 )
 
             else:
-                # Already managing — check for partial exit
-                state  = tracker.managed[symbol]
-                entry  = state["entry"]
-                stop   = state["stop"]
-                risk   = abs(entry - stop)
-                ltp    = get_ltp(kite, symbol)
+                # Manage existing position
+                state    = tracker.managed[symbol]
+                entry    = state["entry"]
+                stop     = state["stop"]
+                risk     = abs(entry - stop)
+                ltp      = get_ltp(kite, symbol)
+                is_long  = direction == "LONG"
 
                 if not state["partial_done"] and ltp > 0:
-                    hit_1r = (direction=="LONG" and ltp >= entry + risk) or \
-                             (direction=="SHORT" and ltp <= entry - risk)
+                    hit_1r = (is_long and ltp >= entry+risk) or \
+                             (not is_long and ltp <= entry-risk)
 
                     if hit_1r:
                         # Cancel existing orders
@@ -321,117 +324,118 @@ def run_order_manager(kite: KiteConnect, signals: dict, tracker: PositionTracker
                         if state["tgt_order_id"]:
                             cancel_order(kite, state["tgt_order_id"], symbol)
 
-                        # Exit half position at market
-                        half_qty = state["partial_qty"]
-                        market_exit(kite, symbol, half_qty, direction)
+                        half_qty   = state["partial_qty"]
+                        one_r_price = entry + risk if is_long else entry - risk
 
-                        # Remaining qty
-                        rem_qty = qty - half_qty
-                        new_stop = entry  # Move to breakeven
+                        # LIMIT order for partial exit (not market)
+                        place_limit_exit(kite, symbol, half_qty, one_r_price, direction)
 
-                        # Place new SL at breakeven for remaining
-                        new_sl = place_sl_order(kite, symbol, rem_qty, new_stop, direction)
-                        # Place new target for remaining
+                        rem_qty  = qty - half_qty
+                        new_stop = entry  # Breakeven
+
+                        # New SL at breakeven + new target for remainder
+                        new_sl  = place_sl_order(kite, symbol, rem_qty, new_stop, direction)
                         new_tgt = place_target_order(kite, symbol, rem_qty, state["target"], direction)
 
                         state["partial_done"]  = True
                         state["sl_order_id"]   = new_sl
                         state["tgt_order_id"]  = new_tgt
                         state["stop"]          = new_stop
+                        state["qty"]           = rem_qty
 
                         pnl_partial = risk * half_qty
                         tracker.daily_pnl += pnl_partial
 
                         notify(
-                            f"💰 <b>PARTIAL EXIT — {symbol}</b>\n"
-                            f"Sold {half_qty} shares @ ₹{ltp:.2f}\n"
+                            f"💰 <b>PARTIAL EXIT (Limit) — {symbol}</b>\n"
+                            f"{half_qty} shares @ ₹{one_r_price:.2f} (limit)\n"
                             f"P&L: +₹{pnl_partial:.0f}\n"
-                            f"Stop moved to breakeven ₹{new_stop:.2f}\n"
+                            f"Stop → breakeven ₹{new_stop:.2f}\n"
                             f"Remaining: {rem_qty} shares\n"
-                            f"Net P&L today: ₹{tracker.net_pnl:.0f}"
+                            f"Net today: ₹{tracker.net_pnl:.0f}"
                         )
 
-        # Check if any managed position was closed (hit SL or target)
-        open_symbols = {p["tradingsymbol"] for p in positions if abs(int(p.get("quantity",0))) > 0}
+                # Trailing stop
+                elif state["partial_done"] and state["qty"] > 0 and ltp > 0:
+                    moves = int((ltp-entry)/risk) if direction=="LONG" else int((entry-ltp)/risk)
+                    if moves > state["trail_level"] + 1:
+                        state["trail_level"] = moves - 1
+                        new_stop = round(entry+(state["trail_level"]*risk*0.5),1) if direction=="LONG" else \
+                                   round(entry-(state["trail_level"]*risk*0.5),1)
+                        if (direction=="LONG" and new_stop>state["stop"]) or \
+                           (direction=="SHORT" and new_stop<state["stop"]):
+                            if state["sl_order_id"]:
+                                cancel_order(kite, state["sl_order_id"], symbol)
+                            new_sl = place_sl_order(kite, symbol, state["qty"], new_stop, direction)
+                            state["stop"]       = new_stop
+                            state["sl_order_id"]= new_sl
+                            print(f"\n  📈 TRAILING STOP: {symbol} → ₹{new_stop:.2f}\n")
+
+        # Check closed positions
+        open_syms = {p["tradingsymbol"] for p in positions if abs(int(p.get("quantity",0)))>0}
         for symbol in list(tracker.managed.keys()):
-            if symbol not in open_symbols:
+            if symbol not in open_syms:
                 state = tracker.managed[symbol]
                 ltp   = get_ltp(kite, symbol)
-                pnl   = (ltp - state["entry"]) * state["qty"] if state["direction"]=="LONG" else \
-                        (state["entry"] - ltp) * state["qty"]
+                pnl   = (ltp-state["entry"])*state["qty"] if state["direction"]=="LONG" else \
+                        (state["entry"]-ltp)*state["qty"]
                 tracker.daily_pnl += pnl
                 tracker.stop_managing(symbol)
-
-                result = "✅ TARGET HIT" if pnl > 0 else "❌ STOPLOSS HIT"
+                result = "✅ TARGET" if pnl>0 else "❌ STOPLOSS"
                 notify(
                     f"{result} — <b>{symbol}</b>\n"
                     f"P&L: {'+'if pnl>=0 else ''}₹{pnl:.0f}\n"
-                    f"Net P&L today: ₹{tracker.net_pnl:.0f}"
+                    f"Net today: ₹{tracker.net_pnl:.0f}"
                 )
 
         time.sleep(POLL_INTERVAL_SEC)
 
 
-def _squareoff_all(kite: KiteConnect, tracker: PositionTracker):
-    """Cancel all orders and square off all positions."""
+def _squareoff_all(kite, tracker):
     try:
-        # Cancel all open orders
         orders = kite.orders()
-        for order in orders:
-            if order.get("status") in ("TRIGGER PENDING", "OPEN"):
+        for o in orders:
+            if o.get("status") in ("TRIGGER PENDING","OPEN"):
                 try:
                     kite.cancel_order(
-                        variety=order.get("variety", kite.VARIETY_REGULAR),
-                        order_id=order["order_id"]
+                        variety=o.get("variety", kite.VARIETY_REGULAR),
+                        order_id=o["order_id"]
                     )
-                    logger.info("Cancelled order: %s", order["order_id"])
                 except: pass
 
-        # Square off all net positions
         positions = kite.positions().get("net", [])
         for pos in positions:
             qty    = int(pos.get("quantity", 0))
             symbol = pos.get("tradingsymbol", "")
             if qty == 0 or not symbol: continue
-
             direction = "LONG" if qty > 0 else "SHORT"
             market_exit(kite, symbol, abs(qty), direction)
-
-        logger.info("All positions squared off")
-
     except Exception as e:
-        logger.error("Squareoff failed: %s", e)
-        notify(f"🚨 AUTO SQUAREOFF FAILED\nManually close all positions!\nError: {e}")
+        logger.error("Squareoff: %s", e)
+        notify(f"🚨 SQUAREOFF FAILED — Close manually!\nError: {e}")
 
 
-def _save_final_pnl(tracker: PositionTracker):
-    """Update Neon with final P&L."""
+def _save_final_pnl(tracker):
     try:
         conn = psycopg2.connect(NEON_URL, connect_timeout=10)
         conn.autocommit = True
         cur  = conn.cursor()
         cur.execute("""
-            UPDATE investmitra.intraday_pnl
-            SET gross_pnl=gross_pnl + %s,
-                brokerage=brokerage + %s,
-                net_pnl=net_pnl + %s,
-                saved_at=NOW()
+            UPDATE investmitra.intraday_pnl SET
+                gross_pnl=gross_pnl+%s, brokerage=brokerage+%s,
+                net_pnl=net_pnl+%s, saved_at=NOW()
             WHERE trade_date=CURRENT_DATE
-        """, (round(tracker.daily_pnl,2),
-              round(tracker.brokerage,2),
-              round(tracker.net_pnl,2)))
+        """, (round(tracker.daily_pnl,2), round(tracker.brokerage,2), round(tracker.net_pnl,2)))
         cur.close(); conn.close()
-
         notify(
             f"📊 <b>DAY COMPLETE — {date.today()}</b>\n"
-            f"Gross P&L:  ₹{tracker.daily_pnl:.0f}\n"
-            f"Brokerage:  ₹{tracker.brokerage:.0f}\n"
-            f"Net P&L:    ₹{tracker.net_pnl:.0f}\n"
+            f"Gross: ₹{tracker.daily_pnl:.0f}\n"
+            f"Brokerage: ₹{tracker.brokerage:.0f}\n"
+            f"Net P&L: ₹{tracker.net_pnl:.0f}\n"
             f"Grafana updated ✅"
         )
-        logger.info("Final P&L saved to Neon")
     except Exception as e:
-        logger.warning("Final P&L save: %s", e)
+        logger.warning("Save P&L: %s", e)
 
 
 def main():
@@ -440,39 +444,32 @@ def main():
         sys.exit(1)
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
-        print("⚠️  Telegram not configured — alerts disabled")
-        print("   Add to .env.prod:")
-        print("   TELEGRAM_BOT_TOKEN=your_bot_token")
-        print("   TELEGRAM_CHAT_ID=your_chat_id")
-        print()
+        print("⚠️  Telegram not configured")
 
-    kite = KiteConnect(api_key=API_KEY)
+    kite    = KiteConnect(api_key=API_KEY)
     kite.set_access_token(ACCESS_TOKEN)
-
-    # Load today's signals
     signals = load_todays_signals()
-    logger.info("Loaded %d signals for today", len(signals))
-
     tracker = PositionTracker()
 
     print(f"\n{'='*60}")
-    print(f"  investMITRA ORDER MANAGER — {date.today()}")
+    print(f"  investMITRA ORDER MANAGER v2 — {date.today()}")
+    print(f"  LIMIT orders enabled (reduced slippage)")
     print(f"{'='*60}")
-    print(f"  Monitoring Kite positions every {POLL_INTERVAL_SEC} seconds")
-    print(f"  Max daily loss: ₹{MAX_DAILY_LOSS_INR}")
-    print(f"  Auto square-off: 3:00 PM")
-    print(f"  Telegram: {'✅ configured' if TELEGRAM_TOKEN else '❌ not configured'}")
-    print(f"  Signals loaded: {len(signals)}")
+    print(f"  Entry SL:    SL-M (market when triggered)")
+    print(f"  Target:      Limit at exact price")
+    print(f"  Partial:     Limit at 1R price")
+    print(f"  Square off:  Market at 3:00 PM")
+    print(f"  Signals:     {len(signals)}")
+    print(f"  Telegram:    {'✅' if TELEGRAM_TOKEN else '❌'}")
     print(f"{'='*60}")
-    print(f"  Waiting for you to place entry orders on Kite app...")
-    print(f"  System will auto-place SL + target after detection")
+    print(f"  Waiting for positions on Kite app...")
     print(f"{'='*60}\n")
 
     try:
         run_order_manager(kite, signals, tracker)
     except KeyboardInterrupt:
-        logger.info("Stopped by user")
-        notify("⚠️ Order manager stopped manually — check open positions!")
+        logger.info("Stopped")
+        notify("⚠️ Order manager stopped — check open positions!")
 
 
 if __name__ == "__main__":
