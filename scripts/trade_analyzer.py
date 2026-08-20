@@ -114,7 +114,18 @@ Analyze this trade concisely. Respond in JSON only:
         elif "```" in clean:
             clean = clean.split("```")[1].split("```")[0].strip()
 
-        analysis = json.loads(clean)
+        try:
+            analysis = json.loads(clean)
+        except Exception:
+            import re
+            m = re.search(r'"primary_issue": "([^"]+)"', clean)
+            analysis = {
+                "primary_issue": m.group(1) if m else "Analysis truncated - JSON too long",
+                "issues": [],
+                "suggestions": [],
+                "confidence": 0.4,
+                "skip_next_time_if": ""
+            }
 
         # Save to Neon
         _save_insight(trade_id, trade, analysis, SONNET_MODEL)
