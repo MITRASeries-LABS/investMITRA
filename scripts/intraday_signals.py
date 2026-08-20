@@ -416,7 +416,14 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
         WHERE ds.score_date=(SELECT MAX(score_date) FROM investmitra.daily_scores)
           AND cm.nse_symbol IS NOT NULL
                     AND cm.market_cap_category IN ('MID','LARGE','SMALL','MICRO')
-          AND cm.nse_symbol IN (SELECT symbol FROM investmitra.fo_stocks)
+          AND (
+            -- Tier 1: F&O eligible stocks (most liquid)
+            cm.nse_symbol IN (SELECT symbol FROM investmitra.fo_stocks)
+            OR
+            -- Tier 2: High volume small/mid caps not in F&O
+            (cm.market_cap_category IN ('SMALL','MICRO')
+             AND cm.nse_symbol NOT IN (SELECT symbol FROM investmitra.fo_stocks))
+          )
         ORDER BY ds.investmitra_score DESC
     """)
     rows = cur.fetchall()
