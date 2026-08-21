@@ -1093,6 +1093,17 @@ def preflight_check() -> bool:
         print(f"  ❌ Kite token MISSING — run: python scripts/kite_login.py")
         all_ok = False
 
+    # 1b. Auto-fetch market data if today's data missing
+    try:
+        cur.execute("SELECT COUNT(*) FROM investmitra.market_indices WHERE fetch_date=CURRENT_DATE")
+        if cur.fetchone()[0] == 0:
+            print("  ?? Fetching today's market indices...")
+            import subprocess
+            subprocess.run(["python", "scripts/fetch_market_indices.py"], timeout=30)
+            subprocess.run(["python", "scripts/fetch_global_sentiment.py"], timeout=30)
+            print("  ? Market data fetched")
+    except: pass
+
     # 2. Neon connection + data freshness
     try:
         conn = psycopg2.connect(NEON_URL, connect_timeout=5)
