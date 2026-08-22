@@ -493,15 +493,19 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
 
 
 def classify_gap(gap_pct, volume, avg_volume) -> tuple[str, float]:
-    abs_gap  = abs(gap_pct)
-    high_vol = (volume / avg_volume if avg_volume > 0 else 1) > 1.5
-    if abs_gap > 4.0:                            return "exhaustion", 0.4
-    elif abs_gap > 2.0 and high_vol:             return "continuation_strong", 1.3
-    elif abs_gap > 2.0:                          return "fade_risk", 0.6
-    elif abs_gap > 0.5 and high_vol:             return "continuation", 1.1
-    elif abs_gap > 0.3 and high_vol:             return "continuation", 1.0
-    elif abs_gap > 0.3:                          return "fade_risk", 0.8
-    else:                                         return "small_gap", 0.7
+    abs_gap    = abs(gap_pct)
+    rvol       = volume / avg_volume if avg_volume > 0 else 1
+    high_vol   = rvol > 1.5
+    strong_vol = rvol > 2.5
+    if abs_gap > 4.0:                              return "exhaustion", 0.4
+    elif abs_gap > 2.0 and strong_vol:             return "continuation_strong", 1.3
+    elif abs_gap > 2.0 and high_vol:               return "continuation", 1.1
+    elif abs_gap > 2.0:                            return "exhaustion", 0.4
+    elif abs_gap > 0.5 and strong_vol:             return "continuation", 1.1
+    elif abs_gap > 0.3 and high_vol:               return "continuation", 1.0
+    elif abs_gap > 0.5:                            return "fade_risk", 0.5
+    elif abs_gap > 0.3:                            return "fade_risk", 0.3
+    else:                                          return "small_gap", 0.2
 
 
 class DailyRiskManager:
@@ -858,10 +862,16 @@ class IntradayEngine:
         quality = stock.get("quality_score", 50)
         opp, details = self._compute_opportunity_score(symbol, ltp, volume, true_gap_pct, session)
 
-        if details["gap_type"] in ("exhaustion", "fade_risk"):
-            if details["gap_type"] == "exhaustion": return
-            # fade_risk: require higher quality + volume
-            if quality < 65 or details["rvol"] < 1.5: return
+        # Exhaustion gaps: always skip
+        if details["gap_type"] == "exhaustion":
+            return
+
+        # fade_risk: only allow if RVOL > 2.5x AND quality > 65
+        # Otherwise skip — Sonnet confirmed fade_risk consistently loses
+        if details["gap_type"] == "fade_risk":
+            if details["rvol"] < 2.5 or quality < 65:
+                logger.debug("Skip %s — fade_risk with weak RVOL %.1fx", symbol, details["rvol"])
+                return
 
         final = quality * 0.40 + opp * 0.60
         if final < 48: return
