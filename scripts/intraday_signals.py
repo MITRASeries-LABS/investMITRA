@@ -57,7 +57,28 @@ SESSIONS = {
     "afternoon": (13*60+30, 15*60+0),
     "closing":   (15*60+0,  15*60+30),
 }
-GAP_THRESHOLDS = {"momentum": 0.3, "choppy": 0.6, "afternoon": 0.4}
+GAP_THRESHOLDS = {"momentum": 0.3, "choppy": 0.6, "afternoon": 0.4}  # defaults
+
+def load_signal_weights() -> dict:
+    """Load latest signal weights from Neon (updated by weekly Opus review)."""
+    try:
+        conn = psycopg2.connect(NEON_URL, connect_timeout=10)
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT weights FROM investmitra.signal_weights
+            WHERE effective_date <= CURRENT_DATE
+            ORDER BY effective_date DESC LIMIT 1
+        """)
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        if row:
+            import json
+            w = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+            logger.info("Loaded signal weights effective %s", w.get("effective_date","?"))
+            return w
+    except Exception as e:
+        logger.warning("Load weights failed: %s ? using defaults", e)
+    return {}
 
 SECTOR_INDEX_MAP = {
     "Technology":         "NSE:NIFTY IT",
@@ -783,19 +804,31 @@ class IntradayEngine:
         regime_score= 70 if self.market_direction=="BULLISH" else 30 if self.market_direction=="BEARISH" else 50
         sess_mult   = {"momentum":1.0,"choppy":0.7,"afternoon":0.85}.get(session, 0.5)
 
+        # Load Opus weights
+        try:
+            import json as _j
+            _conn = psycopg2.connect(NEON_URL, connect_timeout=5)
+            _cur  = _conn.cursor()
+            _cur.execute("SELECT weights FROM investmitra.signal_weights WHERE effective_date<=CURRENT_DATE ORDER BY effective_date DESC LIMIT 1")
+            _row  = _cur.fetchone()
+            _cur.close(); _conn.close()
+            _w = _row[0] if isinstance(_row[0], dict) else _j.loads(_row[0]) if _row else {}
+        except:
+            _w = {}
+
         opp = (
-            gap_score     * 0.15 +
-            rvol_score    * 0.12 +
-            vwap_score    * 0.10 +
-            orb_score     * 0.12 +
-            holding_score * 0.10 +
-            sector_rs     * 0.12 +
-            breadth_score * 0.05 +
-            regime_score  * 0.05 +
-            kl_score      * 0.08 +
-            sent_score    * 0.04 +
-            bulk_score    * 0.04 +
-            preopen_score * 0.03
+            gap_score     * _w.get("gap_score",     0.15) +
+            rvol_score    * _w.get("rvol_score",    0.12) +
+            vwap_score    * _w.get("vwap_score",    0.10) +
+            orb_score     * _w.get("orb_score",     0.12) +
+            holding_score * _w.get("holding_score", 0.10) +
+            sector_rs     * _w.get("sector_rs",     0.12) +
+            breadth_score * _w.get("breadth_score", 0.05) +
+            regime_score  * _w.get("regime_score",  0.05) +
+            kl_score      * _w.get("kl_score",      0.08) +
+            sent_score    * _w.get("sent_score",     0.04) +
+            bulk_score    * _w.get("bulk_score",     0.04) +
+            preopen_score * _w.get("preopen_score",  0.03)
         ) * sess_mult
 
         details = {
@@ -1276,6 +1309,24 @@ def main():
 
     ctx = get_premarket_context()
     market_direction, nifty_change = get_market_direction(kite, ctx)
+
+    # Load Opus-updated weights from Neon
+    global GAP_THRESHOLDS
+    weights = load_signal_weights()
+    if weights:
+        GAP_THRESHOLDS["momentum"]  = weights.get("gap_threshold_momentum", 0.3)
+        GAP_THRESHOLDS["choppy"]    = weights.get("gap_threshold_choppy", 0.6)
+        GAP_THRESHOLDS["afternoon"] = weights.get("gap_threshold_afternoon", 0.4)
+        logger.info("Weights loaded: gap_momentum=%.2f sector_rs=%.2f rvol=%.2f",
+                    GAP_THRESHOLDS["momentum"],
+                    weights.get("sector_rs", 0.12),
+                    weights.get("rvol_score", 0.13))
+        # Apply skip flags
+        if weights.get("skip_choppy_session"):
+            SESSIONS.pop("choppy", None)
+            logger.info("Choppy session DISABLED by Opus")
+        if weights.get("skip_fade_risk"):
+            logger.info("fade_risk gaps DISABLED by Opus")
 
     # Morning brief to Telegram
     try:
