@@ -26,6 +26,16 @@ from dotenv import load_dotenv
 load_dotenv('.env.prod')
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# Suppress noisy WebSocket disconnect messages
+import logging as _logging
+class _WSFilter(_logging.Filter):
+    def filter(self, record):
+        msg = str(record.getMessage())
+        if 'connection was closed uncleanly' in msg: return False
+        if 'peer dropped the TCP' in msg: return False
+        if 'WebSocket closing handshake' in msg: return False
+        return True
+_logging.getLogger().addFilter(_WSFilter())
 logger = logging.getLogger(__name__)
 
 from kiteconnect import KiteConnect, KiteTicker
