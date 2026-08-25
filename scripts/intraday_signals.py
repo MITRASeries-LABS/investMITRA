@@ -868,13 +868,27 @@ class IntradayEngine:
 
         # Need today's open captured
         today_open = self.today_open.get(symbol, 0)
-        if today_open == 0: return
+        if today_open == 0:
+            # Fallback: fetch open from Kite quote
+            try:
+                q = self.kite.quote([f"NSE:{symbol}"])
+                today_open = float(q.get(f"NSE:{symbol}", {}).get("ohlc", {}).get("open", 0))
+                if today_open > 0:
+                    self.today_open[symbol] = today_open
+                else:
+                    return
+            except:
+                return
 
         # TRUE GAP
         true_gap_pct = (today_open - prev) / prev * 100
 
         # GAP HOLD CONFIRMATION (5 minutes)
         gap_thresh = GAP_THRESHOLDS.get(session, 0.4)
+        # Lower threshold for MICRO/SMALL ? they gap more
+        cap = stock.get("market_cap_category", "MID")
+        if cap in ("MICRO", "SMALL"):
+            gap_thresh *= 0.7  # 30% lower for small caps
         if self.vix_signal == "ELEVATED": gap_thresh *= 1.5
 
         if abs(true_gap_pct) > gap_thresh:
@@ -1252,14 +1266,22 @@ def preflight_check() -> bool:
 
     # 1b. Auto-fetch market data if today's data missing
     try:
+        import subprocess
         cur.execute("SELECT COUNT(*) FROM investmitra.market_indices WHERE fetch_date=CURRENT_DATE")
-        if cur.fetchone()[0] == 0:
-            print("  ?? Fetching today's market indices...")
-            import subprocess
-            subprocess.run(["python", "scripts/fetch_market_indices.py"], timeout=30)
-            subprocess.run(["python", "scripts/fetch_global_sentiment.py"], timeout=30)
-            print("  ? Market data fetched")
-    except: pass
+        count = cur.fetchone()[0]
+        if count == 0:
+            print("  Fetching today's market indices...")
+            subprocess.run(["python", "scripts/fetch_market_indices.py"], timeout=60, cwd=os.getcwd())
+            subprocess.run(["python", "scripts/fetch_global_sentiment.py"], timeout=60, cwd=os.getcwd())
+            print("  Market data fetched")
+        else:
+            print(f"  Market indices: {count} records today")
+    except Exception as e:
+        print(f"  Auto-fetch failed: {e}")
+        try:
+            subprocess.run(["python", "scripts/fetch_market_indices.py"], timeout=60)
+            subprocess.run(["python", "scripts/fetch_global_sentiment.py"], timeout=60)
+        except: pass
 
     # 2. Neon connection + data freshness
     try:
