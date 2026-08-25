@@ -1269,8 +1269,11 @@ def preflight_check() -> bool:
     # 1b. Auto-fetch market data if today's data missing
     try:
         import subprocess
-        cur.execute("SELECT COUNT(*) FROM investmitra.market_indices WHERE fetch_date=CURRENT_DATE")
-        count = cur.fetchone()[0]
+        _conn2 = psycopg2.connect(NEON_URL, connect_timeout=5)
+        _cur2  = _conn2.cursor()
+        _cur2.execute("SELECT COUNT(*) FROM investmitra.market_indices WHERE fetch_date=CURRENT_DATE")
+        count = _cur2.fetchone()[0]
+        _cur2.close(); _conn2.close()
         if count == 0:
             print("  Fetching today's market indices...")
             subprocess.run(["python", "scripts/fetch_market_indices.py"], timeout=60, cwd=os.getcwd())
