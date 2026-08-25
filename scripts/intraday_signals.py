@@ -517,6 +517,8 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
 
         if inv >= 60:   long_list.append(stock)
         elif inv <= 35: short_list.append(stock)
+        # High quality stocks also added to short list for bearish days
+        elif inv >= 55: short_list.append({**stock, "bearish_candidate": True})
 
     long_list  = sorted(long_list,  key=lambda x: x["quality_score"], reverse=True)[:25]
     short_list = sorted(short_list, key=lambda x: x["investmitra_score"])[:10]
@@ -1389,8 +1391,18 @@ def main():
     rvol_baseline         = get_rvol_baseline()
     long_list, short_list = get_intraday_watchlist(ctx)
 
-    if market_direction == "BULLISH":   short_list = []
-    elif market_direction == "BEARISH": long_list  = []
+    # On weak breadth days ? allow quality stocks to go SHORT too
+    breadth = ctx.get("breadth", {})
+    adv_ratio = breadth.get("adv_ratio", 1.0) if isinstance(breadth, dict) else 1.0
+    weak_market = adv_ratio < 0.3 or market_direction == "BEARISH"
+
+    if market_direction == "BULLISH":
+        short_list = []
+    elif market_direction == "BEARISH":
+        long_list = []
+    elif weak_market:
+        # NEUTRAL but weak breadth ? keep both but flag bearish bias
+        logger.info("Weak breadth (%.1fx) ? SHORT bias enabled for quality stocks", adv_ratio)
 
     all_stocks = long_list + short_list
     if not all_stocks:
