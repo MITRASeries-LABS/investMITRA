@@ -948,7 +948,7 @@ class IntradayEngine:
         if final < 48: return
 
         # Check market breadth for bearish bias
-        breadth     = self.ctx.get("breadth", {})
+        breadth     = getattr(self, "ctx", {}).get("breadth", {})
         ad_ratio    = breadth.get("adv_ratio", 1.0) if isinstance(breadth, dict) else 1.0
         weak_market = ad_ratio < 0.3 or self.market_direction == "BEARISH"
 
