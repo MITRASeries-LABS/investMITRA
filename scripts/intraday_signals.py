@@ -605,6 +605,7 @@ class IntradayEngine:
         self.rev_tokens       = {v: k for k, v in token_map.items()}
         self.prev_close       = prev_close
         self.market_direction = market_direction
+        self.ctx              = ctx
         self.vix_signal       = ctx["vix_signal"]
         self.rvol_baseline    = rvol_baseline
         self.key_levels       = key_levels
@@ -1500,6 +1501,7 @@ def main():
     engine = IntradayEngine(long_list, short_list, token_map, prev_close,
                             market_direction, ctx, rvol_baseline,
                             key_levels, sector_quotes, sentiment)
+    engine.kite = kite  # Store kite reference for LTP fallback
 
     def on_connect(ws, response):
         logger.info("Connected — %d tokens", len(tokens))
