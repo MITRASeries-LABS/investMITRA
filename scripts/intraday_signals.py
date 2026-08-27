@@ -438,7 +438,7 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
             WHERE trade_date>=CURRENT_DATE-INTERVAL '30 days'
             GROUP BY isin
             HAVING AVG(close) BETWEEN 50 AND 20000
-               AND AVG(volume)*AVG(close) >= 5000000
+               AND AVG(volume)*AVG(close) >= 2000000
         )
         SELECT ds.isin, ds.company_name, cm.nse_symbol, ds.sector,
                cm.market_cap_category, ds.investmitra_score, ds.signal,
@@ -459,14 +459,8 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
         WHERE ds.score_date=(SELECT MAX(score_date) FROM investmitra.daily_scores)
           AND cm.nse_symbol IS NOT NULL
                     AND cm.market_cap_category IN ('MID','LARGE','SMALL','MICRO')
-          AND (
-            -- Tier 1: F&O eligible stocks (most liquid)
-            cm.nse_symbol IN (SELECT symbol FROM investmitra.fo_stocks)
-            OR
-            -- Tier 2: High volume small/mid caps not in F&O
-            (cm.market_cap_category IN ('SMALL','MICRO')
-             AND cm.nse_symbol NOT IN (SELECT symbol FROM investmitra.fo_stocks))
-          )
+          -- All cap categories included
+          -- F&O check only applied to SHORT signals (in _check_signal)
         ORDER BY ds.investmitra_score DESC
     """)
     rows = cur.fetchall()
@@ -528,15 +522,15 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
         }
 
         cap = stock.get("market_cap_category", "MID")
-        # Lower threshold for MICRO/SMALL to get more small cap signals
-        long_thresh  = 55 if cap in ("MICRO", "SMALL") else 60
+        # Same threshold for all caps - 55 minimum
+        long_thresh  = 55
         short_thresh = 40
         if inv >= long_thresh:   long_list.append(stock)
         elif inv <= short_thresh: short_list.append(stock)
         # High quality stocks also added to short list for bearish days
         elif inv >= 50: short_list.append({**stock, "bearish_candidate": True})
 
-    long_list  = sorted(long_list,  key=lambda x: x["quality_score"], reverse=True)[:25]
+    long_list  = sorted(long_list,  key=lambda x: x["quality_score"], reverse=True)[:50]
     short_list = sorted(short_list, key=lambda x: x["investmitra_score"])[:10]
     return long_list, short_list
 
@@ -770,6 +764,16 @@ class IntradayEngine:
 
         # Gap classification
         avg_vol    = stock.get("avg_volume", 1)
+        # Early morning RVOL adjustment - volume builds up after 10 AM
+        from datetime import datetime, timezone, timedelta
+        _ist = timezone(timedelta(hours=5, minutes=30))
+        _now_ist = datetime.now(_ist)
+        _early_morning = _now_ist.hour < 10  # Before 10 AM
+        
+        # Adjust avg_vol for early morning (volume is naturally lower)
+        if _early_morning:
+            avg_vol = avg_vol * 0.4  # Expect only 40% of daily avg before 10 AM
+        
         gap_type, gap_mult = classify_gap(true_gap_pct, volume, avg_vol)
 
         # Sector RS
@@ -983,7 +987,8 @@ class IntradayEngine:
                 true_gap_pct < -gap_thresh and
                 ltp <= today_open * 1.002 and
                 below_vwap and score >= 55 and
-                self._is_fo_eligible(symbol)):
+                self._is_fo_eligible(symbol) and
+                abs(true_gap_pct) > 0.5):  # Require stronger gap for quality shorts
             direction = "SHORT"
             logger.info("Bearish SHORT: %s gap %.2f%% breadth %.1fx (F&O eligible)", symbol, true_gap_pct, ad_ratio)
 
