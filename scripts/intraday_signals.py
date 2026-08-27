@@ -1508,11 +1508,29 @@ def main():
         ws.subscribe(tokens)
         ws.set_mode(ws.MODE_FULL, tokens)
 
-    ticker = KiteTicker(API_KEY, ACCESS_TOKEN)
+    def on_reconnect(ws, attempts):
+        logger.info("Reconnecting... attempt %d", attempts)
+
+    def on_noreconnect(ws):
+        logger.error("Max reconnects reached")
+
+    import threading, time
+    def _keepalive(ws_ref):
+        while True:
+            time.sleep(240)  # ping every 4 minutes
+            try:
+                if hasattr(ws_ref, '_ws') and ws_ref._ws:
+                    ws_ref._ws.ping()
+                    logger.debug("Keepalive ping sent")
+            except: pass
+
+    ticker = KiteTicker(API_KEY, ACCESS_TOKEN, reconnect=True, reconnect_max_tries=300)
     ticker.on_connect = on_connect
     ticker.on_ticks   = engine.on_tick
-    ticker.on_close   = lambda ws,c,r: logger.warning("Closed: %s", r)
-    ticker.on_error   = lambda ws,c,r: logger.error("Error: %s", r)
+    ticker.on_close        = lambda ws,c,r: logger.debug("Closed: %s", r)
+    ticker.on_error        = lambda ws,c,r: logger.debug("Error: %s", r)
+    ticker.on_reconnect    = on_reconnect
+    ticker.on_noreconnect  = on_noreconnect
 
     logger.info("Live — 9:15 open capture → 9:35+ signals")
     try:
