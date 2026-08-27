@@ -64,11 +64,11 @@ MAX_DAILY_LOSS_INR      = 6000
 MAX_POSITIONS           = 3
 MAX_CONSECUTIVE_LOSSES  = 2
 ATR_STOP_MULT           = 1.5
-ATR_TARGET_MULT         = 3.0
+ATR_TARGET_MULT         = 1.5
 BROKERAGE_PER_TRADE     = 80
 MIN_NET_PROFIT          = 200
 GAP_HOLD_MINUTES        = 5     # Gap must hold for 5 min before signal
-DEAD_TRADE_MINUTES      = 45    # Exit if no movement after 45 min
+DEAD_TRADE_MINUTES      = 30    # Exit if no movement after 30 min
 
 # ── Session Times ──────────────────────────────────────────────────────────────
 SESSIONS = {
@@ -527,10 +527,14 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
             "in_bulk_deal": in_bulk,
         }
 
-        if inv >= 60:   long_list.append(stock)
-        elif inv <= 35: short_list.append(stock)
+        cap = stock.get("market_cap_category", "MID")
+        # Lower threshold for MICRO/SMALL to get more small cap signals
+        long_thresh  = 55 if cap in ("MICRO", "SMALL") else 60
+        short_thresh = 40
+        if inv >= long_thresh:   long_list.append(stock)
+        elif inv <= short_thresh: short_list.append(stock)
         # High quality stocks also added to short list for bearish days
-        elif inv >= 55: short_list.append({**stock, "bearish_candidate": True})
+        elif inv >= 50: short_list.append({**stock, "bearish_candidate": True})
 
     long_list  = sorted(long_list,  key=lambda x: x["quality_score"], reverse=True)[:25]
     short_list = sorted(short_list, key=lambda x: x["investmitra_score"])[:10]
@@ -960,7 +964,8 @@ class IntradayEngine:
                 self.market_direction in ("BULLISH","NEUTRAL") and
                 true_gap_pct > gap_thresh and
                 ltp >= today_open * 0.998 and
-                above_vwap and score >= 60):
+                above_vwap and
+                score >= (55 if stock.get("market_cap_category","MID") in ("MICRO","SMALL") else 60)):
             direction = "LONG"
 
         # SHORT Option 1: dedicated short stock (low quality) gapping down
