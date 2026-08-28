@@ -802,6 +802,7 @@ class IntradayEngine:
 
         # Gap hold tracking (5 min confirmation)
         self.gap_first_seen   = {}   # symbol -> timestamp when gap first confirmed
+        self.traded_today      = set()  # No re-entry same stock same day
         self.gap_direction    = {}   # symbol -> 'LONG' or 'SHORT'
 
         self.signals          = {}
@@ -1066,6 +1067,7 @@ class IntradayEngine:
 
     def _check_signal(self, symbol, ltp, volume, now, session):
         if symbol in self.signals: return
+        if symbol in self.traded_today: return  # No re-entry same day
         # Paper trading - no position limit
         # can, reason = self.risk.can_trade()
         # if not can: return
@@ -1197,6 +1199,7 @@ class IntradayEngine:
 
         self.risk.open_position(symbol, ltp, stop, size, target, atr)
 
+        self.traded_today.add(symbol)  # Block re-entry today
         self.signals[symbol] = dict(
             symbol=symbol, direction=direction, entry=ltp,
             target=target, stoploss=stop, atr=round(atr,2),
