@@ -68,7 +68,7 @@ ATR_TARGET_MULT         = 1.5
 BROKERAGE_PER_TRADE     = 80
 MIN_NET_PROFIT          = 200
 GAP_HOLD_MINUTES        = 5     # Gap must hold for 5 min before signal
-DEAD_TRADE_MINUTES      = 30    # Exit if no movement after 30 min
+DEAD_TRADE_MINUTES      = 40    # Exit if no movement after 40 min
 
 # ── Session Times ──────────────────────────────────────────────────────────────
 SESSIONS = {
@@ -869,9 +869,7 @@ class IntradayEngine:
         # Gap classification
         avg_vol    = stock.get("avg_volume", 1)
         # Early morning RVOL adjustment - volume builds up after 10 AM
-        from datetime import datetime, timezone, timedelta
-        _ist = timezone(timedelta(hours=5, minutes=30))
-        _now_ist = datetime.now(_ist)
+        _now_ist = datetime.now(IST)
         _early_morning = _now_ist.hour < 10  # Before 10 AM
         
         # Adjust avg_vol for early morning (volume is naturally lower)
@@ -1617,20 +1615,21 @@ def main():
                             key_levels, sector_quotes, sentiment)
     engine.kite = kite  # Store kite reference for LTP fallback
 
-    # Dynamic gap scan at 9:32 AM — find additional gappers
+    # Dynamic gap scan ? runs once after WebSocket stable
     import threading
+    _dynamic_done = [False]
     def _dynamic_scan():
         import time as _time
-        from datetime import datetime, timezone, timedelta
-        ist = timezone(timedelta(hours=5, minutes=30))
-        # Wait until 9:32 AM
+        # Wait 60 seconds for WebSocket to fully stabilize
+        _time.sleep(60)
+        # Then wait until after 9:30 AM
         while True:
-            now = datetime.now(ist)
-            if now.hour == 9 and now.minute >= 32:
-                break
-            if now.hour > 9:
+            now = datetime.now(IST)
+            if now.hour > 9 or (now.hour == 9 and now.minute >= 30):
                 break
             _time.sleep(10)
+        if _dynamic_done[0]: return
+        _dynamic_done[0] = True
 
         existing = set(engine.all_stocks.keys())
         new_gappers = get_dynamic_gappers(kite, existing, ctx)
@@ -1656,11 +1655,14 @@ def main():
 
             if new_tokens:
                 logger.info("Subscribing %d dynamic gapper tokens", len(new_tokens))
-                # Will subscribe on next reconnect or via ticker
+                import time as _t
+                _t.sleep(2)  # Wait for WebSocket stability
                 try:
                     ticker.subscribe(new_tokens)
                     ticker.set_mode(ticker.MODE_FULL, new_tokens)
-                except: pass
+                    _t.sleep(1)
+                except Exception as e:
+                    logger.warning("Token subscribe failed: %s", e)
 
             print(f"\n  🔍 Dynamic scan: {len(new_gappers)} new gappers added")
             for g in new_gappers:
@@ -1689,11 +1691,11 @@ def main():
                     logger.debug("Keepalive ping sent")
             except: pass
 
-    ticker = KiteTicker(API_KEY, ACCESS_TOKEN, reconnect=True, reconnect_max_tries=300)
+    ticker = KiteTicker(API_KEY, ACCESS_TOKEN, reconnect=True, reconnect_max_tries=300, reconnect_max_delay=5)
     ticker.on_connect = on_connect
     ticker.on_ticks   = engine.on_tick
-    ticker.on_close        = lambda ws,c,r: logger.debug("Closed: %s", r)
-    ticker.on_error        = lambda ws,c,r: logger.debug("Error: %s", r)
+    ticker.on_close        = lambda ws,c,r: None
+    ticker.on_error        = lambda ws,c,r: None
     ticker.on_reconnect    = on_reconnect
     ticker.on_noreconnect  = on_noreconnect
 
