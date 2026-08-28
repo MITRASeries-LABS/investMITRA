@@ -47,8 +47,12 @@ def main():
     # Step 3: Run Opus weekly review + update weights
     print("\nStep 3: Running Opus weekly strategy review...")
     try:
-        from weight_optimizer import run_weekly_review
+        from weight_optimizer import run_weekly_review, update_signal_thresholds
         run_weekly_review(weeks=1)
+        # Update self-learning thresholds
+        from trade_logger import get_recent_trades
+        trades = get_recent_trades(days=7)
+        update_signal_thresholds({'total': len(trades)}, trades)
         print("  ✅ Weekly review complete")
     except Exception as e:
         print(f"  ❌ Weekly review failed: {e}")
