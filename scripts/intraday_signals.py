@@ -1049,8 +1049,9 @@ class IntradayEngine:
 
     def _check_signal(self, symbol, ltp, volume, now, session):
         if symbol in self.signals: return
-        can, reason = self.risk.can_trade()
-        if not can: return
+        # Paper trading - no position limit
+        # can, reason = self.risk.can_trade()
+        # if not can: return
 
         prev  = self.prev_close.get(symbol, 0)
         vwap  = self.vwap.get(symbol, ltp)
