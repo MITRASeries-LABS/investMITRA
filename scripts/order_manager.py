@@ -36,7 +36,7 @@ MAX_POSITIONS         = 3
 BROKERAGE_PER_TRADE   = 80
 SQUAREOFF_HOUR        = 15
 SQUAREOFF_MINUTE      = 0
-POLL_INTERVAL_SEC     = 5
+POLL_INTERVAL_SEC     = 15
 
 # Limit order buffer
 LIMIT_BUFFER_PCT      = 0.001   # 0.1% buffer for limit orders
