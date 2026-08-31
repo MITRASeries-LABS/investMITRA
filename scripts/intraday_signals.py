@@ -648,6 +648,10 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
     Exclude: results next 3 days, sensitive announcements,
              stocks up/down >5% yesterday
     """
+    # Load thresholds once
+    _thresh = load_signal_thresholds()
+    long_thresh  = int(_thresh.get('tier1_score_min', 55))
+
     conn = psycopg2.connect(NEON_URL, connect_timeout=15)
     cur  = conn.cursor()
     cur.execute("SELECT UPPER(symbol) FROM investmitra.nse_announcements WHERE ann_datetime>=NOW()-INTERVAL '12 hours' AND is_sensitive=TRUE")
@@ -755,11 +759,7 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
         # Same threshold for all caps - 55 minimum
         long_thresh  = 55
         short_thresh = 40
-        # Load thresholds
-        thresholds = load_signal_thresholds()
-        t1_score = thresholds.get('tier1_score_min', 55)
-
-        if inv >= t1_score:
+        if inv >= long_thresh:
             stock['tier'] = 1
             long_list.append(stock)
         elif inv <= short_thresh:
