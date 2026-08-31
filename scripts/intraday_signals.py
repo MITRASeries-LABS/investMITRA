@@ -989,45 +989,55 @@ class IntradayEngine:
             except: pass
             return
 
-        # Gap reversal exit: price crosses back through open
+        # Gap reversal exit: only if BELOW ENTRY for extended time
+        # Not just below open - stock must be losing money
         today_open = self.today_open.get(symbol, entry)
-        if is_long and ltp < today_open * 0.998:
-            pnl = self.risk.close_position(symbol, ltp)
-            print(f"\n  🔄 GAP REVERSAL EXIT: {symbol} @ ₹{ltp:.2f} | Gap filled | Net: ₹{pnl:.0f}\n")
-            try:
-                from order_manager import notify as tg_notify
-                tg_notify(f"GAP REVERSAL EXIT - {symbol}\nExit: {ltp:.2f}\nNet: {pnl:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
-            except: pass
-            return
+        if is_long and ltp < today_open * 0.995:  # 0.5% below open
+            # Only exit if ALSO below entry (actually losing)
+            if ltp < entry * 0.998:
+                # Track how long below open
+                below_open_key = f"{symbol}_below_open"
+                if below_open_key not in self.gap_first_seen:
+                    self.gap_first_seen[below_open_key] = now
+                else:
+                    mins_below = (now - self.gap_first_seen[below_open_key]).total_seconds() / 60
+                    if mins_below >= 10:  # Below open for 10+ minutes
+                        del self.gap_first_seen[below_open_key]
+                        pnl = self.risk.close_position(symbol, ltp)
+                        print(f"\n  ?? GAP REVERSAL EXIT: {symbol} @ \u20b9{ltp:.2f} | Below entry {mins_below:.0f}min | Net: \u20b9{pnl:.0f}\n")
+                        try:
+                            from order_manager import notify as tg_notify
+                            tg_notify(f"GAP REVERSAL EXIT - {symbol}\nBelow entry for {mins_below:.0f}min\nExit: {ltp:.2f}\nNet: {pnl:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
+                        except: pass
+                        return
+            else:
+                # Above entry but below open - remove below_open timer
+                self.gap_first_seen.pop(f"{symbol}_below_open", None)
+        else:
+            # Above open - clear any below_open timer
+            self.gap_first_seen.pop(f"{symbol}_below_open", None)
 
-        # Dead trade exit: no movement after 45 min
+        # Dead trade exit: no movement after time limit
         elapsed = (now - pos["signal_time"]).total_seconds() / 60
-        # SMART EXIT: Exit based on price action, not just time
         today_open = self.today_open.get(symbol, entry)
-        vwap = self.vwap.get(symbol, ltp)
-        gap_intact = (is_long and ltp > today_open) or (not is_long and ltp < today_open)
-        above_vwap = (is_long and ltp >= vwap * 0.998) or (not is_long and ltp <= vwap * 1.002)
+        gap_intact = (is_long and ltp >= today_open) or (not is_long and ltp <= today_open)
+        above_entry = (is_long and ltp >= entry) or (not is_long and ltp <= entry)
 
         if elapsed > DEAD_TRADE_MINUTES and not pos["partial_done"]:
-            if gap_intact and elapsed < DEAD_TRADE_MINUTES * 3:
-                # Gap still intact - give more time (up to 3x)
-                logger.debug("Gap intact: %s ltp=%.2f open=%.2f - holding", symbol, ltp, today_open)
-            elif not gap_intact and elapsed > 20:
-                # Gap filled - thesis broken - exit immediately
-                pnl = self.risk.close_position(symbol, ltp)
-                print(f"\n  ? GAP FILLED EXIT: {symbol} @ \u20b9{ltp:.2f} | Gap filled after {elapsed:.0f}min | Net: \u20b9{pnl:.0f}\n")
-                try:
-                    from order_manager import notify as tg_notify
-                    tg_notify(f"GAP FILLED EXIT - {symbol}\nGap filled after {elapsed:.0f}min\nExit: {ltp:.2f}\nNet: {pnl:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
-                except: pass
-                return
+            if above_entry and gap_intact:
+                # Profitable or flat + gap intact = hold until 3PM
+                logger.debug("Holding: %s ltp=%.2f entry=%.2f gap intact", symbol, ltp, entry)
+            elif above_entry and not gap_intact and elapsed < DEAD_TRADE_MINUTES * 3:
+                # Above entry but gap filled = give more time
+                logger.debug("Above entry, gap filled: %s - extending", symbol)
             else:
-                # Time limit reached and gap borderline - exit
+                # Below entry OR time limit exceeded = exit
                 pnl = self.risk.close_position(symbol, ltp)
-                print(f"\n  ? DEAD TRADE EXIT: {symbol} @ \u20b9{ltp:.2f} | No move in {elapsed:.0f}min | Net: \u20b9{pnl:.0f}\n")
+                reason = "below entry" if not above_entry else "time limit"
+                print(f"\n  \u23f0 DEAD TRADE EXIT: {symbol} @ \u20b9{ltp:.2f} | {reason} after {elapsed:.0f}min | Net: \u20b9{pnl:.0f}\n")
                 try:
                     from order_manager import notify as tg_notify
-                    tg_notify(f"DEAD TRADE EXIT - {symbol}\nNo move in {elapsed:.0f}min\nExit: {ltp:.2f}\nNet: {pnl:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
+                    tg_notify(f"DEAD TRADE EXIT - {symbol}\n{reason} after {elapsed:.0f}min\nExit: {ltp:.2f}\nNet: {pnl:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
                 except: pass
                 return
         # Partial exit at 1R
