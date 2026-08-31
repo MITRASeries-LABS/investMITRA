@@ -1494,8 +1494,9 @@ class IntradayEngine:
 
             # Update intraday_pnl
             wins = sum(1 for s in self.signals.values() 
-                      if (s.get("exit_price",s["entry"])-s["entry"])*
-                         (1 if s["direction"]=="LONG" else -1) > 0)
+                      if ((s.get("exit_price",s["entry"])-s["entry"])*
+                         (1 if s["direction"]=="LONG" else -1) * 
+                         s.get("position_size",1)) > 80)  # Must beat brokerage
             cur.execute("""
                 INSERT INTO investmitra.intraday_pnl
                     (trade_date, trades, capital_deployed, gross_pnl, brokerage,
