@@ -1295,6 +1295,16 @@ class IntradayEngine:
 
         direction = None
 
+        # Minimum quality filters (Sonnet recommendation)
+        min_rvol = 8.0   # Minimum RVOL for any signal
+        # Relaxed for Tier 2 momentum stocks
+        tier = stock.get('tier', 1)
+        if tier == 2:
+            min_rvol = 3.0  # Tier 2 already requires gap>1%
+
+        if rvol_score_raw < min_rvol:
+            return  # Skip weak volume signals
+
         # LONG: quality stock gapping up in neutral/bullish market
         if (symbol in self.long_map and
                 self.market_direction in ("BULLISH","NEUTRAL") and
