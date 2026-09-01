@@ -807,7 +807,7 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
         for row in t2_rows:
             sym = row[0]
             if sym in existing_syms: continue
-            if sym in results_symbols: continue
+            if sym in ctx.get('results_today', set()): continue
             stock = {
                 'symbol':              sym,
                 'market_cap_category': row[1] or 'MID',
