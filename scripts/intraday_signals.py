@@ -839,7 +839,7 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
 
 def classify_gap(gap_pct, volume, avg_volume) -> tuple[str, float]:
     abs_gap    = abs(gap_pct)
-    rvol       = volume / avg_volume if avg_volume > 0 else 1
+    rvol       = min(volume / avg_volume if avg_volume > 0 else 1, 200.0)
     high_vol   = rvol > 1.5
     strong_vol = rvol > 2.5
     if abs_gap > 4.0:                              return "exhaustion", 0.4
@@ -1088,7 +1088,7 @@ class IntradayEngine:
         kl         = self.key_levels.get(symbol, {})
 
         # RVOL
-        avg_daily  = self.rvol_baseline.get(isin, stock.get("avg_volume", 1))
+        avg_daily  = max(self.rvol_baseline.get(isin, stock.get("avg_volume", 1)), 1)
         now        = datetime.now(IST)
         mkt_min    = now.hour*60+now.minute-(9*60+15)
         frac       = max(mkt_min/375, 0.05)
