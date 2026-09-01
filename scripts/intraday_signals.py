@@ -1542,7 +1542,7 @@ class IntradayEngine:
                 print(f"\n  {label} ({len(lst)}):")
                 for s in lst:
                     cap = s['position_size']*s['entry']
-                    print(f"    {s['symbol']:<12}[{s['cap']}] ₹{s['entry']:>8,.2f}→₹{s['target']:>8,.2f} SL:₹{s['stoploss']:,.2f} {s['position_size']}sh ₹{cap:,.0f} Gap:{s['true_gap']:+.1f}%")
+                    print(f"    {s['symbol']:<12}[{s.get('cap', s.get('market_cap_category','?'))}] ₹{s['entry']:>8,.2f}→₹{s['target']:>8,.2f} SL:₹{s['stoploss']:,.2f} {s['position_size']}sh ₹{cap:,.0f} Gap:{s['true_gap']:+.1f}%")
         if not longs and not shorts:
             print("  No signals today.")
         print(f"\n  ⚠️  SQUARE OFF BY 3:00 PM")
@@ -1829,14 +1829,14 @@ def main():
                 kl  = key_levels.get(s["symbol"], {})
                 atr = kl.get("atr14", 0)
                 blk = "📦" if s.get("in_bulk_deal") else ""
-                print(f"  {s['symbol']:<13} {s['cap']:<7} {s['quality_score']:>5.1f} {s['investmitra_score']:>6.1f} {s['screen_count']:>4} {s['piotroski']:>3} {atr:>7.1f} {s['prev_day_chg']:>+5.1f}% {blk}")
+                print(f"  {s['symbol']:<13} {s.get('cap',s.get('market_cap_category','?')):<7} {s.get('quality_score',0):>5.1f} {s.get('investmitra_score',0):>6.1f} {s.get('screen_count',0):>4} {s.get('piotroski',s.get('piotroski_score',0)):>3} {atr:>7.1f} {s.get('prev_day_chg',0):>+5.1f}% {blk}")
     if short_list:
         print(f"\n  🔴 SHORT ({len(short_list)}):")
         for s in short_list:
             if s["symbol"] in token_map:
                 kl  = key_levels.get(s["symbol"], {})
                 atr = kl.get("atr14", 0)
-                print(f"  {s['symbol']:<13} {s['cap']:<7} {s['quality_score']:>5.1f} {s['investmitra_score']:>6.1f} ATR:{atr:.1f}")
+                print(f"  {s['symbol']:<13} {s.get('cap', s.get('market_cap_category','?')):<7} {s['quality_score']:>5.1f} {s['investmitra_score']:>6.1f} ATR:{atr:.1f}")
     print(f"\n  Capturing opens 9:15-9:30 → gap hold 5min → signals 9:35+")
     print(f"  Exits: partial@1R | trail | reversal | dead@45min | 3PM")
     print(f"{'='*65}\n")
