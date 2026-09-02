@@ -1302,7 +1302,7 @@ class IntradayEngine:
         if tier == 2:
             min_rvol = 3.0  # Tier 2 already requires gap>1%
 
-        if rvol_score_raw < min_rvol:
+        if rvol < min_rvol:
             return  # Skip weak volume signals
 
         # LONG: quality stock gapping up in neutral/bullish market
@@ -1802,10 +1802,10 @@ def main():
     if market_direction == "BULLISH":
         short_list = []
     elif market_direction == "BEARISH":
-        long_list = []
-    elif weak_market:
-        # NEUTRAL but weak breadth ? keep both but flag bearish bias
-        logger.info("Weak breadth (%.1fx) ? SHORT bias enabled for quality stocks", adv_ratio)
+        # On bearish day add quality long stocks as short candidates
+        quality_shorts = [dict(s, direction_override="SHORT") for s in long_list if s.get("quality_score",0) >= 60]
+        short_list = quality_shorts + short_list
+        long_list  = []
 
     all_stocks = long_list + short_list
     if not all_stocks:
