@@ -1326,9 +1326,12 @@ class IntradayEngine:
         if rvol_check < min_rvol:
             return  # Skip weak volume signals
 
-        # LONG: quality stock gapping up in neutral/bullish market
+        # LONG: quality stock gapping up
+        # Allow on BEARISH day only if gap is strong (>1%) and RVOL high
+        bearish_long_ok = (self.market_direction == "BEARISH" and
+                          true_gap_pct > 1.0 and rvol_check > 3.0)
         if (symbol in self.long_map and
-                self.market_direction in ("BULLISH","NEUTRAL") and
+                (self.market_direction in ("BULLISH","NEUTRAL") or bearish_long_ok) and
                 true_gap_pct > gap_thresh and
                 ltp >= today_open * 0.998 and
                 above_vwap and
