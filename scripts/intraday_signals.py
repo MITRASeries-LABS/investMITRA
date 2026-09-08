@@ -570,8 +570,17 @@ def get_dynamic_gappers(kite, existing_symbols: set, ctx: dict) -> list[dict]:
                     dynamic_gappers.append(c)
                     logger.info("Dynamic gapper: %s gap=%.2f%% (%s)", sym, gap_pct, gap_type)
 
-        logger.info("Dynamic scan: %d new gappers from top-200", len(dynamic_gappers))
-        return dynamic_gappers[:20]
+        # Deduplicate by symbol
+        seen = set()
+        unique = []
+        for g in dynamic_gappers:
+            if g["symbol"] not in seen:
+                seen.add(g["symbol"])
+                unique.append(g)
+        # Sort by gap size descending - best first
+        unique.sort(key=lambda x: abs(x.get("gap_pct",0)), reverse=True)
+        logger.info("Dynamic scan: %d unique gappers", len(unique))
+        return unique[:20]
 
     except Exception as e:
         logger.warning("Dynamic gap scan failed: %s", e)
