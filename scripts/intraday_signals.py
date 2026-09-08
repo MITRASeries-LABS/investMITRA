@@ -1296,7 +1296,7 @@ class IntradayEngine:
         direction = None
 
         # Minimum quality filters (Sonnet recommendation)
-        min_rvol = 8.0   # Minimum RVOL for any signal
+        min_rvol = 2.0   # Minimum RVOL for any signal
         tier = stock.get('tier', 1)
         if tier == 2:
             min_rvol = 3.0
