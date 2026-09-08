@@ -562,7 +562,8 @@ def get_dynamic_gappers(kite, existing_symbols: set, ctx: dict) -> list[dict]:
                 if cap in ('MICRO','SMALL'): thresh *= 0.7
 
                 if (abs(gap_pct) >= thresh and
-                        gap_type not in ('exhaustion','fade_risk','small_gap')):
+                        gap_type not in ('exhaustion','fade_risk','small_gap') and
+                        abs(gap_pct) >= 0.5):  # Min 0.5% gap for dynamic stocks
                     c['gap_pct']  = gap_pct
                     c['gap_type'] = gap_type
                     c['ltp']      = ltp
