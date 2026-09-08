@@ -1900,8 +1900,12 @@ def main():
         if new_gappers:
             # Add to engine watchlist
             for g in new_gappers:
+                g['direction'] = 'LONG' if g.get('gap_pct',0) > 0 else 'SHORT'
                 engine.long_map[g['symbol']] = g
                 engine.all_stocks[g['symbol']] = g
+                # Also add to short_map if bearish gap
+                if g.get('gap_pct',0) < 0:
+                    engine.short_map[g['symbol']] = g
 
             # Subscribe new tokens
             new_tokens = []
