@@ -1317,8 +1317,8 @@ class IntradayEngine:
         # Minimum quality filters (Sonnet recommendation)
         min_rvol = 2.0   # Minimum RVOL for any signal
         tier = stock.get('tier', 1)
-        if tier == 2:
-            min_rvol = 3.0
+        # Tier 2 already filtered by gap>0.5% in dynamic scan
+        # Keep same RVOL threshold
 
         # Calculate RVOL here for filtering
         avg_vol_check = self.rvol_baseline.get(symbol, 0)
@@ -1335,7 +1335,7 @@ class IntradayEngine:
                 true_gap_pct > gap_thresh and
                 ltp >= today_open * 0.998 and
                 above_vwap and
-                score >= (55 if stock.get("market_cap_category","MID") in ("MICRO","SMALL") else 60)):
+                (score >= (55 if stock.get("market_cap_category","MID") in ("MICRO","SMALL") else 60) or tier == 2)):
             direction = "LONG"
 
         # SHORT Option 1: dedicated short stock (low quality) gapping down
