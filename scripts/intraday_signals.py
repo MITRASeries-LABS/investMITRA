@@ -591,7 +591,16 @@ def get_rvol_baseline() -> dict[str, float]:
     try:
         conn = psycopg2.connect(NEON_URL, connect_timeout=10)
         cur  = conn.cursor()
-        cur.execute("SELECT isin, AVG(volume) FROM investmitra.equity_prices WHERE trade_date>=CURRENT_DATE-INTERVAL '30 days' AND trade_date<CURRENT_DATE GROUP BY isin HAVING AVG(volume)>0")
+        cur.execute("""
+            SELECT cm.nse_symbol, AVG(ep.volume)
+            FROM investmitra.equity_prices ep
+            JOIN investmitra.company_master cm ON ep.isin=cm.isin
+            WHERE ep.trade_date>=CURRENT_DATE-INTERVAL '30 days'
+              AND ep.trade_date<CURRENT_DATE
+              AND cm.nse_symbol IS NOT NULL
+            GROUP BY cm.nse_symbol
+            HAVING AVG(ep.volume)>0
+        """)
         result = {r[0]: float(r[1]) for r in cur.fetchall()}
         cur.close(); conn.close()
         return result
