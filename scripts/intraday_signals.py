@@ -1057,17 +1057,92 @@ class IntradayEngine:
                 self._check_signal(symbol, ltp, volume, now, session)
 
     def _record_exit(self, symbol, exit_price, outcome):
-        """Record exit details in signals dict for P&L tracking."""
-        if symbol in self.signals:
-            now_ist = datetime.now(IST)
-            self.signals[symbol]["exit_price"] = exit_price
-            self.signals[symbol]["outcome"]    = outcome
-            self.signals[symbol]["exit_at"]    = now_ist   # tz-aware, immutable
-            self.signals[symbol]["exit_time"]  = now_ist.strftime("%H:%M:%S")
-            # Ensure entry_at is set (fallback to position signal_time)
-            if "entry_at" not in self.signals[symbol]:
-                pos = self.risk.positions.get(symbol, {})
-                self.signals[symbol]["entry_at"] = pos.get("signal_time", now_ist)
+        """Record exit details, persist closed state, save trade immediately."""
+        if symbol not in self.signals:
+            return
+        now_ist = datetime.now(IST)
+        sig = self.signals[symbol]
+        sig["exit_price"] = exit_price
+        sig["outcome"]    = outcome
+        sig["exit_at"]    = now_ist
+        sig["exit_time"]  = now_ist.strftime("%H:%M:%S")
+        if "entry_at" not in sig:
+            pos = self.risk.positions.get(symbol, {})
+            sig["entry_at"] = pos.get("signal_time", now_ist)
+
+        # Persist closed snapshot immediately (before summary save)
+        try:
+            from broker_reconciler import persist_engine_position
+            pos = self.risk.positions.get(symbol, {})
+            persist_engine_position(symbol, {
+                "direction":       sig.get("direction","LONG"),
+                "entry":           sig.get("entry",0),
+                "orig_qty":        sig.get("position_size",0),
+                "remaining_qty":   0,
+                "stop":            sig.get("stoploss",0),
+                "target":          sig.get("target",0),
+                "initial_risk":    pos.get("initial_risk",1),
+                "atr":             pos.get("atr",0),
+                "trail_level":     pos.get("trail_level",0),
+                "partial_done":    bool(sig.get("partial_exit_price")),
+                "partial_gross":   sig.get("partial_gross",0),
+                "partial_exit_px": sig.get("partial_exit_price"),
+                "estimated_costs": sig.get("estimated_costs",80),
+                "trade_id":        sig.get("trade_id"),
+                "daily_pnl_at":           self.risk.daily_pnl,
+                "trades_today_at":         self.risk.trades_today,
+                "daily_brokerage_at":      self.risk.daily_brokerage,
+                "consecutive_losses_at":   self.risk.consecutive_losses,
+                "signal_time":             sig.get("entry_at"),
+                "exchange":        pos.get("exchange","NSE"),
+                "product":         pos.get("product","MIS"),
+            }, status="CLOSED", is_paper=PAPER_TRADING)
+        except Exception: pass
+
+        # Save to trade_log immediately — idempotent upsert via trade_id
+        try:
+            import psycopg2 as _pg2
+            _c2 = _pg2.connect(NEON_URL, connect_timeout=5)
+            _c2.autocommit = True
+            _cur2 = _c2.cursor()
+            _exit_p  = sig["exit_price"]
+            _entry   = sig.get("entry", 0)
+            _oqty    = sig.get("position_size", 0)
+            _psz     = _oqty // 2 if sig.get("partial_exit_price") else 0
+            _rem     = _oqty - _psz
+            _pg2_dir = sig.get("direction","LONG")
+            _fg      = (_exit_p - _entry) * _rem if _pg2_dir=="LONG" else (_entry - _exit_p) * _rem
+            _gross   = sig.get("partial_gross", 0) + _fg
+            _net     = self.risk.compute_trade_net(sig, _exit_p)
+            _hold    = round((now_ist - sig["entry_at"]).total_seconds()/60)
+            _d       = sig.get("details", {})
+            _cur2.execute("""
+                INSERT INTO investmitra.trade_log
+                    (trade_date,symbol,direction,entry_price,exit_price,
+                     quantity,gross_pnl,net_pnl,outcome,hold_minutes,
+                     true_gap_pct,gap_type,rvol,sector_rs,final_score,
+                     market_direction,vix_level,session,atr,capital_deployed,
+                     trade_id,trade_status,is_paper,strategy_version)
+                VALUES (CURRENT_DATE,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'CLOSED',%s,'v28')
+                ON CONFLICT (trade_id) WHERE trade_id IS NOT NULL
+                DO UPDATE SET exit_price=EXCLUDED.exit_price,
+                    gross_pnl=EXCLUDED.gross_pnl,net_pnl=EXCLUDED.net_pnl,
+                    outcome=EXCLUDED.outcome,hold_minutes=EXCLUDED.hold_minutes,
+                    trade_status=EXCLUDED.trade_status
+            """, (
+                symbol, _pg2_dir, _entry, _exit_p, _oqty,
+                round(_gross,2), round(_net,2), outcome, _hold,
+                sig.get("true_gap",0), _d.get("gap_type",""),
+                _d.get("rvol",0), _d.get("sector_rs",0),
+                sig.get("final_score",0), getattr(self,"market_direction","NEUTRAL"),
+                0, sig.get("session","momentum"),
+                sig.get("atr",0), round(_entry*_oqty,2),
+                sig.get("trade_id"), PAPER_TRADING,
+            ))
+            _cur2.close(); _c2.close()
+            logger.info("Trade saved immediately: %s net=Rs%.0f", symbol, _net)
+        except Exception as _te:
+            logger.warning("Immediate trade save failed for %s: %s", symbol, _te)
 
     def _check_exits(self, symbol, ltp, session, now):
         """Check all exit conditions: partial, trailing, dead trade, reversal."""
@@ -1175,6 +1250,34 @@ class IntradayEngine:
                         # partial_pnl = gross (full costs deducted at trade close via estimated_costs)
                         self.signals[symbol]["partial_pnl"] = self.signals[symbol]["partial_gross"]
                         self.signals[symbol]["partial_exit_price"] = ltp
+                    # Persist full snapshot after partial exit
+                    try:
+                        from broker_reconciler import persist_engine_position
+                        _sig = self.signals.get(symbol, {})
+                        persist_engine_position(symbol, {
+                            "direction":       pos.get("direction","LONG"),
+                            "entry":           entry,
+                            "orig_qty":        _sig.get("position_size", pos["size"] + partial_size),
+                            "remaining_qty":   pos["size"],
+                            "stop":            pos["stop"],
+                            "target":          pos.get("target",0),
+                            "initial_risk":    pos.get("initial_risk", abs(entry - pos["stop"])) or 1,
+                            "atr":             pos.get("atr", 0),
+                            "trail_level":     pos.get("trail_level", 0),
+                            "partial_done":    True,
+                            "partial_gross":   _sig.get("partial_gross", 0),
+                            "partial_exit_px": ltp,
+                            "estimated_costs": _sig.get("estimated_costs", 80),
+                            "daily_brokerage_at":      self.risk.daily_brokerage,
+                            "consecutive_losses_at":   self.risk.consecutive_losses,
+                            "trade_id":        _sig.get("trade_id"),
+                            "daily_pnl_at":    self.risk.daily_pnl,
+                            "trades_today_at": self.risk.trades_today,
+                            "signal_time":     _sig.get("entry_at"),
+                            "exchange":        pos.get("exchange","NSE"),
+                            "product":         pos.get("product","MIS"),
+                        }, status="PARTIAL", is_paper=PAPER_TRADING)
+                    except Exception: pass
                     print(f"\n  💰 PARTIAL EXIT: {symbol} — {partial_size} sh @ ₹{ltp:.2f} | Gross realised: +₹{gross_partial:.0f}")
                 try:
                     from order_manager import notify as tg_notify
@@ -1193,6 +1296,34 @@ class IntradayEngine:
                 if (is_long and new_stop > pos["stop"]) or (not is_long and new_stop < pos["stop"]):
                     pos["stop"] = new_stop
                     print(f"\n  📈 TRAILING STOP: {symbol} → ₹{new_stop:.2f}\n")
+                    # Persist full snapshot after trailing stop update
+                    try:
+                        from broker_reconciler import persist_engine_position
+                        _sig = self.signals.get(symbol, {})
+                        persist_engine_position(symbol, {
+                            "direction":       pos.get("direction","LONG"),
+                            "entry":           entry,
+                            "orig_qty":        _sig.get("position_size", pos["size"]),
+                            "remaining_qty":   pos["size"],
+                            "stop":            new_stop,
+                            "target":          pos.get("target",0),
+                            "initial_risk":    pos.get("initial_risk",1),  # original — never zero
+                            "atr":             pos.get("atr",0),
+                            "trail_level":     pos.get("trail_level",0),
+                            "partial_done":    True,
+                            "partial_gross":   _sig.get("partial_gross",0),
+                            "partial_exit_px": _sig.get("partial_exit_price"),
+                            "estimated_costs": _sig.get("estimated_costs",80),
+                            "daily_brokerage_at":      self.risk.daily_brokerage,
+                            "consecutive_losses_at":   self.risk.consecutive_losses,
+                            "trade_id":        _sig.get("trade_id"),
+                            "daily_pnl_at":    self.risk.daily_pnl,
+                            "trades_today_at": self.risk.trades_today,
+                            "signal_time":     _sig.get("entry_at"),
+                            "exchange":        pos.get("exchange","NSE"),
+                            "product":         pos.get("product","MIS"),
+                        }, status="PARTIAL", is_paper=PAPER_TRADING)
+                    except Exception: pass
 
         # Session close
         if session == "closing":
@@ -1335,6 +1466,9 @@ class IntradayEngine:
     def _check_signal(self, symbol, ltp, volume, now, session):
         if symbol in self.signals: return
         if symbol in self.traded_today: return  # No re-entry same day
+        if getattr(self, "_entry_blocked", False):
+            logger.debug("Entry blocked for %s — restart recovery pending", symbol)
+            return
         # Risk checks - checked again after sizing below
         if self.risk.net_pnl <= -MAX_DAILY_LOSS_INR:
             logger.debug("Daily loss limit hit: Rs%.0f", self.risk.net_pnl)
@@ -1548,8 +1682,12 @@ class IntradayEngine:
         # Realistic cost estimate
         trade_cost   = estimate_costs(ltp, size, target)
         expected_net = (abs(target - ltp) * size * 0.5) - trade_cost
-        # Minimum: must beat costs after 50% partial exit
-        if expected_net < MIN_NET_PROFIT: return
+        # Minimum: expected net must exceed costs by at least 1x
+        # (costs already deducted — so min_profit = 0 means break-even, 
+        #  MIN_NET_PROFIT=50 means ₹50 above costs)
+        # For small tickets (< ₹5,000), relax to just beat costs
+        min_profit = MIN_NET_PROFIT if ltp * size >= 5000 else max(0, trade_cost * 0.5)
+        if expected_net < min_profit: return
 
         # Risk check AFTER sizing - includes candidate stop risk and costs
         candidate_stop_risk = abs(ltp - stop) * size
@@ -1575,18 +1713,15 @@ class IntradayEngine:
             logger.debug("Capital limit: Rs%.0f committed", committed)
             return
 
-        # Estimate realistic costs upfront - stored with signal
-        trade_cost = estimate_costs(ltp, size, target)
-        self.risk.open_position(symbol, ltp, stop, size, target, atr, trade_cost)
-        self.risk.positions[symbol]["direction"] = direction  # Store for P&L calc
-
         self.traded_today.add(symbol)  # Block re-entry today
         _entry_at = datetime.now(IST)
+        _trade_id = f"{date.today().isoformat()}_{symbol}_{_entry_at.strftime('%H%M%S')}"
         self.signals[symbol] = dict(
             symbol=symbol, direction=direction, entry=ltp,
             estimated_costs=trade_cost,
             signal_time=_entry_at,
             entry_at=_entry_at,
+            trade_id=_trade_id,
             target=target, stoploss=stop, atr=round(atr,2),
             true_gap=round(true_gap_pct,2), today_open=today_open,
             vwap=vwap, final_score=final,
@@ -1600,6 +1735,40 @@ class IntradayEngine:
             piotroski=stock.get("piotroski",0),
             in_bulk=stock.get("in_bulk_deal",False),
         )
+        # Now open position and persist (signal dict exists)
+        self.risk.open_position(symbol, ltp, stop, size, target, atr, trade_cost)
+        self.risk.positions[symbol]["direction"] = direction
+        self.risk.positions[symbol]["exchange"]  = "NSE"
+        self.risk.positions[symbol]["product"]   = "MIS"
+        try:
+            from broker_reconciler import persist_engine_position
+            sig = self.signals[symbol]
+            persist_engine_position(symbol, {
+                "direction":       direction,
+                "entry":           ltp,
+                "orig_qty":        size,
+                "remaining_qty":   size,
+                "stop":            stop,
+                "target":          target,
+                "initial_risk":    stop_dist,
+                "atr":             atr,
+                "trail_level":     0,
+                "partial_done":    False,
+                "partial_gross":   0,
+                "partial_exit_px": None,
+                "estimated_costs": trade_cost,
+                "trade_id":        sig.get("trade_id"),
+                "daily_pnl_at":           self.risk.daily_pnl,
+                "trades_today_at":         self.risk.trades_today,
+                "daily_brokerage_at":      self.risk.daily_brokerage,
+                "consecutive_losses_at":   self.risk.consecutive_losses,
+                "signal_time":             sig.get("entry_at"),
+                "exchange":                "NSE",
+                "product":                 "MIS",
+            }, status="OPEN", is_paper=PAPER_TRADING)
+        except Exception as _pe:
+            logger.warning("Persist open position failed for %s: %s", symbol, _pe)
+
         self._print_signal(self.signals[symbol], stock)
 
         # Send Telegram alert immediately
@@ -1700,9 +1869,31 @@ class IntradayEngine:
                     session          VARCHAR(20),
                     atr              DECIMAL(10,2),
                     capital_deployed DECIMAL(12,2),
+                    trade_id         VARCHAR(60) UNIQUE,
+                    trade_status     VARCHAR(10) DEFAULT 'CLOSED',
+                    is_paper         BOOLEAN DEFAULT TRUE,
+                    strategy_version VARCHAR(20) DEFAULT 'v25',
                     created_at       TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
+            # Add columns if table existed before these were added
+            for _col, _def in [
+                ("trade_id",         "VARCHAR(60)"),
+                ("trade_status",     "VARCHAR(10) DEFAULT 'CLOSED'"),
+                ("is_paper",         "BOOLEAN DEFAULT TRUE"),
+                ("strategy_version", "VARCHAR(20) DEFAULT 'v25'"),
+            ]:
+                try:
+                    cur.execute(f"ALTER TABLE investmitra.trade_log ADD COLUMN IF NOT EXISTS {_col} {_def}")
+                except Exception: pass
+            # Unique index on trade_id for upsert
+            try:
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS trade_log_trade_id_uidx
+                    ON investmitra.trade_log(trade_id)
+                    WHERE trade_id IS NOT NULL
+                """)
+            except Exception: pass
 
             saved = 0
             for symbol, sig in self.signals.items():
@@ -1736,8 +1927,13 @@ class IntradayEngine:
                          quantity, gross_pnl, net_pnl, outcome, hold_minutes,
                          true_gap_pct, gap_type, rvol, sector_rs,
                          final_score, market_direction, vix_level, session, atr,
-                         capital_deployed)
-                    VALUES (CURRENT_DATE,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                         capital_deployed, trade_id, trade_status, is_paper, strategy_version)
+                    VALUES (CURRENT_DATE,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (trade_id) WHERE trade_id IS NOT NULL
+                    DO UPDATE SET
+                        exit_price=EXCLUDED.exit_price, gross_pnl=EXCLUDED.gross_pnl,
+                        net_pnl=EXCLUDED.net_pnl, outcome=EXCLUDED.outcome,
+                        hold_minutes=EXCLUDED.hold_minutes, trade_status=EXCLUDED.trade_status
                 """, (
                     symbol, sig["direction"], entry, exit_p, qty,
                     round(gross,2), round(net,2), outcome,
@@ -1751,7 +1947,8 @@ class IntradayEngine:
                     d.get("rvol",0), d.get("sector_rs",0),
                     sig.get("final_score",0), self.market_direction,
                     0, sig.get("session","momentum"),
-                    sig.get("atr",0), round(entry*qty,2)
+                    sig.get("atr",0), round(entry*qty,2),
+                    sig.get("trade_id"), "CLOSED", PAPER_TRADING, "v28"
                 ))
                 saved += 1
 
@@ -2152,7 +2349,31 @@ def main():
     engine = IntradayEngine(long_list, short_list, token_map, prev_close,
                             market_direction, ctx, rvol_baseline,
                             key_levels, sector_quotes, sentiment)
-    engine.kite = kite  # Store kite reference for LTP fallback
+    engine.kite = kite
+
+    # Start with entries BLOCKED — enabled only after successful restore
+    # AND after all restored positions are monitored (token subscription)
+    engine._entry_blocked = True
+    try:
+        from broker_reconciler import restore_engine_state
+        restore_engine_state(engine, is_paper=PAPER_TRADING)
+        # DB recovery succeeded — but entries stay blocked if positions need tokens
+        restored = getattr(engine, "_restored_symbols", [])
+        if restored:
+            logger.info("DB recovery succeeded — %d position(s) still need token "
+                        "subscription before entries are enabled", len(restored))
+            # _entry_blocked remains True — on_connect will enable after subscription
+        else:
+            # No open positions to restore — safe to enable immediately
+            engine._entry_blocked = False
+            logger.info("State restore complete — no open positions — entries enabled")
+    except RuntimeError as e:
+        logger.error("State restore FAILED — entries remain blocked: %s", e)
+        logger.error("Resolve manually or restart after market reset.")
+    except Exception as e:
+        logger.error("State restore ERROR — entries remain blocked: %s", e)
+        logger.info("If this is a fresh session with no open positions, "
+                    "manually set engine._entry_blocked = False to resume.")
 
     # Dynamic gap scan ? runs once after WebSocket stable
     import threading
@@ -2232,6 +2453,61 @@ def main():
         logger.info("Connected — %d tokens", len(tokens))
         ws.subscribe(tokens)
         ws.set_mode(ws.MODE_FULL, tokens)
+        # Subscribe tokens for positions restored after restart
+        # Entries stay blocked until ALL restored positions are monitored
+        restored = getattr(engine, "_restored_symbols", [])
+        if restored:
+            restored_tokens  = []
+            still_unresolved = []   # keep queue — retry on next connect
+            for item in restored:
+                sym  = item["symbol"]   if isinstance(item, dict) else item
+                exch = item.get("exchange", "NSE") if isinstance(item, dict) else "NSE"
+
+                tok = engine.token_map.get(sym)
+                if not tok:
+                    try:
+                        ltp_data = kite.ltp([f"{exch}:{sym}"])
+                        for k, v in ltp_data.items():
+                            tok = v.get("instrument_token")
+                            if tok:
+                                engine.token_map[sym]  = tok
+                                engine.rev_tokens[tok] = sym
+                                break
+                    except Exception as _re:
+                        logger.warning("Token resolution failed for %s: %s — will retry", sym, _re)
+
+                if tok:
+                    if sym not in engine.all_stocks:
+                        stock_data = (engine.long_map.get(sym)
+                                      or engine.short_map.get(sym)
+                                      or {"symbol": sym})
+                        engine.all_stocks[sym] = stock_data
+                    restored_tokens.append(tok)
+                    logger.info("Re-subscribing restored: %s token=%d", sym, tok)
+                else:
+                    still_unresolved.append(item)
+                    logger.error("No token for restored %s — kept in retry queue", sym)
+
+            if restored_tokens:
+                ws.subscribe(restored_tokens)
+                ws.set_mode(ws.MODE_FULL, restored_tokens)
+                logger.info("Subscribed %d restored position tokens", len(restored_tokens))
+
+            if still_unresolved:
+                # Keep unresolved in queue and explicitly keep entries blocked
+                engine._restored_symbols  = still_unresolved
+                engine._entry_blocked     = True   # explicit — not just "remains True"
+                logger.error(
+                    "%d restored position(s) still unmonitored — entries blocked: %s",
+                    len(still_unresolved),
+                    [i["symbol"] if isinstance(i,dict) else i for i in still_unresolved]
+                )
+            else:
+                # All resolved — clear queue and enable entries
+                engine._restored_symbols = []
+                if getattr(engine, "_entry_blocked", False):
+                    engine._entry_blocked = False
+                    logger.info("All restored positions monitored — new entries enabled")
 
     def on_reconnect(ws, attempts):
         logger.info("Reconnecting... attempt %d", attempts)
