@@ -61,8 +61,23 @@ MAX_POSITIONS           = 3
 MAX_CONSECUTIVE_LOSSES  = 2
 ATR_STOP_MULT           = 1.5
 ATR_TARGET_MULT         = 1.5
-BROKERAGE_PER_TRADE     = 80
-MIN_NET_PROFIT          = 200
+BROKERAGE_PER_TRADE     = 80   # conservative fallback only
+MIN_NET_PROFIT          = 50   # lowered - filter by expected_net not fixed floor
+PAPER_TRADING           = True  # Set False for real money (changes position limit only)
+PAPER_MAX_POSITIONS     = 9     # Max positions in paper trading mode
+DESK_CAPITAL_INR        = 250000  # Total capital available for trading
+
+def estimate_costs(entry_price: float, qty: int, exit_price: float = 0) -> float:
+    """Realistic Zerodha intraday cost estimate."""
+    ticket = entry_price * qty
+    # Brokerage: min(₹20, 0.03%) per order, 2 orders round-trip
+    brokerage = min(20, ticket * 0.0003) * 2
+    # STT: 0.025% on sell side only (intraday)
+    exit_val = (exit_price or entry_price) * qty
+    stt = exit_val * 0.00025
+    # Exchange + SEBI + GST: ~0.005%
+    other = ticket * 0.00005 * 2
+    return round(brokerage + stt + other + 2, 2)  # +2 for misc
 GAP_HOLD_MINUTES        = 5     # Gap must hold for 5 min before signal
 DEAD_TRADE_MINUTES      = 40    # Exit if no movement after 40 min
 
@@ -184,28 +199,45 @@ def get_key_levels(symbols: list[str]) -> dict[str, dict]:
         conn = psycopg2.connect(NEON_URL, connect_timeout=10)
         cur  = conn.cursor()
         cur.execute("""
-            WITH recent AS (
+            WITH base AS (
+                -- Step 1: raw prices with previous close
                 SELECT ep.isin, cm.nse_symbol, ep.trade_date,
                        ep.open, ep.high, ep.low, ep.close,
-                       ep.high - ep.low AS daily_range,
-                       AVG(ep.close) OVER (PARTITION BY ep.isin ORDER BY ep.trade_date
-                           ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS ma20,
-                       AVG(ep.close) OVER (PARTITION BY ep.isin ORDER BY ep.trade_date
-                           ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS ma50,
-                       AVG(ep.high - ep.low) OVER (PARTITION BY ep.isin ORDER BY ep.trade_date
-                           ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS atr14,
-                       MAX(ep.high) OVER (PARTITION BY ep.isin ORDER BY ep.trade_date
-                           ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS high_52w,
-                       MIN(ep.low) OVER (PARTITION BY ep.isin ORDER BY ep.trade_date
-                           ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS low_52w,
-                       (ep.close - LAG(ep.close) OVER (PARTITION BY ep.isin ORDER BY ep.trade_date))
-                           / NULLIF(LAG(ep.close) OVER (PARTITION BY ep.isin ORDER BY ep.trade_date), 0) * 100
-                           AS prev_day_chg_pct,
-                       ROW_NUMBER() OVER (PARTITION BY ep.isin ORDER BY ep.trade_date DESC) AS rn
+                       LAG(ep.close) OVER (PARTITION BY ep.isin ORDER BY ep.trade_date) AS prev_close
                 FROM investmitra.equity_prices ep
                 JOIN investmitra.company_master cm ON ep.isin = cm.isin
                 WHERE cm.nse_symbol = ANY(%s)
-                  AND ep.trade_date >= CURRENT_DATE - INTERVAL '60 days'
+                  AND ep.trade_date >= CURRENT_DATE - INTERVAL '500 days'
+                  AND ep.trade_date < CURRENT_DATE  -- exclude today's incomplete session
+            ),
+            tr_calc AS (
+                -- Step 2: true range using prev close
+                SELECT isin, nse_symbol, trade_date, open, high, low, close,
+                       GREATEST(
+                           high - low,
+                           ABS(high - COALESCE(prev_close, close)),
+                           ABS(low  - COALESCE(prev_close, close))
+                       ) AS tr,
+                       prev_close
+                FROM base
+            ),
+            recent AS (
+                -- Step 3: rolling indicators
+                SELECT isin, nse_symbol, trade_date, open, high, low, close,
+                       high - low AS daily_range,
+                       AVG(close) OVER (PARTITION BY isin ORDER BY trade_date
+                           ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS ma20,
+                       AVG(close) OVER (PARTITION BY isin ORDER BY trade_date
+                           ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS ma50,
+                       AVG(tr) OVER (PARTITION BY isin ORDER BY trade_date
+                           ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS atr14,
+                       MAX(high) OVER (PARTITION BY isin ORDER BY trade_date
+                           ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS high_52w,  -- needs 252 sessions
+                       MIN(low) OVER (PARTITION BY isin ORDER BY trade_date
+                           ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS low_52w,
+                       (close - prev_close) / NULLIF(prev_close, 0) * 100 AS prev_day_chg_pct,
+                       ROW_NUMBER() OVER (PARTITION BY isin ORDER BY trade_date DESC) AS rn
+                FROM tr_calc
             )
             SELECT nse_symbol, open, high, low, close, ma20, ma50,
                    atr14, daily_range, high_52w, low_52w, prev_day_chg_pct
@@ -634,31 +666,6 @@ def load_signal_thresholds() -> dict:
             'tier2_gap_min':1.0,'tier2_rvol_min':3.0,'tier2_traded_min':5000000}
 
 
-def load_signal_thresholds() -> dict:
-    try:
-        conn = psycopg2.connect(NEON_URL, connect_timeout=10)
-        cur  = conn.cursor()
-        cur.execute("""
-            SELECT tier1_score_min, tier1_gap_min, tier1_rvol_min,
-                   tier2_gap_min, tier2_rvol_min, tier2_traded_min
-            FROM investmitra.signal_thresholds
-            WHERE effective_date <= CURRENT_DATE
-            ORDER BY effective_date DESC LIMIT 1
-        """)
-        row = cur.fetchone()
-        cur.close(); conn.close()
-        if row:
-            t = {'tier1_score_min': float(row[0]), 'tier1_gap_min': float(row[1]),
-                 'tier1_rvol_min': float(row[2]), 'tier2_gap_min': float(row[3]),
-                 'tier2_rvol_min': float(row[4]), 'tier2_traded_min': int(row[5])}
-            logger.info("Thresholds: T1 score>%.0f gap>%.2f%% | T2 gap>%.1f%% rvol>%.1fx",
-                t['tier1_score_min'], t['tier1_gap_min'], t['tier2_gap_min'], t['tier2_rvol_min'])
-            return t
-    except Exception as e:
-        logger.warning("Load thresholds: %s", e)
-    return {'tier1_score_min':55,'tier1_gap_min':0.30,'tier1_rvol_min':1.5,
-            'tier2_gap_min':1.0,'tier2_rvol_min':3.0,'tier2_traded_min':5000000}
-
 
 def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
     """
@@ -683,9 +690,18 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
                    AVG(close) AS avg_price,
                    AVG(volume)*AVG(close) AS avg_traded_value,
                    -- Yesterday's change %
-                   (MAX(CASE WHEN trade_date=(SELECT MAX(t) FROM (SELECT DISTINCT trade_date AS t FROM investmitra.equity_prices WHERE trade_date<CURRENT_DATE ORDER BY t DESC LIMIT 1) x) THEN close END)
-                    - MAX(CASE WHEN trade_date=(SELECT MAX(t) FROM (SELECT DISTINCT trade_date AS t FROM investmitra.equity_prices WHERE trade_date<CURRENT_DATE ORDER BY t DESC LIMIT 2) x LIMIT 1 OFFSET 1) THEN close END))
-                   / NULLIF(MAX(CASE WHEN trade_date=(SELECT MAX(t) FROM (SELECT DISTINCT trade_date AS t FROM investmitra.equity_prices WHERE trade_date<CURRENT_DATE ORDER BY t DESC LIMIT 2) x LIMIT 1 OFFSET 1) THEN close END), 0) * 100
+                   (MAX(CASE WHEN trade_date=(
+                        SELECT trade_date FROM investmitra.equity_prices
+                        WHERE trade_date < CURRENT_DATE GROUP BY trade_date
+                        ORDER BY trade_date DESC LIMIT 1) THEN close END)
+                    - MAX(CASE WHEN trade_date=(
+                        SELECT trade_date FROM investmitra.equity_prices
+                        WHERE trade_date < CURRENT_DATE GROUP BY trade_date
+                        ORDER BY trade_date DESC LIMIT 1 OFFSET 1) THEN close END))
+                   / NULLIF(MAX(CASE WHEN trade_date=(
+                        SELECT trade_date FROM investmitra.equity_prices
+                        WHERE trade_date < CURRENT_DATE GROUP BY trade_date
+                        ORDER BY trade_date DESC LIMIT 1 OFFSET 1) THEN close END), 0) * 100
                    AS prev_day_chg
             FROM investmitra.equity_prices
             WHERE trade_date>=CURRENT_DATE-INTERVAL '30 days'
@@ -894,23 +910,67 @@ class DailyRiskManager:
             return False, f"Consecutive losses: {self.consecutive_losses}"
         return True, "OK"
 
-    def open_position(self, symbol, entry, stop, size, target, atr):
+    def open_position(self, symbol, entry, stop, size, target, atr, estimated_costs=None):
+        initial_risk = abs(entry - stop)
+        costs = estimated_costs if estimated_costs is not None else BROKERAGE_PER_TRADE
         self.positions[symbol] = {
             "entry": entry, "stop": stop, "size": size, "target": target,
             "partial_done": False, "partial_size": size // 2,
             "atr": atr, "signal_time": datetime.now(IST),
-            "trail_level": 0,  # tracks how many 1R moves made
+            "trail_level": 0,
+            "initial_risk": initial_risk,
+            "direction": None,
+            "estimated_costs": costs,
         }
         self.trades_today    += 1
-        self.daily_brokerage += BROKERAGE_PER_TRADE
+        self.daily_brokerage += costs  # use realistic estimate
 
-    def close_position(self, symbol, exit_price):
+    def compute_trade_net(self, sig: dict, exit_price: float) -> float:
+        """
+        Single source of truth for trade P&L.
+        trade_gross = partial_gross + final_gross_on_remaining
+        trade_net   = trade_gross - total_costs (one brokerage for whole trade)
+        """
+        if not sig: return 0.0
+        entry     = sig.get("entry", 0)
+        orig_qty  = sig.get("position_size", 1)
+        direction = sig.get("direction", "LONG")
+        partial_gross = sig.get("partial_gross", 0.0)
+        partial_done  = bool(sig.get("partial_exit_price"))
+        partial_qty   = orig_qty // 2 if partial_done else 0
+        remaining_qty = orig_qty - partial_qty
+
+        if direction == "SHORT":
+            final_gross = (entry - exit_price) * remaining_qty
+        else:
+            final_gross = (exit_price - entry) * remaining_qty
+
+        total_gross = partial_gross + final_gross
+        # Use pre-estimated costs stored at signal time (consistent with daily_brokerage)
+        total_costs = sig.get("estimated_costs", BROKERAGE_PER_TRADE)
+        return total_gross - total_costs
+
+    def close_position(self, symbol, exit_price, direction="LONG", sig=None):
         if symbol not in self.positions: return 0
         pos = self.positions.pop(symbol)
-        pnl = (exit_price - pos["entry"]) * pos["size"]
-        self.daily_pnl += pnl
-        self.consecutive_losses = 0 if pnl > 0 else self.consecutive_losses + 1
-        return pnl
+        pos_direction = pos.get("direction", direction)
+
+        # Final exit P&L on remaining shares
+        if pos_direction == "SHORT":
+            final_pnl = (pos["entry"] - exit_price) * pos["size"]
+        else:
+            final_pnl = (exit_price - pos["entry"]) * pos["size"]
+        self.daily_pnl += final_pnl
+
+        # Determine win/loss using WHOLE trade (partial + final - costs)
+        if sig is not None:
+            trade_net = self.compute_trade_net(sig, exit_price)
+        else:
+            # Fallback: use final pnl only
+            trade_net = final_pnl - BROKERAGE_PER_TRADE
+
+        self.consecutive_losses = 0 if trade_net > 0 else self.consecutive_losses + 1
+        return final_pnl
 
 
 class IntradayEngine:
@@ -968,12 +1028,20 @@ class IntradayEngine:
                 self.today_open[symbol] = ohlc_open if ohlc_open > 0 else ltp
                 self.open_captured[symbol] = True
 
-            # VWAP
-            new_vol = max(0, volume - self.cum_vol[symbol])
-            if new_vol > 0:
+            # VWAP - use average traded price from tick if available
+            avg_traded_price = tick.get("average_traded_price", 0)
+            if avg_traded_price > 0 and volume > 0:
+                # Kite provides reliable ATP - use directly
+                self.vwap[symbol] = avg_traded_price
+                # Refresh accumulators on every valid update
                 self.cum_vol[symbol]    = volume
-                self.cum_tp_vol[symbol] += ltp * new_vol
-                if volume > 0:
+                self.cum_tp_vol[symbol] = avg_traded_price * volume
+            elif volume > 0:
+                # Fallback: calculate from cumulative ticks
+                new_vol = max(0, volume - self.cum_vol[symbol])
+                if new_vol > 0:
+                    self.cum_vol[symbol]    = volume
+                    self.cum_tp_vol[symbol] += ltp * new_vol
                     self.vwap[symbol] = self.cum_tp_vol[symbol] / volume
 
             # Opening range
@@ -988,6 +1056,19 @@ class IntradayEngine:
             if session in ("momentum","choppy","afternoon"):
                 self._check_signal(symbol, ltp, volume, now, session)
 
+    def _record_exit(self, symbol, exit_price, outcome):
+        """Record exit details in signals dict for P&L tracking."""
+        if symbol in self.signals:
+            now_ist = datetime.now(IST)
+            self.signals[symbol]["exit_price"] = exit_price
+            self.signals[symbol]["outcome"]    = outcome
+            self.signals[symbol]["exit_at"]    = now_ist   # tz-aware, immutable
+            self.signals[symbol]["exit_time"]  = now_ist.strftime("%H:%M:%S")
+            # Ensure entry_at is set (fallback to position signal_time)
+            if "entry_at" not in self.signals[symbol]:
+                pos = self.risk.positions.get(symbol, {})
+                self.signals[symbol]["entry_at"] = pos.get("signal_time", now_ist)
+
     def _check_exits(self, symbol, ltp, session, now):
         """Check all exit conditions: partial, trailing, dead trade, reversal."""
         if symbol not in self.risk.positions: return
@@ -996,15 +1077,18 @@ class IntradayEngine:
         stop  = pos["stop"]
         atr   = pos["atr"]
         risk  = abs(entry - stop)
-        is_long = symbol in self.long_map
+        is_long = self.risk.positions[symbol].get("direction", "LONG" if symbol in self.long_map else "SHORT") == "LONG"
 
         # Stoploss hit
         if (is_long and ltp <= stop) or (not is_long and ltp >= stop):
-            pnl = self.risk.close_position(symbol, ltp)
-            print(f"\n  🛑 STOPLOSS: {symbol} @ ₹{ltp:.2f} | Net: ₹{pnl:.0f}\n")
+            sig = self.signals.get(symbol)
+            pnl = self.risk.close_position(symbol, ltp, sig=sig)
+            self._record_exit(symbol, ltp, "STOPLOSS")
+            trade_net = self.risk.compute_trade_net(sig, ltp) if sig else pnl - 80
+            print(f"\n  🛑 STOPLOSS: {symbol} @ ₹{ltp:.2f} | Net: ₹{trade_net:.0f}\n")
             try:
                 from order_manager import notify as tg_notify
-                tg_notify(f"STOPLOSS - {symbol}\nExit: {ltp:.2f}\nNet: {pnl:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
+                tg_notify(f"STOPLOSS - {symbol}\nExit: {ltp:.2f}\nNet: {trade_net:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
             except: pass
             return
 
@@ -1022,11 +1106,14 @@ class IntradayEngine:
                     mins_below = (now - self.gap_first_seen[below_open_key]).total_seconds() / 60
                     if mins_below >= 10:  # Below open for 10+ minutes
                         del self.gap_first_seen[below_open_key]
-                        pnl = self.risk.close_position(symbol, ltp)
-                        print(f"\n  ?? GAP REVERSAL EXIT: {symbol} @ \u20b9{ltp:.2f} | Below entry {mins_below:.0f}min | Net: \u20b9{pnl:.0f}\n")
+                        pnl = self.risk.close_position(symbol, ltp, sig=self.signals.get(symbol))
+                        self._record_exit(symbol, ltp, 'REVERSAL')
+                        print(f"\n  🔄 GAP REVERSAL EXIT: {symbol} @ ₹{ltp:.2f} | Below entry {mins_below:.0f}min | Net: ₹{pnl:.0f}\n")
                         try:
                             from order_manager import notify as tg_notify
-                            tg_notify(f"GAP REVERSAL EXIT - {symbol}\nBelow entry for {mins_below:.0f}min\nExit: {ltp:.2f}\nNet: {pnl:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
+                            _sig = self.signals.get(symbol)
+                            _trade_net = self.risk.compute_trade_net(_sig, ltp) if _sig else pnl - BROKERAGE_PER_TRADE
+                            tg_notify(f"GAP REVERSAL EXIT - {symbol}\nBelow entry for {mins_below:.0f}min\nExit: {ltp:.2f}\nNet: {_trade_net:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
                         except: pass
                         return
             else:
@@ -1051,50 +1138,73 @@ class IntradayEngine:
                 logger.debug("Above entry, gap filled: %s - extending", symbol)
             else:
                 # Below entry OR time limit exceeded = exit
-                pnl = self.risk.close_position(symbol, ltp)
+                sig = self.signals.get(symbol)
+                pnl = self.risk.close_position(symbol, ltp, sig=sig)
                 reason = "below entry" if not above_entry else "time limit"
-                print(f"\n  \u23f0 DEAD TRADE EXIT: {symbol} @ \u20b9{ltp:.2f} | {reason} after {elapsed:.0f}min | Net: \u20b9{pnl:.0f}\n")
+                self._record_exit(symbol, ltp, 'TIME_EXIT')
+                trade_net = self.risk.compute_trade_net(sig, ltp) if sig else pnl - 80
+                print(f"\n  ⏰ DEAD TRADE EXIT: {symbol} @ ₹{ltp:.2f} | {reason} after {elapsed:.0f}min | Net: ₹{trade_net:.0f}\n")
                 try:
                     from order_manager import notify as tg_notify
-                    tg_notify(f"DEAD TRADE EXIT - {symbol}\n{reason} after {elapsed:.0f}min\nExit: {ltp:.2f}\nNet: {pnl:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
+                    tg_notify(f"DEAD TRADE EXIT - {symbol}\n{reason} after {elapsed:.0f}min\nExit: {ltp:.2f}\nNet: {trade_net:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
                 except: pass
                 return
         # Partial exit at 1R
         if not pos["partial_done"]:
             if (is_long and ltp >= entry + risk) or (not is_long and ltp <= entry - risk):
-                pos["partial_done"] = True
                 partial_size = pos["partial_size"]
-                pnl = abs(ltp - entry) * partial_size
-                self.risk.daily_pnl += pnl
-                pos["stop"] = entry  # Move to breakeven
-                pos["size"] -= partial_size
-                net = pnl - BROKERAGE_PER_TRADE // 2
-                print(f"\n  💰 PARTIAL EXIT: {symbol} — {partial_size} sh @ ₹{ltp:.2f} | Net: +₹{net:.0f}")
+                if partial_size == 0:  # Skip partial for single-share positions
+                    pos["partial_done"] = True
+                    # Do NOT return - continue to check session close below
+                else:
+                    pos["partial_done"] = True
+                    # Direction-aware partial P&L
+                    pos_dir = pos.get("direction", "LONG")
+                    if pos_dir == "SHORT":
+                        pnl = (entry - ltp) * partial_size
+                    else:
+                        pnl = (ltp - entry) * partial_size
+                    self.risk.daily_pnl += pnl
+                    pos["stop"] = entry  # Move to breakeven
+                    pos["size"] -= partial_size
+                    gross_partial = pnl  # gross, costs accounted in estimated_costs
+                    # gross_partial used in print/TG below; net costs settled at close
+                    # Record partial exit in signals (gross stored separately)
+                    if symbol in self.signals:
+                        self.signals[symbol]["partial_gross"] = self.signals[symbol].get("partial_gross", 0) + pnl
+                        # partial_pnl = gross (full costs deducted at trade close via estimated_costs)
+                        self.signals[symbol]["partial_pnl"] = self.signals[symbol]["partial_gross"]
+                        self.signals[symbol]["partial_exit_price"] = ltp
+                    print(f"\n  💰 PARTIAL EXIT: {symbol} — {partial_size} sh @ ₹{ltp:.2f} | Gross realised: +₹{gross_partial:.0f}")
                 try:
                     from order_manager import notify as tg_notify
-                    tg_notify(f"PARTIAL EXIT - {symbol}\\n{partial_size} shares @ {ltp:.2f}\\nNet: +{net:.0f}\\nStop -> breakeven\\nDaily P&L: {self.risk.net_pnl:.0f}")
+                    tg_notify(f"PARTIAL EXIT - {symbol}\\n{partial_size} shares @ {ltp:.2f}\\nGross realised: +{gross_partial:.0f}\\nStop -> breakeven\\nDaily P&L: {self.risk.net_pnl:.0f}")
                 except: pass
-                print(f"  📍 Stop → breakeven ₹{entry:.2f} | Remaining: {pos['size']} shares\n")
+                print(f"  📍 Stop → breakeven ₹{pos['stop']:.2f} | Remaining: {pos['size']} shares")
 
         # Trailing stop: move stop by ATR/2 after each additional 1R
         elif pos["partial_done"] and pos["size"] > 0:
-            moves_made = int((ltp - entry) / risk) if is_long else int((entry - ltp) / risk)
+            initial_risk = pos.get("initial_risk", risk) or risk  # never zero
+            moves_made = int((ltp - entry) / initial_risk) if is_long else int((entry - ltp) / initial_risk)
             if moves_made > pos["trail_level"] + 1:
                 pos["trail_level"] = moves_made - 1
-                new_stop = round(entry + (pos["trail_level"] * risk * 0.5), 2) if is_long else \
-                           round(entry - (pos["trail_level"] * risk * 0.5), 2)
+                new_stop = round(entry + (pos["trail_level"] * initial_risk * 0.5), 2) if is_long else \
+                           round(entry - (pos["trail_level"] * initial_risk * 0.5), 2)
                 if (is_long and new_stop > pos["stop"]) or (not is_long and new_stop < pos["stop"]):
                     pos["stop"] = new_stop
                     print(f"\n  📈 TRAILING STOP: {symbol} → ₹{new_stop:.2f}\n")
 
         # Session close
         if session == "closing":
-            pnl = self.risk.close_position(symbol, ltp)
+            sig = self.signals.get(symbol)
+            pnl = self.risk.close_position(symbol, ltp, sig=sig)
             if pnl is not None:
-                print(f"\n  🏁 SESSION EXIT: {symbol} @ ₹{ltp:.2f} | Net: ₹{pnl:.0f}\n")
+                self._record_exit(symbol, ltp, "TIME_EXIT")
+                trade_net = self.risk.compute_trade_net(sig, ltp) if sig else pnl - 80
+                print(f"\n  🏁 SESSION EXIT: {symbol} @ ₹{ltp:.2f} | Net: ₹{trade_net:.0f}\n")
                 try:
                     from order_manager import notify as tg_notify
-                    tg_notify(f"3PM EXIT - {symbol}\nExit: {ltp:.2f}\nNet: {pnl:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
+                    tg_notify(f"3PM EXIT - {symbol}\nExit: {ltp:.2f}\nNet: {trade_net:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
                 except: pass
 
     def _compute_opportunity_score(self, symbol, ltp, volume, true_gap_pct, session) -> tuple[float, dict]:
@@ -1106,24 +1216,20 @@ class IntradayEngine:
         sector     = stock.get("sector", "")
         kl         = self.key_levels.get(symbol, {})
 
-        # RVOL
-        avg_daily  = max(self.rvol_baseline.get(isin, stock.get("avg_volume", 1)), 1)
+        # RVOL - time-adjusted, symbol-keyed baseline
+        # Use symbol key (fixed) not ISIN key (broken)
+        avg_daily  = max(self.rvol_baseline.get(symbol, 
+                         self.rvol_baseline.get(isin, 
+                         stock.get("avg_volume", 0))), 1)
         now        = datetime.now(IST)
         mkt_min    = now.hour*60+now.minute-(9*60+15)
+        # Time-adjusted: compare today's volume to historical volume at same time
         frac       = max(mkt_min/375, 0.05)
-        rvol       = volume / (avg_daily * frac) if avg_daily * frac > 0 else 1
+        expected_vol_now = avg_daily * frac
+        rvol       = min(volume / expected_vol_now, 200.0) if expected_vol_now > 0 else 1
 
-        # Gap classification
-        avg_vol    = stock.get("avg_volume", 1)
-        # Early morning RVOL adjustment - volume builds up after 10 AM
-        _now_ist = datetime.now(IST)
-        _early_morning = _now_ist.hour < 10  # Before 10 AM
-        
-        # Adjust avg_vol for early morning (volume is naturally lower)
-        if _early_morning:
-            avg_vol = avg_vol * 0.4  # Expect only 40% of daily avg before 10 AM
-        
-        gap_type, gap_mult = classify_gap(true_gap_pct, volume, avg_vol)
+        # Gap classification - use time-adjusted expected volume
+        gap_type, gap_mult = classify_gap(true_gap_pct, volume, expected_vol_now)
 
         # Sector RS
         sector_key = SECTOR_INDEX_MAP.get(sector, "NSE:NIFTY 50")
@@ -1229,9 +1335,18 @@ class IntradayEngine:
     def _check_signal(self, symbol, ltp, volume, now, session):
         if symbol in self.signals: return
         if symbol in self.traded_today: return  # No re-entry same day
-        # Paper trading - no position limit
-        # can, reason = self.risk.can_trade()
-        # if not can: return
+        # Risk checks - checked again after sizing below
+        if self.risk.net_pnl <= -MAX_DAILY_LOSS_INR:
+            logger.debug("Daily loss limit hit: Rs%.0f", self.risk.net_pnl)
+            return
+        if self.risk.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+            logger.debug("Consecutive losses: %d", self.risk.consecutive_losses)
+            return
+        # Position cap - explicit paper/live limits
+        pos_limit = PAPER_MAX_POSITIONS if PAPER_TRADING else MAX_POSITIONS
+        if len(self.risk.positions) >= pos_limit:
+            logger.debug("Max positions reached: %d/%d", len(self.risk.positions), pos_limit)
+            return
 
         prev  = self.prev_close.get(symbol, 0)
         vwap  = self.vwap.get(symbol, ltp)
@@ -1266,6 +1381,16 @@ class IntradayEngine:
         if self.vix_signal == "ELEVATED": gap_thresh *= 1.5
 
         if abs(true_gap_pct) > gap_thresh:
+            # Check live price still confirms gap direction
+            gap_is_long = true_gap_pct > 0
+            live_confirms = (gap_is_long and ltp > prev * 1.001) or                            (not gap_is_long and ltp < prev * 0.999)
+            
+            if not live_confirms:
+                # Price has filled the gap - reset timer
+                if symbol in self.gap_first_seen:
+                    del self.gap_first_seen[symbol]
+                return
+
             # First time we see this gap — record timestamp
             if symbol not in self.gap_first_seen:
                 self.gap_first_seen[symbol] = now
@@ -1279,6 +1404,13 @@ class IntradayEngine:
             # Check gap direction hasn't flipped
             current_dir = "LONG" if true_gap_pct > 0 else "SHORT"
             if current_dir != self.gap_direction.get(symbol):
+                del self.gap_first_seen[symbol]
+                return
+            # Reset if live price has filled the gap (price back at prev close)
+            if current_dir == "LONG" and ltp < prev * 1.001:
+                del self.gap_first_seen[symbol]
+                return
+            if current_dir == "SHORT" and ltp > prev * 0.999:
                 del self.gap_first_seen[symbol]
                 return
         else:
@@ -1317,51 +1449,58 @@ class IntradayEngine:
         # Minimum quality filters (Sonnet recommendation)
         min_rvol = 2.0   # Minimum RVOL for any signal
         tier = stock.get('tier', 1)
-        # Tier 2 already filtered by gap>0.5% in dynamic scan
-        # Keep same RVOL threshold
+        if tier == 2:
+            min_rvol = 3.0
 
-        # Calculate RVOL here for filtering
+        # Calculate time-adjusted RVOL (matches _compute_opportunity_score)
         avg_vol_check = self.rvol_baseline.get(symbol, 0)
         if avg_vol_check == 0: return  # No history - skip
-        rvol_check = min(volume / avg_vol_check, 200.0)
+        _mkt_min   = now.hour*60+now.minute-(9*60+15)
+        _frac      = max(_mkt_min/375, 0.05)
+        _exp_vol   = avg_vol_check * _frac
+        rvol_check = min(volume / _exp_vol, 200.0) if _exp_vol > 0 else 1.0
         if rvol_check < min_rvol:
             return  # Skip weak volume signals
 
-        # LONG: quality stock gapping up
-        # Allow on BEARISH day if:
-        #   gap > 0.5% AND price already moved 2%+ from open (strong momentum)
-        # On BEARISH day allow LONG if gap>0.3% and RVOL>3x
-        # Don't wait for price momentum - gap + volume is enough
-        bearish_long_ok = (self.market_direction == "BEARISH" and
-                          true_gap_pct > 0.3 and
-                          rvol_check > 3.0)
+        # LONG: quality stock gapping up in neutral/bullish market
         if (symbol in self.long_map and
-                (self.market_direction in ("BULLISH","NEUTRAL") or bearish_long_ok) and
+                self.market_direction in ("BULLISH","NEUTRAL") and
                 true_gap_pct > gap_thresh and
                 ltp >= today_open * 0.998 and
                 above_vwap and
-                (score >= (55 if stock.get("market_cap_category","MID") in ("MICRO","SMALL") else 60) or tier == 2)):
+                score >= (55 if stock.get("market_cap_category","MID") in ("MICRO","SMALL") else 60)):
             direction = "LONG"
 
         # SHORT Option 1: dedicated short stock (low quality) gapping down
         elif (symbol in self.short_map and
+                stock.get("direction_override") != "SHORT" and  # not a quality short
                 self.market_direction in ("BEARISH","NEUTRAL") and
                 true_gap_pct < -gap_thresh and
                 ltp <= today_open * 1.002 and
                 below_vwap and score <= 40):
             direction = "SHORT"
 
-        # SHORT Option 2: HIGH QUALITY stock gapping DOWN on weak/bearish day
-        # Only F&O eligible stocks can be shorted intraday reliably
+        # SHORT Option 2: QUALITY stock with direction_override="SHORT" (bearish day routing)
+        # These are quality stocks moved to short list by main() on bearish days
+        elif (symbol in self.short_map and
+                stock.get("direction_override") == "SHORT" and
+                true_gap_pct < -gap_thresh and
+                ltp <= today_open * 1.002 and
+                below_vwap and score >= 55 and
+                self._is_fo_eligible(symbol)):
+            direction = "SHORT"
+            logger.info("Quality SHORT: %s gap %.2f%% (bearish day F&O)", symbol, true_gap_pct)
+
+        # SHORT Option 3: HIGH QUALITY stock gapping DOWN on weak/bearish day (long_map)
         elif (symbol in self.long_map and
                 weak_market and
                 true_gap_pct < -gap_thresh and
                 ltp <= today_open * 1.002 and
                 below_vwap and score >= 55 and
                 self._is_fo_eligible(symbol) and
-                abs(true_gap_pct) > 0.5):  # Require stronger gap for quality shorts
+                abs(true_gap_pct) > 0.5):
             direction = "SHORT"
-            logger.info("Bearish SHORT: %s gap %.2f%% breadth %.1fx (F&O eligible)", symbol, true_gap_pct, ad_ratio)
+            logger.info("Bearish SHORT: %s gap %.2f%% (F&O eligible)", symbol, true_gap_pct)
 
         if not direction: return
 
@@ -1373,16 +1512,81 @@ class IntradayEngine:
         stop_dist = abs(ltp - stop)
         if stop_dist == 0: return
 
-        size = max(1, min(int(MAX_RISK_PER_TRADE_INR/stop_dist), int(MAX_CAPITAL_PER_TRADE/ltp)))
+        # Available capital = starting equity minus realised losses and committed capital
+        # Equity after realised P&L and costs (negative net_pnl reduces available capital)
+        realised_equity   = DESK_CAPITAL_INR + self.risk.net_pnl  # net_pnl already deducts costs
+        committed_capital = sum(p["entry"] * p["size"] for p in self.risk.positions.values())
+        candidate_cost    = estimate_costs(ltp, int(MAX_CAPITAL_PER_TRADE / ltp) or 1, target)
+        available_capital = max(0, realised_equity - committed_capital - candidate_cost)
 
-        expected_net = (abs(target - ltp) * size * 0.5) - BROKERAGE_PER_TRADE
+        if available_capital < 1000:
+            logger.debug("Insufficient capital: Rs%.0f available", available_capital)
+            return
+
+        # Size constrained by: risk budget, available capital, and per-trade cap
+        risk_size    = int(MAX_RISK_PER_TRADE_INR / stop_dist) if stop_dist > 0 else 1
+        capital_size = int(min(available_capital, MAX_CAPITAL_PER_TRADE) / ltp)
+        size = min(risk_size, capital_size)
+        if size <= 0:
+            logger.debug("Skip %s — zero size after risk/capital constraints", symbol)
+            return
+
+        # Post-sizing validations — none may override the limits above
+        ticket_value  = size * ltp
+        actual_risk   = size * stop_dist
+
+        if ticket_value < 1000:
+            logger.debug("Skip %s — ticket Rs%.0f below Rs1000 minimum", symbol, ticket_value)
+            return
+        if ticket_value > MAX_CAPITAL_PER_TRADE:
+            logger.debug("Skip %s — ticket Rs%.0f exceeds cap Rs%d", symbol, ticket_value, MAX_CAPITAL_PER_TRADE)
+            return
+        if actual_risk > MAX_RISK_PER_TRADE_INR:
+            logger.debug("Skip %s — stop risk Rs%.0f exceeds limit Rs%d", symbol, actual_risk, MAX_RISK_PER_TRADE_INR)
+            return
+
+        # Realistic cost estimate
+        trade_cost   = estimate_costs(ltp, size, target)
+        expected_net = (abs(target - ltp) * size * 0.5) - trade_cost
+        # Minimum: must beat costs after 50% partial exit
         if expected_net < MIN_NET_PROFIT: return
 
-        self.risk.open_position(symbol, ltp, stop, size, target, atr)
+        # Risk check AFTER sizing - includes candidate stop risk and costs
+        candidate_stop_risk = abs(ltp - stop) * size
+        candidate_costs     = estimate_costs(ltp, size, target)
+        # Direction-aware open risk (stops that lock profit are not losses)
+        open_risk = 0
+        for p in self.risk.positions.values():
+            p_dir = p.get("direction", "LONG")
+            p_entry = p["entry"]; p_stop = p["stop"]; p_size = p["size"]
+            if p_dir == "LONG":
+                worst = (p_stop - p_entry) * p_size  # negative if stop below entry
+            else:
+                worst = (p_entry - p_stop) * p_size
+            open_risk += min(0, worst)  # only count actual losses, not locked profits
+        effective_pnl = self.risk.net_pnl + open_risk - candidate_stop_risk - candidate_costs
+        if effective_pnl <= -MAX_DAILY_LOSS_INR:
+            logger.debug("Risk limit after candidate: Rs%.0f", effective_pnl)
+            return
+        # Capital check
+        committed = sum(p["entry"] * p["size"] for p in self.risk.positions.values())
+        # DESK_CAPITAL_INR set at top of file
+        if committed + ltp * size > DESK_CAPITAL_INR:
+            logger.debug("Capital limit: Rs%.0f committed", committed)
+            return
+
+        # Estimate realistic costs upfront - stored with signal
+        trade_cost = estimate_costs(ltp, size, target)
+        self.risk.open_position(symbol, ltp, stop, size, target, atr, trade_cost)
+        self.risk.positions[symbol]["direction"] = direction  # Store for P&L calc
 
         self.traded_today.add(symbol)  # Block re-entry today
+        _entry_at = datetime.now(IST)
         self.signals[symbol] = dict(
             symbol=symbol, direction=direction, entry=ltp,
+            estimated_costs=trade_cost,
+            signal_time=_entry_at,
+            entry_at=_entry_at,
             target=target, stoploss=stop, atr=round(atr,2),
             true_gap=round(true_gap_pct,2), today_open=today_open,
             vwap=vwap, final_score=final,
@@ -1502,15 +1706,29 @@ class IntradayEngine:
 
             saved = 0
             for symbol, sig in self.signals.items():
-                # Get exit info from risk manager history
-                entry  = sig.get("entry", 0)
-                exit_p = sig.get("exit_price", entry)  # fallback to entry if no exit
-                qty    = sig.get("position_size", 0)
-                outcome= sig.get("outcome", "TIME_EXIT")
-                d      = sig.get("details", {})
+                # Skip open positions — only save completed trades
+                if "exit_price" not in sig or "exit_at" not in sig:
+                    logger.debug("Skip open position %s — not yet closed", symbol)
+                    continue
 
-                gross = (exit_p - entry) * qty if sig["direction"]=="LONG" else (entry - exit_p) * qty
-                net   = gross - 80
+                entry   = sig.get("entry", 0)
+                exit_p  = sig["exit_price"]
+                outcome = sig.get("outcome", "TIME_EXIT")
+                d       = sig.get("details", {})
+
+                # Use shared compute_trade_net for consistent P&L
+                orig_qty  = sig.get("position_size", 0)
+                net       = self.risk.compute_trade_net(sig, exit_p)
+                # Gross = partial gross + final gross on remaining
+                partial_sz  = orig_qty // 2 if sig.get("partial_exit_price") else 0
+                remaining   = orig_qty - partial_sz
+                p_gross     = sig.get("partial_gross", 0)
+                if sig["direction"] == "LONG":
+                    f_gross = (exit_p - entry) * remaining
+                else:
+                    f_gross = (entry - exit_p) * remaining
+                gross = p_gross + f_gross
+                qty   = orig_qty
 
                 cur.execute("""
                     INSERT INTO investmitra.trade_log
@@ -1522,7 +1740,13 @@ class IntradayEngine:
                     VALUES (CURRENT_DATE,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, (
                     symbol, sig["direction"], entry, exit_p, qty,
-                    round(gross,2), round(net,2), outcome, 45,
+                    round(gross,2), round(net,2), outcome,
+                    # hold = exit_at - entry_at (frozen at exit, not at save time)
+                    round(
+                        (sig["exit_at"] - sig["entry_at"]).total_seconds() / 60
+                        if isinstance(sig.get("exit_at"), datetime) and isinstance(sig.get("entry_at"), datetime)
+                        else 45
+                    ),
                     sig.get("true_gap",0), d.get("gap_type",""),
                     d.get("rvol",0), d.get("sector_rs",0),
                     sig.get("final_score",0), self.market_direction,
@@ -1532,10 +1756,29 @@ class IntradayEngine:
                 saved += 1
 
             # Update intraday_pnl
-            wins = sum(1 for s in self.signals.values() 
-                      if ((s.get("exit_price",s["entry"])-s["entry"])*
-                         (1 if s["direction"]=="LONG" else -1) * 
-                         s.get("position_size",1)) > 80)  # Must beat brokerage
+            # Win = net P&L positive after brokerage (include partial exits)
+            wins = 0
+            completed_losses = 0
+            for s in self.signals.values():
+                ep  = s.get("exit_price", s["entry"])
+                en  = s["entry"]
+                orig_qty   = s.get("position_size", 1)
+                partial_sz = orig_qty // 2
+                remaining  = orig_qty - partial_sz if s.get("partial_exit_price") else orig_qty
+                partial_gross = s.get("partial_gross", 0)  # use stored gross directly
+                if s["direction"] == "LONG":
+                    final_gross = (ep - en) * remaining
+                else:
+                    final_gross = (en - ep) * remaining
+                # Skip open positions in win/loss count
+                if "exit_price" not in s or "exit_at" not in s:
+                    continue
+                # Use compute_trade_net for consistent win/loss
+                _net = self.risk.compute_trade_net(s, ep)
+                if _net > 0:
+                    wins += 1
+                else:
+                    completed_losses += 1
             cur.execute("""
                 INSERT INTO investmitra.intraday_pnl
                     (trade_date, trades, capital_deployed, gross_pnl, brokerage,
@@ -1550,12 +1793,12 @@ class IntradayEngine:
                     loss_trades=EXCLUDED.loss_trades,
                     saved_at=NOW()
             """, (
-                len(self.signals),
+                saved,  # completed trade count (open positions excluded)
                 sum(s.get("position_size",0)*s.get("entry",0) for s in self.signals.values()),
                 round(self.risk.daily_pnl,2),
                 round(self.risk.daily_brokerage,2),
                 round(self.risk.net_pnl,2),
-                wins, len(self.signals)-wins,
+                wins, completed_losses,
                 self.market_direction, 0
             ))
 
@@ -1640,15 +1883,40 @@ def save_daily_pnl(risk_manager, signals: dict, market_direction: str, vix: floa
         } for sym, s in signals.items()]
 
         # Capital deployed
+        # Build completed-trade collection FIRST — requires both exit_price and exit_at
+        completed  = [s for s in signals.values()
+                      if "exit_price" in s and "exit_at" in s]
+        open_count = len(signals) - len(completed)
+        total      = len(completed)
+
         capital = sum(
             s.get("position_size", 0) * s.get("entry", 0)
-            for s in signals.values()
+            for s in completed
         )
 
         # Win/loss
-        total  = risk_manager.trades_today
-        losses = risk_manager.consecutive_losses
-        wins   = max(total - losses, 0)
+        wins   = 0
+        losses = 0
+        for s in completed:
+            ep        = s["exit_price"]
+            en        = s.get("entry", 0)
+            direction = s.get("direction", "LONG")
+            orig_qty  = s.get("position_size", 1)
+            partial_sz = orig_qty // 2 if s.get("partial_exit_price") else 0
+            remaining  = orig_qty - partial_sz
+            p_gross    = s.get("partial_gross", 0)
+            if direction == "SHORT":
+                final_gross = (en - ep) * remaining
+            else:
+                final_gross = (ep - en) * remaining
+            total_gross = final_gross + p_gross
+            _costs = s.get("estimated_costs", BROKERAGE_PER_TRADE)
+            if total_gross - _costs > 0:
+                wins += 1
+            else:
+                losses += 1
+        if open_count:
+            logger.info("%d open position(s) excluded from daily summary", open_count)
 
         cur.execute("""
             INSERT INTO investmitra.intraday_pnl
