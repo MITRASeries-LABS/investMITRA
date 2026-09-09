@@ -1322,7 +1322,8 @@ class IntradayEngine:
 
         # Calculate RVOL here for filtering
         avg_vol_check = self.rvol_baseline.get(symbol, 0)
-        rvol_check = min(volume / avg_vol_check if avg_vol_check > 0 else 1, 200.0)
+        if avg_vol_check == 0: return  # No history - skip
+        rvol_check = min(volume / avg_vol_check, 200.0)
         if rvol_check < min_rvol:
             return  # Skip weak volume signals
 
