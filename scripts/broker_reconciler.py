@@ -227,6 +227,7 @@ def persist_engine_position(symbol: str, pos: dict,
         cur.close(); conn.close()
     except Exception as e:
         logger.warning("persist_engine_position(%s): %s", symbol, e)
+        raise  # Entry caller must block when durable daily usage is uncertain
 
 def restore_engine_state(engine, is_paper: bool = True):
     """
@@ -278,6 +279,21 @@ def restore_engine_state(engine, is_paper: bool = True):
         daily_brokerage     = float(row[2]) if row and row[2] is not None else 0
         consecutive_losses  = int(row[3])   if row and row[3] is not None else 0
 
+        # All entry tickets count, including CLOSED and PARTIAL positions.
+        # Original quantities are immutable in the existing upsert; never sum
+        # remaining quantities, which would incorrectly release daily allowance.
+        cur.execute("""
+            SELECT COALESCE(SUM(entry_price * orig_qty), 0), COUNT(*),
+                   COUNT(*) FILTER (WHERE entry_price IS NULL OR entry_price <= 0
+                                     OR orig_qty IS NULL OR orig_qty <= 0)
+            FROM investmitra.engine_positions
+            WHERE trade_date = CURRENT_DATE AND is_paper = %s
+        """, (is_paper,))
+        budget_row = cur.fetchone()
+        daily_capital_used = float(budget_row[0])
+        if budget_row[2] or int(budget_row[1]) != trades_today:
+            raise RuntimeError("Daily budget ledger incomplete; reconcile before enabling entries")
+
         # ── 3. traded_today from all today's positions ────────────
         cur.execute("""
             SELECT DISTINCT symbol
@@ -292,6 +308,10 @@ def restore_engine_state(engine, is_paper: bool = True):
         try: conn.rollback(); conn.close()
         except: pass
         raise RuntimeError(f"restore_engine_state DB read failed: {e}") from e
+
+    engine.risk.daily_capital_used = round(daily_capital_used, 2)
+    engine.risk.daily_budget_restored = True
+    logger.info("Restored cumulative daily entry tickets: Rs%.2f", daily_capital_used)
 
     if not open_rows and not traded:
         logger.info("No state to restore (fresh session)")

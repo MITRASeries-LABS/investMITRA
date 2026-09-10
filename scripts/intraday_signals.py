@@ -65,7 +65,71 @@ BROKERAGE_PER_TRADE     = 80   # conservative fallback only
 MIN_NET_PROFIT          = 50   # lowered - filter by expected_net not fixed floor
 PAPER_TRADING           = True  # Set False for real money (changes position limit only)
 PAPER_MAX_POSITIONS     = 9     # Max positions in paper trading mode
-DESK_CAPITAL_INR        = 250000  # Total capital available for trading
+MAX_DAILY_CAPITAL_INR  = 25000  # Cumulative entry tickets per day; exits do not replenish it
+MIN_TICKET_INR         = 1000
+DESK_CAPITAL_INR       = MAX_DAILY_CAPITAL_INR  # No leverage or extra desk allocation
+
+
+def ensure_trade_log_schema(conn):
+    """Prepare the exit-writer schema before trading; propagate migration errors.
+
+    Caller owns commit/rollback. Legacy rows retain unknown metadata as NULL.
+    No historical trades are relabelled or reconstructed by this migration.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            CREATE SCHEMA IF NOT EXISTS investmitra
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS investmitra.trade_log (
+                id               SERIAL PRIMARY KEY,
+                trade_date       DATE NOT NULL,
+                symbol           VARCHAR(20),
+                direction        VARCHAR(10),
+                entry_price      DECIMAL(12,2),
+                exit_price       DECIMAL(12,2),
+                quantity         INTEGER,
+                gross_pnl        DECIMAL(12,2),
+                net_pnl          DECIMAL(12,2),
+                outcome          VARCHAR(20),
+                hold_minutes     INTEGER,
+                true_gap_pct     DECIMAL(8,4),
+                gap_type         VARCHAR(30),
+                rvol             DECIMAL(8,2),
+                sector_rs        DECIMAL(8,2),
+                final_score      DECIMAL(8,2),
+                market_direction VARCHAR(20),
+                vix_level        DECIMAL(8,2),
+                session          VARCHAR(20),
+                atr              DECIMAL(10,2),
+                capital_deployed DECIMAL(12,2),
+                trade_id         VARCHAR(60),
+                trade_status     VARCHAR(10),
+                is_paper         BOOLEAN,
+                strategy_version VARCHAR(20),
+                created_at       TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            ALTER TABLE investmitra.trade_log ADD COLUMN IF NOT EXISTS trade_id VARCHAR(60)
+        """)
+        cur.execute("""
+            ALTER TABLE investmitra.trade_log ADD COLUMN IF NOT EXISTS trade_status VARCHAR(10)
+        """)
+        cur.execute("""
+            ALTER TABLE investmitra.trade_log ADD COLUMN IF NOT EXISTS is_paper BOOLEAN
+        """)
+        cur.execute("""
+            ALTER TABLE investmitra.trade_log ADD COLUMN IF NOT EXISTS strategy_version VARCHAR(20)
+        """)
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS trade_log_trade_id_uidx
+            ON investmitra.trade_log(trade_id) WHERE trade_id IS NOT NULL
+        """)
+    finally:
+        cur.close()
+
 
 def estimate_costs(entry_price: float, qty: int, exit_price: float = 0) -> float:
     """Realistic Zerodha intraday cost estimate."""
@@ -893,13 +957,23 @@ class DailyRiskManager:
         self.daily_pnl          = 0.0
         self.daily_brokerage    = 0.0
         self.trades_today       = 0
+        self.daily_capital_used  = 0.0
+        self.daily_budget_restored = False
         self.consecutive_losses = 0
         self.positions          = {}
 
     @property
     def net_pnl(self): return self.daily_pnl - self.daily_brokerage
 
+    @property
+    def daily_budget_remaining(self):
+        # Reserve estimated round-trip charges; realised profits never refill this.
+        return max(0.0, round(MAX_DAILY_CAPITAL_INR - self.daily_capital_used
+                              - self.daily_brokerage, 2))
+
     def can_trade(self) -> tuple[bool, str]:
+        if self.daily_budget_remaining < MIN_TICKET_INR:
+            return False, "Daily capital budget exhausted"
         if self.net_pnl <= -MAX_DAILY_LOSS_INR:
             return False, f"Daily loss ₹{self.net_pnl:.0f}"
         if self.trades_today >= MAX_POSITIONS * 4:
@@ -913,6 +987,12 @@ class DailyRiskManager:
     def open_position(self, symbol, entry, stop, size, target, atr, estimated_costs=None):
         initial_risk = abs(entry - stop)
         costs = estimated_costs if estimated_costs is not None else BROKERAGE_PER_TRADE
+        ticket_value = round(entry * size, 2)
+        if (size <= 0 or ticket_value < MIN_TICKET_INR
+                or ticket_value > MAX_CAPITAL_PER_TRADE
+                or round(ticket_value + costs, 2) > self.daily_budget_remaining):
+            raise ValueError("Ticket exceeds remaining daily budget or ticket limits")
+        self.daily_capital_used = round(self.daily_capital_used + ticket_value, 2)
         self.positions[symbol] = {
             "entry": entry, "stop": stop, "size": size, "target": target,
             "partial_done": False, "partial_size": size // 2,
@@ -1469,6 +1549,9 @@ class IntradayEngine:
         if getattr(self, "_entry_blocked", False):
             logger.debug("Entry blocked for %s — restart recovery pending", symbol)
             return
+        if self.risk.daily_budget_remaining < MIN_TICKET_INR:
+            logger.debug("Daily budget exhausted: Rs%.2f used", self.risk.daily_capital_used)
+            return
         # Risk checks - checked again after sizing below
         if self.risk.net_pnl <= -MAX_DAILY_LOSS_INR:
             logger.debug("Daily loss limit hit: Rs%.0f", self.risk.net_pnl)
@@ -1651,9 +1734,11 @@ class IntradayEngine:
         realised_equity   = DESK_CAPITAL_INR + self.risk.net_pnl  # net_pnl already deducts costs
         committed_capital = sum(p["entry"] * p["size"] for p in self.risk.positions.values())
         candidate_cost    = estimate_costs(ltp, int(MAX_CAPITAL_PER_TRADE / ltp) or 1, target)
-        available_capital = max(0, realised_equity - committed_capital - candidate_cost)
+        available_capital = max(0, min(
+            realised_equity - committed_capital - candidate_cost,
+            self.risk.daily_budget_remaining - candidate_cost))
 
-        if available_capital < 1000:
+        if available_capital < MIN_TICKET_INR:
             logger.debug("Insufficient capital: Rs%.0f available", available_capital)
             return
 
@@ -1669,7 +1754,7 @@ class IntradayEngine:
         ticket_value  = size * ltp
         actual_risk   = size * stop_dist
 
-        if ticket_value < 1000:
+        if ticket_value < MIN_TICKET_INR:
             logger.debug("Skip %s — ticket Rs%.0f below Rs1000 minimum", symbol, ticket_value)
             return
         if ticket_value > MAX_CAPITAL_PER_TRADE:
@@ -1681,6 +1766,8 @@ class IntradayEngine:
 
         # Realistic cost estimate
         trade_cost   = estimate_costs(ltp, size, target)
+        if round(ticket_value + trade_cost, 2) > self.risk.daily_budget_remaining:
+            return
         expected_net = (abs(target - ltp) * size * 0.5) - trade_cost
         # Minimum: expected net must exceed costs by at least 1x
         # (costs already deducted — so min_profit = 0 means break-even, 
@@ -1767,7 +1854,9 @@ class IntradayEngine:
                 "product":                 "MIS",
             }, status="OPEN", is_paper=PAPER_TRADING)
         except Exception as _pe:
-            logger.warning("Persist open position failed for %s: %s", symbol, _pe)
+            self._entry_blocked = True
+            logger.error("Persist open position failed for %s; entries blocked: %s", symbol, _pe)
+            return  # Do not announce an entry whose durable state is uncertain
 
         self._print_signal(self.signals[symbol], stock)
 
@@ -1845,55 +1934,7 @@ class IntradayEngine:
             conn.autocommit = True
             cur  = conn.cursor()
 
-            # Ensure table exists
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS investmitra.trade_log (
-                    id               SERIAL PRIMARY KEY,
-                    trade_date       DATE NOT NULL,
-                    symbol           VARCHAR(20),
-                    direction        VARCHAR(10),
-                    entry_price      DECIMAL(12,2),
-                    exit_price       DECIMAL(12,2),
-                    quantity         INTEGER,
-                    gross_pnl        DECIMAL(12,2),
-                    net_pnl          DECIMAL(12,2),
-                    outcome          VARCHAR(20),
-                    hold_minutes     INTEGER,
-                    true_gap_pct     DECIMAL(8,4),
-                    gap_type         VARCHAR(30),
-                    rvol             DECIMAL(8,2),
-                    sector_rs        DECIMAL(8,2),
-                    final_score      DECIMAL(8,2),
-                    market_direction VARCHAR(20),
-                    vix_level        DECIMAL(8,2),
-                    session          VARCHAR(20),
-                    atr              DECIMAL(10,2),
-                    capital_deployed DECIMAL(12,2),
-                    trade_id         VARCHAR(60) UNIQUE,
-                    trade_status     VARCHAR(10) DEFAULT 'CLOSED',
-                    is_paper         BOOLEAN DEFAULT TRUE,
-                    strategy_version VARCHAR(20) DEFAULT 'v25',
-                    created_at       TIMESTAMPTZ DEFAULT NOW()
-                )
-            """)
-            # Add columns if table existed before these were added
-            for _col, _def in [
-                ("trade_id",         "VARCHAR(60)"),
-                ("trade_status",     "VARCHAR(10) DEFAULT 'CLOSED'"),
-                ("is_paper",         "BOOLEAN DEFAULT TRUE"),
-                ("strategy_version", "VARCHAR(20) DEFAULT 'v25'"),
-            ]:
-                try:
-                    cur.execute(f"ALTER TABLE investmitra.trade_log ADD COLUMN IF NOT EXISTS {_col} {_def}")
-                except Exception: pass
-            # Unique index on trade_id for upsert
-            try:
-                cur.execute("""
-                    CREATE UNIQUE INDEX IF NOT EXISTS trade_log_trade_id_uidx
-                    ON investmitra.trade_log(trade_id)
-                    WHERE trade_id IS NOT NULL
-                """)
-            except Exception: pass
+            ensure_trade_log_schema(conn)
 
             saved = 0
             for symbol, sig in self.signals.items():
@@ -1983,6 +2024,7 @@ class IntradayEngine:
                 VALUES (CURRENT_DATE,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (trade_date) DO UPDATE SET
                     trades=EXCLUDED.trades,
+                    capital_deployed=EXCLUDED.capital_deployed,
                     gross_pnl=EXCLUDED.gross_pnl,
                     brokerage=EXCLUDED.brokerage,
                     net_pnl=EXCLUDED.net_pnl,
@@ -1991,7 +2033,7 @@ class IntradayEngine:
                     saved_at=NOW()
             """, (
                 saved,  # completed trade count (open positions excluded)
-                sum(s.get("position_size",0)*s.get("entry",0) for s in self.signals.values()),
+                self.risk.daily_capital_used,
                 round(self.risk.daily_pnl,2),
                 round(self.risk.daily_brokerage,2),
                 round(self.risk.net_pnl,2),
@@ -2015,6 +2057,7 @@ class IntradayEngine:
         print(f"  Gross: ₹{self.risk.daily_pnl:.0f} | Brokerage: ₹{self.risk.daily_brokerage:.0f} | NET: ₹{self.risk.net_pnl:.0f}")
         print(f"{'='*65}")
         # Auto-save all trades to Neon
+        print(f"  Daily budget: ₹{MAX_DAILY_CAPITAL_INR:,.0f} | Tickets used: ₹{self.risk.daily_capital_used:,.2f} | Remaining after estimated charges: ₹{self.risk.daily_budget_remaining:,.2f}")
         self._save_trades_to_neon()
         for label, lst in [("🟢 LONG", longs), ("🔴 SHORT", shorts)]:
             if lst:
@@ -2086,10 +2129,7 @@ def save_daily_pnl(risk_manager, signals: dict, market_direction: str, vix: floa
         open_count = len(signals) - len(completed)
         total      = len(completed)
 
-        capital = sum(
-            s.get("position_size", 0) * s.get("entry", 0)
-            for s in completed
-        )
+        capital = risk_manager.daily_capital_used
 
         # Win/loss
         wins   = 0
@@ -2322,7 +2362,8 @@ def main():
     print(f"\n{'='*65}")
     print(f"  INTRADAY WATCHLIST v10 — {date.today()} | {market_direction}")
     print(f"  TRUE GAP | 5-min hold | ATR 14-day | Traded value filter")
-    print(f"  Cap: ₹{MAX_CAPITAL_PER_TRADE:,}/trade | Risk: ₹{MAX_RISK_PER_TRADE_INR}")
+    print(f"  Daily budget: ₹{MAX_DAILY_CAPITAL_INR:,} | Ticket: ₹{MIN_TICKET_INR:,}–₹{MAX_CAPITAL_PER_TRADE:,}")
+    print("  Entry tickets + estimated charges share the daily budget; exits do not refill it.")
     print(f"{'='*65}")
     if long_list:
         print(f"\n  🟢 LONG ({len(long_list)}) — sorted by Quality:")
@@ -2355,8 +2396,20 @@ def main():
     # AND after all restored positions are monitored (token subscription)
     engine._entry_blocked = True
     try:
+        # Immediate exits write before print_summary(); migrate before enabling entries.
+        schema_conn = psycopg2.connect(NEON_URL, connect_timeout=10)
+        try:
+            ensure_trade_log_schema(schema_conn)
+            schema_conn.commit()
+        except Exception:
+            schema_conn.rollback()
+            raise
+        finally:
+            schema_conn.close()
         from broker_reconciler import restore_engine_state
         restore_engine_state(engine, is_paper=PAPER_TRADING)
+        if not engine.risk.daily_budget_restored:
+            raise RuntimeError("Daily budget was not restored; deploy the matching broker_reconciler.py")
         # DB recovery succeeded — but entries stay blocked if positions need tokens
         restored = getattr(engine, "_restored_symbols", [])
         if restored:
