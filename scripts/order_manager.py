@@ -23,6 +23,29 @@ IST = timezone(timedelta(hours=5, minutes=30))
 logger = logging.getLogger(__name__)
 TERMINAL = {"COMPLETE", "CANCELLED", "REJECTED"}
 PREFIX = "IM3"
+BUILD_ID = "2026-09-11-trial-fix1"
+MIN_SIGNAL_GAP_PCT = 0.30
+MIN_FINAL_SCORE = 55.0
+
+
+def entry_policy_rejection(signal):
+    """Hard gates shared by the signal engine and executor; reject missing data."""
+    try:
+        gap = float(signal["true_gap"])
+        score = float(signal["final_score"])
+        threshold = max(MIN_SIGNAL_GAP_PCT, float(signal.get("gap_threshold", MIN_SIGNAL_GAP_PCT)))
+        gap_type = signal["details"]["gap_type"]
+        if not all(math.isfinite(x) for x in (gap, score, threshold)):
+            return "invalid numeric signal metadata"
+        if abs(gap) < threshold:
+            return f"gap {gap:.5f}% below {threshold:.5f}%"
+        if gap_type not in {"continuation", "continuation_strong", "fade_risk"}:
+            return f"blocked gap type: {gap_type}"
+        if score < MIN_FINAL_SCORE:
+            return f"blended score {score:.2f} below {MIN_FINAL_SCORE:.2f}"
+    except (KeyError, ValueError, TypeError):
+        return "missing or invalid signal gate metadata"
+    return None
 
 
 def notify(message: str, silent: bool = False):
@@ -215,7 +238,8 @@ class AutoOrderManager:
         self.daily_cap, self.min_ticket, self.cost_reserve = daily_cap, min_ticket, cost_reserve
         self.max_risk, self.max_daily_loss = max_risk, max_daily_loss
         self.max_positions, self.max_losses = max_positions, max_losses
-        self.clock, self.alerts = clock, alerts
+        self.clock, self._deliver_alert = clock, alerts
+        self.state.setdefault("alert_events", [])
         self.inbox = queue.Queue(maxsize=100)
         self.lock = threading.Lock()
         self.view = {"ready": False, "reason": "Broker recovery pending", "trades": {}, "remaining": 0}
@@ -232,11 +256,24 @@ class AutoOrderManager:
             with journal.db:
                 journal.db.execute("INSERT OR REPLACE INTO history VALUES (?, ?)",
                                    (self.state["day"], json.dumps(self.state, allow_nan=False)))
-            self.state.update(day=today, trades={}, halt="", flatten=False)
+            self.state.update(day=today, trades={}, halt="", flatten=False, alert_events=[])
             if isinstance(broker, PaperBroker):
                 broker.book = []; broker._save()
         self.state["day"] = today
         self.journal.save()
+
+    def alerts(self, message):
+        import hashlib
+        event = hashlib.sha256(message.encode("utf-8")).hexdigest()
+        if event in self.state["alert_events"]:
+            return
+        self.state["alert_events"].append(event)
+        try:
+            self.journal.save()  # at-most-once attempt; no retry on uncertain delivery
+        except Exception:
+            logger.error("Alert journal write failed; message kept in console: %s", message)
+            return
+        self._deliver_alert(f"[investMITRA {self.broker.mode} {BUILD_ID}] {message}")
 
     def snapshot(self):
         with self.lock: return copy.deepcopy(self.view)
@@ -418,6 +455,10 @@ class AutoOrderManager:
         now = self.clock()
         if not self.ready or self.state["halt"] or self.state["flatten"] or not (570 <= now.hour*60+now.minute < 900): return
         if self._protection_pending(): return
+        rejection = entry_policy_rejection(sig)
+        if rejection:
+            logger.info("EXECUTION REJECT %s: %s", sig.get("symbol", "?"), rejection)
+            return
         symbol = sig["symbol"]
         if symbol in self.state["trades"] or symbol not in self.meta: return
         if (now.timestamp() - float(sig["offered_at"])) > 10: return
@@ -494,12 +535,12 @@ class AutoOrderManager:
                 else: t["partial_done"] = True
             if half and self._exited(t) >= half and not t["partial_done"]:
                 t["partial_done"] = True
-                partial_avg = sum(o["average"]*o["filled"] for o in t["orders"]
-                                  if o["kind"]=="EXIT" and o["filled"]) / max(self._exited(t),1)
+                p_avg = (sum(o["average"]*o["filled"] for o in t["orders"]
+                             if o["kind"]=="EXIT" and o["filled"])
+                         / max(self._exited(t), 1))
                 self.alerts(
                     f"{self.broker.mode}: {t['symbol']} PARTIAL EXIT"
-                    f" {self._exited(t)}sh @ ₹{partial_avg:.2f}"
-                    f" | Stop → breakeven"
+                    f" {self._exited(t)}sh @ ₹{p_avg:.2f} | Stop → breakeven"
                 )
             if t["partial_done"]:
                 levels = max(0, int(move / risk) - 1)
@@ -563,20 +604,15 @@ class AutoOrderManager:
             self._halt("Protective stop rejected for " + t["symbol"] + "; attempting full exit")
             self._goal(t, qty, "PROTECTION_FAILED")
             return
-        # Alert: entry filled + stop placed
+        # Alert: entry filled + stop being placed
         fill_qty = self._filled(t)
-        fill_avg = (sum(o["average"]*o["filled"] for o in t["orders"]
-                        if o["kind"]=="ENTRY" and o["filled"])
-                    / max(fill_qty, 1))
-        self.alerts(
-            f"{self.broker.mode}: {t['symbol']} FILLED {fill_qty}sh"
-            f" @ ₹{fill_avg:.2f}"
-        )
+        if fill_qty:
+            fill_avg = (sum(o["average"]*o["filled"] for o in t["orders"]
+                            if o["kind"]=="ENTRY" and o["filled"])
+                        / fill_qty)
+            self.alerts(f"{self.broker.mode}: {t['symbol']} FILLED {fill_qty}sh @ ₹{fill_avg:.2f}")
         self._submit(t, "STOP", remaining, trigger=t["stop"])
-        self.alerts(
-            f"{self.broker.mode}: {t['symbol']} STOP PLACED"
-            f" @ ₹{t['stop']:.2f}"
-        )
+        self.alerts(f"{self.broker.mode}: {t['symbol']} STOP PLACED @ ₹{t['stop']:.2f}")
 
     def step(self):
         self.ready = False

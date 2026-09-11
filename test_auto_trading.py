@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
-from order_manager import AutoOrderManager, Journal, KiteBroker, PaperBroker, IST, tick_round
+from order_manager import AutoOrderManager, Journal, KiteBroker, PaperBroker, IST, tick_round, entry_policy_rejection, MIN_SIGNAL_GAP_PCT, MIN_FINAL_SCORE
 
 class FakeBroker:
     mode = 'auto_paper'
@@ -59,7 +59,7 @@ class ExecutionTests(unittest.TestCase):
     def tearDown(self):self.journal.close();self.tmp.cleanup()
     def make_manager(self):return AutoOrderManager(self.broker,self.journal,self.meta,clock=self.clock,alerts=self.alerts.append)
     def signal(self,symbol='A',qty=20,direction='LONG'):
-        return dict(symbol=symbol,entry=100,position_size=qty,direction=direction,stoploss=98 if direction=='LONG' else 102,target=103,today_open=100,offered_at=self.now.timestamp(),entry_at=self.now)
+        return dict(symbol=symbol,entry=100,position_size=qty,direction=direction,stoploss=98 if direction=='LONG' else 102,target=103,today_open=100,offered_at=self.now.timestamp(),entry_at=self.now, true_gap=1., final_score=75., details={'gap_type':'continuation'})
     def enter(self,**kwargs):self.manager.offer(self.signal(**kwargs));self.manager.step();self.manager.step()
     def restart(self):
         self.journal.close();self.journal=Journal(self.path,'test','auto_paper');self.manager=self.make_manager();self.manager.step()
@@ -148,13 +148,13 @@ class ExecutionTests(unittest.TestCase):
         self.journal.save=fail;self.manager.offer(self.signal());self.manager.step();self.assertEqual(self.broker.book,[])
     def test_lost_journal_blocks_against_tagged_broker_orders(self):
         self.enter();self.manager.state['trades']={};self.manager.step();self.assertFalse(self.manager.snapshot()['ready'])
-    def test_real_signal_method_reaches_executor_without_paper_fill(self):
+    def _make_signal_engine(self):
         from collections import defaultdict
         import logging
         from datetime import date
         tree=ast.parse(Path(__file__).with_name('intraday_signals.py').read_text(encoding='utf-8'))
         ns=dict(datetime=datetime,date=date,IST=IST,defaultdict=defaultdict,logger=logging.getLogger('integration'),
-                EXECUTION_MODE='auto_paper',PAPER_TRADING=True)
+                EXECUTION_MODE='auto_paper',PAPER_TRADING=True, entry_policy_rejection=entry_policy_rejection, MIN_SIGNAL_GAP_PCT=MIN_SIGNAL_GAP_PCT, MIN_FINAL_SCORE=MIN_FINAL_SCORE)
         # Import only literals, arithmetic assignments and the actual pure
         # classes/functions; exclude all production imports and startup calls.
         for node in tree.body:
@@ -172,11 +172,75 @@ class ExecutionTests(unittest.TestCase):
         engine._compute_opportunity_score=lambda *args:(90,{'gap_type':'continuation','rvol':5})
         def forbidden(*args,**kwargs):raise AssertionError('Legacy simulated position mutated in automatic mode')
         engine.risk.open_position=forbidden
+        return engine
+
+    def test_real_signal_method_reaches_executor_without_paper_fill(self):
+        engine=self._make_signal_engine()
         engine._check_signal('A',100,1000,self.now,'momentum')
         self.assertFalse(engine.signals);self.assertFalse(engine.risk.positions)
         self.manager.step();self.manager.step()
         self.assertGreater(self.manager.snapshot()['tickets'],0)
         self.assertLessEqual(self.manager._budget_used(),25000)
+
+    def test_small_cap_021_gap_never_queues_signal(self):
+        e=self._make_signal_engine()
+        e.all_stocks['A']['market_cap_category']='SMALL'
+        e.prev_close['A']=100/1.002100001
+        e._check_signal('A',100,1000,self.now,'momentum')
+        self.assertTrue(self.manager.inbox.empty())
+        self.assertIn('gap',e.signal_rejections['A'][0])
+    def test_blended_504_score_never_queues_signal(self):
+        e=self._make_signal_engine();e.all_stocks['A']['quality_score']=50.4
+        e._compute_opportunity_score=lambda *args:(50.4,{'gap_type':'continuation','rvol':5})
+        e._check_signal('A',100,1000,self.now,'momentum')
+        self.assertTrue(self.manager.inbox.empty())
+        self.assertIn('blended score',e.signal_rejections['A'][0])
+    def test_small_gap_type_never_queues_signal(self):
+        e=self._make_signal_engine()
+        e._compute_opportunity_score=lambda *args:(90,{'gap_type':'small_gap','rvol':5})
+        e._check_signal('A',100,1000,self.now,'momentum')
+        self.assertTrue(self.manager.inbox.empty())
+        self.assertIn('small_gap',e.signal_rejections['A'][0])
+    def test_executor_rechecks_each_policy_gate(self):
+        variants=[{'true_gap':.21},{'final_score':50.4}, {'details':{'gap_type':'small_gap'}},
+                  {'true_gap':float('nan')},{'gap_threshold':.6,'true_gap':.4}]
+        for variant in variants:
+            with self.subTest(variant=variant):
+                sig=self.signal();sig.update(variant)
+                self.assertIsNotNone(entry_policy_rejection(sig))
+                # Call actual accept method with otherwise fresh broker context.
+                self.manager.quotes=self.broker.quotes(['A'])
+                self.manager._accept(sig)
+                self.assertEqual(self.broker.book,[])
+    def test_score_55_and_gap_above_floor_pass_policy(self):
+        sig=self.signal();sig.update(final_score=55,true_gap=.30001)
+        self.assertIsNone(entry_policy_rejection(sig))
+    def test_missing_policy_metadata_rejected(self):
+        self.assertIsNotNone(entry_policy_rejection({'symbol':'A'}))
+    def test_missing_executor_cannot_fall_back(self):
+        e=self._make_signal_engine();e.execution=None
+        e._check_signal('A',100,1000,self.now,'momentum')
+        self.assertTrue(e._entry_blocked);self.assertFalse(e.signals)
+    def test_legacy_exit_path_disabled_during_trial(self):
+        e=self._make_signal_engine()
+        # Deliberately incomplete legacy position would raise if this path ran.
+        e.risk.positions['A']={}
+        e._check_exits('A',100,'closing',self.now)
+        self.assertIn('A',e.risk.positions)
+    def test_paper_and_live_modes_rejected_at_config(self):
+        tree=ast.parse(Path(__file__).with_name('intraday_signals.py').read_text(encoding='utf-8'))
+        guard=next(n for n in tree.body if isinstance(n,ast.If) and ast.unparse(n.test)=="EXECUTION_MODE != 'auto_paper'")
+        compiled=compile(ast.Module(body=[guard],type_ignores=[]),'mode','exec')
+        for mode in ('paper','live'):
+            with self.assertRaises(ValueError):exec(compiled,{'EXECUTION_MODE':mode})
+        exec(compiled,{'EXECUTION_MODE':'auto_paper'})
+    def test_alert_once_across_restart(self):
+        self.manager.alerts('event-one');self.manager.alerts('event-one')
+        self.restart();self.manager.alerts('event-one')
+        self.assertEqual(len([m for m in self.alerts if 'event-one' in m]),1)
+    def test_engine_has_no_direct_telegram_sender(self):
+        src=Path(__file__).with_name('intraday_signals.py').read_text(encoding='utf-8')
+        self.assertNotIn('from order_manager import notify',src)
 
     def test_engine_candidate_routed_before_paper_mutation(self):
         tree=ast.parse(Path(__file__).with_name('intraday_signals.py').read_text(encoding='utf-8'))

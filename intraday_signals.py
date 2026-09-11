@@ -64,8 +64,9 @@ ATR_TARGET_MULT         = 1.5
 BROKERAGE_PER_TRADE     = 80   # conservative fallback only
 MIN_NET_PROFIT          = 50   # lowered - filter by expected_net not fixed floor
 EXECUTION_MODE         = os.getenv("INVESTMITRA_EXECUTION_MODE", "auto_paper").lower()
-if EXECUTION_MODE not in {"paper", "auto_paper", "live"}:
-    raise ValueError("INVESTMITRA_EXECUTION_MODE must be paper, auto_paper or live")
+if EXECUTION_MODE != "auto_paper":
+    raise ValueError("Two-week trial requires INVESTMITRA_EXECUTION_MODE=auto_paper; legacy paper/live modes are disabled")
+from order_manager import BUILD_ID, MIN_SIGNAL_GAP_PCT, MIN_FINAL_SCORE, entry_policy_rejection
 PAPER_TRADING          = EXECUTION_MODE != "live"  # Live also requires explicit adapter activation
 PAPER_MAX_POSITIONS     = 9     # Max positions in paper trading mode
 MAX_DAILY_CAPITAL_INR  = 25000  # Cumulative entry tickets per day; exits do not replenish it
@@ -1095,6 +1096,7 @@ class IntradayEngine:
         self.risk             = DailyRiskManager()
         self.execution        = None
         self.execution_offers = {}
+        self.signal_rejections = {}
 
     def on_tick(self, ws, ticks):
         now     = datetime.now(IST)
@@ -1231,7 +1233,9 @@ class IntradayEngine:
             logger.warning("Immediate trade save failed for %s: %s", symbol, _te)
 
     def _check_exits(self, symbol, ltp, session, now):
-        """Check all exit conditions: partial, trailing, dead trade, reversal."""
+        """Legacy exit handler is disabled throughout this automatic-paper trial."""
+        if EXECUTION_MODE == "auto_paper":
+            return
         if symbol not in self.risk.positions: return
         pos   = self.risk.positions[symbol]
         entry = pos["entry"]
@@ -1248,7 +1252,7 @@ class IntradayEngine:
             trade_net = self.risk.compute_trade_net(sig, ltp) if sig else pnl - 80
             print(f"\n  🛑 STOPLOSS: {symbol} @ ₹{ltp:.2f} | Net: ₹{trade_net:.0f}\n")
             try:
-                from order_manager import notify as tg_notify
+                tg_notify = self.execution.alerts
                 tg_notify(f"STOPLOSS - {symbol}\nExit: {ltp:.2f}\nNet: {trade_net:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
             except: pass
             return
@@ -1271,7 +1275,7 @@ class IntradayEngine:
                         self._record_exit(symbol, ltp, 'REVERSAL')
                         print(f"\n  🔄 GAP REVERSAL EXIT: {symbol} @ ₹{ltp:.2f} | Below entry {mins_below:.0f}min | Net: ₹{pnl:.0f}\n")
                         try:
-                            from order_manager import notify as tg_notify
+                            tg_notify = self.execution.alerts
                             _sig = self.signals.get(symbol)
                             _trade_net = self.risk.compute_trade_net(_sig, ltp) if _sig else pnl - BROKERAGE_PER_TRADE
                             tg_notify(f"GAP REVERSAL EXIT - {symbol}\nBelow entry for {mins_below:.0f}min\nExit: {ltp:.2f}\nNet: {_trade_net:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
@@ -1306,7 +1310,7 @@ class IntradayEngine:
                 trade_net = self.risk.compute_trade_net(sig, ltp) if sig else pnl - 80
                 print(f"\n  ⏰ DEAD TRADE EXIT: {symbol} @ ₹{ltp:.2f} | {reason} after {elapsed:.0f}min | Net: ₹{trade_net:.0f}\n")
                 try:
-                    from order_manager import notify as tg_notify
+                    tg_notify = self.execution.alerts
                     tg_notify(f"DEAD TRADE EXIT - {symbol}\n{reason} after {elapsed:.0f}min\nExit: {ltp:.2f}\nNet: {trade_net:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
                 except: pass
                 return
@@ -1366,7 +1370,7 @@ class IntradayEngine:
                     except Exception: pass
                     print(f"\n  💰 PARTIAL EXIT: {symbol} — {partial_size} sh @ ₹{ltp:.2f} | Gross realised: +₹{gross_partial:.0f}")
                 try:
-                    from order_manager import notify as tg_notify
+                    tg_notify = self.execution.alerts
                     tg_notify(f"PARTIAL EXIT - {symbol}\\n{partial_size} shares @ {ltp:.2f}\\nGross realised: +{gross_partial:.0f}\\nStop -> breakeven\\nDaily P&L: {self.risk.net_pnl:.0f}")
                 except: pass
                 print(f"  📍 Stop → breakeven ₹{pos['stop']:.2f} | Remaining: {pos['size']} shares")
@@ -1420,7 +1424,7 @@ class IntradayEngine:
                 trade_net = self.risk.compute_trade_net(sig, ltp) if sig else pnl - 80
                 print(f"\n  🏁 SESSION EXIT: {symbol} @ ₹{ltp:.2f} | Net: ₹{trade_net:.0f}\n")
                 try:
-                    from order_manager import notify as tg_notify
+                    tg_notify = self.execution.alerts
                     tg_notify(f"3PM EXIT - {symbol}\nExit: {ltp:.2f}\nNet: {trade_net:.0f}\nDaily P&L: {self.risk.net_pnl:.0f}")
                 except: pass
 
@@ -1549,7 +1553,17 @@ class IntradayEngine:
         }
         return round(opp, 2), details
 
+    def _reject_signal(self, symbol, reason, now):
+        previous = self.signal_rejections.get(symbol)
+        if previous is None or previous[0] != reason or (now-previous[1]).total_seconds() >= 60:
+            logger.info("SIGNAL REJECT %s: %s", symbol, reason)
+            self.signal_rejections[symbol] = (reason, now)
+
     def _check_signal(self, symbol, ltp, volume, now, session):
+        if self.execution is None:
+            self._entry_blocked = True
+            self._reject_signal(symbol, "automatic executor missing; no legacy fallback", now)
+            return
         if self.execution is not None:
             view = self.execution.snapshot()
             if not view.get("ready"):
@@ -1619,11 +1633,7 @@ class IntradayEngine:
         true_gap_pct = (today_open - prev) / prev * 100
 
         # GAP HOLD CONFIRMATION (5 minutes)
-        gap_thresh = GAP_THRESHOLDS.get(session, 0.4)
-        # Lower threshold for MICRO/SMALL ? they gap more
-        cap = stock.get("market_cap_category", "MID")
-        if cap in ("MICRO", "SMALL"):
-            gap_thresh *= 0.7  # 30% lower for small caps
+        gap_thresh = max(MIN_SIGNAL_GAP_PCT, GAP_THRESHOLDS.get(session, 0.4))
         if self.vix_signal == "ELEVATED": gap_thresh *= 1.5
 
         if abs(true_gap_pct) > gap_thresh:
@@ -1660,6 +1670,7 @@ class IntradayEngine:
                 del self.gap_first_seen[symbol]
                 return
         else:
+            self._reject_signal(symbol, f"gap {true_gap_pct:.5f}% does not exceed {gap_thresh:.5f}%", now)
             # Gap disappeared — reset
             if symbol in self.gap_first_seen:
                 del self.gap_first_seen[symbol]
@@ -1671,8 +1682,11 @@ class IntradayEngine:
         quality = stock.get("quality_score", 50)
         opp, details = self._compute_opportunity_score(symbol, ltp, volume, true_gap_pct, session)
 
-        # Exhaustion gaps: always skip
-        if details["gap_type"] == "exhaustion":
+        final = quality * 0.40 + opp * 0.60
+        rejection = entry_policy_rejection(dict(true_gap=true_gap_pct,
+            final_score=final, gap_threshold=gap_thresh, details=details))
+        if rejection:
+            self._reject_signal(symbol, rejection, now)
             return
 
         # fade_risk: only allow if RVOL > 2.5x AND quality > 65
@@ -1683,7 +1697,7 @@ class IntradayEngine:
                 return
 
         final = quality * 0.40 + opp * 0.60
-        if final < 48: return
+        if final < MIN_FINAL_SCORE: return
 
         # Check market breadth for bearish bias
         breadth     = getattr(self, "ctx", {}).get("breadth", {})
@@ -1840,7 +1854,7 @@ class IntradayEngine:
             target=target, stoploss=stop, atr=round(atr,2),
             true_gap=round(true_gap_pct,2), today_open=today_open,
             vwap=vwap, final_score=final,
-            quality_score=quality, opp_score=opp,
+            quality_score=quality, opp_score=opp, stock_score=score, gap_threshold=gap_thresh,
             position_size=size, stop_dist=round(stop_dist,2),
             risk_inr=round(stop_dist*size,0),
             expected_net=round(expected_net,0),
@@ -1900,7 +1914,7 @@ class IntradayEngine:
 
         # Send Telegram alert immediately
         try:
-            from order_manager import notify as tg_notify
+            tg_notify = self.execution.alerts
             sig = self.signals[symbol]
             d   = sig['details']
             direction = sig['direction']
@@ -2309,6 +2323,8 @@ def preflight_check() -> bool:
 
 
 def _run_signals(kite=None, instruments=None, execution=None, execution_worker=None):
+    if execution is None or execution.broker.mode != "auto_paper":
+        raise RuntimeError("Trial startup requires the automatic-paper executor; no legacy fallback")
     if not API_KEY or not ACCESS_TOKEN:
         print("❌ Run: python scripts/kite_login.py first"); sys.exit(1)
 
@@ -2341,9 +2357,9 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
         if weights.get("skip_fade_risk"):
             logger.info("fade_risk gaps DISABLED by Opus")
 
-    # Morning brief to Telegram
+    # Morning brief uses the executor notification owner.
     try:
-        from order_manager import notify as tg_notify
+        tg_notify = execution.alerts
         vix  = ctx.get('india_vix', 0) or 0
         sgx  = ctx.get('sgx_change', 0) or 0
         skip = ', '.join(list(ctx['results_today'])[:3]) or 'None'
@@ -2676,8 +2692,9 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
 
 
 def main():
-    if EXECUTION_MODE == "paper":
-        return _run_signals()
+    from pathlib import Path
+    logger.info("BUILD=%s MODE=%s PID=%s SCRIPT=%s", BUILD_ID, EXECUTION_MODE,
+                os.getpid(), Path(__file__).resolve())
     if not API_KEY or not ACCESS_TOKEN:
         raise SystemExit("Run scripts/kite_login.py first")
     from order_manager import build_executor
