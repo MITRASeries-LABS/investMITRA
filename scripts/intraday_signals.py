@@ -63,10 +63,7 @@ ATR_STOP_MULT           = 1.5
 ATR_TARGET_MULT         = 1.5
 BROKERAGE_PER_TRADE     = 80   # conservative fallback only
 MIN_NET_PROFIT          = 50   # lowered - filter by expected_net not fixed floor
-EXECUTION_MODE         = os.getenv("INVESTMITRA_EXECUTION_MODE", "auto_paper").lower()
-if EXECUTION_MODE not in {"paper", "auto_paper", "live"}:
-    raise ValueError("INVESTMITRA_EXECUTION_MODE must be paper, auto_paper or live")
-PAPER_TRADING          = EXECUTION_MODE != "live"  # Live also requires explicit adapter activation
+PAPER_TRADING           = True  # Set False for real money (changes position limit only)
 PAPER_MAX_POSITIONS     = 9     # Max positions in paper trading mode
 MAX_DAILY_CAPITAL_INR  = 25000  # Cumulative entry tickets per day; exits do not replenish it
 MIN_TICKET_INR         = 1000
@@ -1093,8 +1090,6 @@ class IntradayEngine:
 
         self.signals          = {}
         self.risk             = DailyRiskManager()
-        self.execution        = None
-        self.execution_offers = {}
 
     def on_tick(self, ws, ticks):
         now     = datetime.now(IST)
@@ -1136,8 +1131,7 @@ class IntradayEngine:
             elif session == "momentum" and not self.or_set[symbol]:
                 self.or_set[symbol] = True
 
-            if self.execution is None:
-                self._check_exits(symbol, ltp, session, now)
+            self._check_exits(symbol, ltp, session, now)
 
             if session in ("momentum","choppy","afternoon"):
                 self._check_signal(symbol, ltp, volume, now, session)
@@ -1550,29 +1544,6 @@ class IntradayEngine:
         return round(opp, 2), details
 
     def _check_signal(self, symbol, ltp, volume, now, session):
-        if self.execution is not None:
-            view = self.execution.snapshot()
-            if not view.get("ready"):
-                return
-            if now.timestamp() - self.execution_offers.get(symbol, 0) < 5:
-                return
-            # Sizing reads the last confirmed execution view; the worker performs
-            # the authoritative budget/risk check again before submitting.
-            self.risk.daily_capital_used = view.get("tickets", 0)
-            self.risk.daily_brokerage = view.get("costs", 0)
-            self.risk.daily_pnl = view.get("gross", 0)
-            self.risk.consecutive_losses = view.get("losses", 0)
-            self.risk.positions = {}
-            for sym, trade in view.get("trades", {}).items():
-                ent = trade["orders"][0]
-                remaining = ent["filled"] - sum(o["filled"] for o in trade["orders"][1:])
-                if remaining:
-                    self.risk.positions[sym] = {
-                        "entry": ent["average"], "size": remaining, "stop": trade["stop"],
-                        "direction": "LONG" if trade["sign"] > 0 else "SHORT"}
-                self.traded_today.add(sym)
-            if view.get("remaining", 0) < MIN_TICKET_INR:
-                return
         if symbol in self.signals: return
         if symbol in self.traded_today: return  # No re-entry same day
         if getattr(self, "_entry_blocked", False):
@@ -1829,9 +1800,10 @@ class IntradayEngine:
             logger.debug("Capital limit: Rs%.0f committed", committed)
             return
 
+        self.traded_today.add(symbol)  # Block re-entry today
         _entry_at = datetime.now(IST)
         _trade_id = f"{date.today().isoformat()}_{symbol}_{_entry_at.strftime('%H%M%S')}"
-        candidate = dict(
+        self.signals[symbol] = dict(
             symbol=symbol, direction=direction, entry=ltp,
             estimated_costs=trade_cost,
             signal_time=_entry_at,
@@ -1850,16 +1822,6 @@ class IntradayEngine:
             piotroski=stock.get("piotroski",0),
             in_bulk=stock.get("in_bulk_deal",False),
         )
-        if self.execution is not None:
-            # Worker owns order state, quantities and P&L. Never create a
-            # simulated engine position before the broker confirms a fill.
-            candidate["offered_at"] = now.timestamp()
-            if self.execution.offer(candidate):
-                self.execution_offers[symbol] = now.timestamp()
-                logger.info("Execution candidate queued: %s (%s)", symbol, EXECUTION_MODE)
-            return
-        self.traded_today.add(symbol)
-        self.signals[symbol] = candidate
         # Now open position and persist (signal dict exists)
         self.risk.open_position(symbol, ltp, stop, size, target, atr, trade_cost)
         self.risk.positions[symbol]["direction"] = direction
@@ -1950,6 +1912,31 @@ class IntradayEngine:
         print(f"  F-Score: {sig['piotroski']} | Screens: {sig['screens']} | {sig['session']}")
         print(f"  Time:         {sig['time']} | Net P&L: ₹{self.risk.net_pnl:.0f}")
         print(f"{'='*65}\n")
+        # Send full signal box to Telegram
+        try:
+            from order_manager import async_notify
+            d = sig["details"]
+            pct    = abs(sig["entry"]-sig["target"])/sig["entry"]*100
+            sl_pct = abs(sig["entry"]-sig["stoploss"])/sig["entry"]*100
+            emoji  = "🟢 LONG" if sig["direction"]=="LONG" else "🔴 SHORT"
+            cap52  = " 🏆 52W HIGH" if d.get("52w_high") and sig["entry"] >= d["52w_high"]*0.9 else ""
+            msg = (
+                f"{'='*45}\n"
+                f"{emoji} — {sig['symbol']} [{sig['cap']}]{cap52}\n"
+                f"{stock.get('company_name','')[:40]}\n"
+                f"{'='*45}\n"
+                f"Entry:    ₹{sig['entry']:,.2f}\n"
+                f"Target:   ₹{sig['target']:,.2f} (+{pct:.1f}%)\n"
+                f"Stop:     ₹{sig['stoploss']:,.2f} (-{sl_pct:.1f}%)\n"
+                f"Size:     {sig['position_size']}sh × ₹{sig['entry']:.0f}\n"
+                f"Gap:      {sig['true_gap']:+.2f}% ({d.get('gap_type','')})\n"
+                f"RVOL:     {d['rvol']:.1f}x\n"
+                f"Score:    {sig['final_score']:.1f}\n"
+                f"Time:     {sig['time']} | P&L: ₹{self.risk.net_pnl:.0f}\n"
+                f"{'='*45}"
+            )
+            async_notify(msg)
+        except Exception: pass
 
     def _is_fo_eligible(self, symbol: str) -> bool:
         """Check if stock is F&O eligible (can be shorted intraday)."""
@@ -2087,9 +2074,6 @@ class IntradayEngine:
             logger.warning("Auto-save trades failed: %s", e)
 
     def print_summary(self):
-        if self.execution is not None:
-            print(self.execution.report())
-            return
         longs  = [s for s in self.signals.values() if s["direction"]=="LONG"]
         shorts = [s for s in self.signals.values() if s["direction"]=="SHORT"]
         print(f"\n{'='*65}")
@@ -2308,7 +2292,7 @@ def preflight_check() -> bool:
     return all_ok
 
 
-def _run_signals(kite=None, instruments=None, execution=None, execution_worker=None):
+def main():
     if not API_KEY or not ACCESS_TOKEN:
         print("❌ Run: python scripts/kite_login.py first"); sys.exit(1)
 
@@ -2316,9 +2300,8 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
     if not preflight_check():
         sys.exit(1)
 
-    if kite is None:
-        kite = KiteConnect(api_key=API_KEY)
-        kite.set_access_token(ACCESS_TOKEN)
+    kite = KiteConnect(api_key=API_KEY)
+    kite.set_access_token(ACCESS_TOKEN)
 
     ctx = get_premarket_context()
     market_direction, nifty_change = get_market_direction(kite, ctx)
@@ -2388,9 +2371,8 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
         logger.error("No stocks in watchlist"); sys.exit(1)
 
     symbols       = list(set(s["symbol"] for s in all_stocks))
-    instruments   = instruments if instruments is not None else kite.instruments("NSE")
     token_map     = {i["tradingsymbol"]: i["instrument_token"]
-                     for i in instruments
+                     for i in kite.instruments("NSE")
                      if i.get("tradingsymbol") in symbols and i.get("segment")=="NSE"}
     prev_close    = {s.replace("NSE:",""): d["ohlc"]["close"]
                      for s,d in kite.quote([f"NSE:{s}" for s in token_map]).items()}
@@ -2405,7 +2387,6 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
     print(f"\n{'='*65}")
     print(f"  INTRADAY WATCHLIST v10 — {date.today()} | {market_direction}")
     print(f"  TRUE GAP | 5-min hold | ATR 14-day | Traded value filter")
-    print(f"  Execution: {EXECUTION_MODE} (auto_paper sends no real orders)")
     print(f"  Daily budget: ₹{MAX_DAILY_CAPITAL_INR:,} | Ticket: ₹{MIN_TICKET_INR:,}–₹{MAX_CAPITAL_PER_TRADE:,}")
     print("  Entry tickets + estimated charges share the daily budget; exits do not refill it.")
     print(f"{'='*65}")
@@ -2436,50 +2417,41 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
                             key_levels, sector_quotes, sentiment)
     engine.kite = kite
 
-    # The automatic executor has its own fill ledger. Never mix its actual
-    # order state with the legacy paper engine_positions/trade_log snapshots.
+    # Start with entries BLOCKED — enabled only after successful restore
+    # AND after all restored positions are monitored (token subscription)
     engine._entry_blocked = True
-    if EXECUTION_MODE in {"auto_paper", "live"}:
-        engine.execution = execution
-        # Execution worker was started before signal preflight/universe queries.
-        # It monitors restored positions independently of this watchlist.
-        engine._entry_blocked = False
-    else:
-        # Start with entries BLOCKED — enabled only after successful restore
-        # AND after all restored positions are monitored (token subscription)
-        engine._entry_blocked = True
+    try:
+        # Immediate exits write before print_summary(); migrate before enabling entries.
+        schema_conn = psycopg2.connect(NEON_URL, connect_timeout=10)
         try:
-            # Immediate exits write before print_summary(); migrate before enabling entries.
-            schema_conn = psycopg2.connect(NEON_URL, connect_timeout=10)
-            try:
-                ensure_trade_log_schema(schema_conn)
-                schema_conn.commit()
-            except Exception:
-                schema_conn.rollback()
-                raise
-            finally:
-                schema_conn.close()
-            from broker_reconciler import restore_engine_state
-            restore_engine_state(engine, is_paper=PAPER_TRADING)
-            if not engine.risk.daily_budget_restored:
-                raise RuntimeError("Daily budget was not restored; deploy the matching broker_reconciler.py")
-            # DB recovery succeeded — but entries stay blocked if positions need tokens
-            restored = getattr(engine, "_restored_symbols", [])
-            if restored:
-                logger.info("DB recovery succeeded — %d position(s) still need token "
-                            "subscription before entries are enabled", len(restored))
-                # _entry_blocked remains True — on_connect will enable after subscription
-            else:
-                # No open positions to restore — safe to enable immediately
-                engine._entry_blocked = False
-                logger.info("State restore complete — no open positions — entries enabled")
-        except RuntimeError as e:
-            logger.error("State restore FAILED — entries remain blocked: %s", e)
-            logger.error("Resolve manually or restart after market reset.")
-        except Exception as e:
-            logger.error("State restore ERROR — entries remain blocked: %s", e)
-            logger.info("If this is a fresh session with no open positions, "
-                        "manually set engine._entry_blocked = False to resume.")
+            ensure_trade_log_schema(schema_conn)
+            schema_conn.commit()
+        except Exception:
+            schema_conn.rollback()
+            raise
+        finally:
+            schema_conn.close()
+        from broker_reconciler import restore_engine_state
+        restore_engine_state(engine, is_paper=PAPER_TRADING)
+        if not engine.risk.daily_budget_restored:
+            raise RuntimeError("Daily budget was not restored; deploy the matching broker_reconciler.py")
+        # DB recovery succeeded — but entries stay blocked if positions need tokens
+        restored = getattr(engine, "_restored_symbols", [])
+        if restored:
+            logger.info("DB recovery succeeded — %d position(s) still need token "
+                        "subscription before entries are enabled", len(restored))
+            # _entry_blocked remains True — on_connect will enable after subscription
+        else:
+            # No open positions to restore — safe to enable immediately
+            engine._entry_blocked = False
+            logger.info("State restore complete — no open positions — entries enabled")
+    except RuntimeError as e:
+        logger.error("State restore FAILED — entries remain blocked: %s", e)
+        logger.error("Resolve manually or restart after market reset.")
+    except Exception as e:
+        logger.error("State restore ERROR — entries remain blocked: %s", e)
+        logger.info("If this is a fresh session with no open positions, "
+                    "manually set engine._entry_blocked = False to resume.")
 
     # Dynamic gap scan ? runs once after WebSocket stable
     import threading
@@ -2644,19 +2616,7 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
         ticker.connect(threaded=True)
         while True:
             now = datetime.now(IST)
-            if engine.execution is not None:
-                if now.hour*60 + now.minute >= 900:
-                    engine.execution.request_flatten()
-                if now.hour*60 + now.minute >= 905:
-                    engine.print_summary()
-                    if engine.execution.snapshot().get("flat", False):
-                        engine.execution.stop_requested.set()
-                        execution_worker.join(timeout=10)
-                        break
-                    logger.error("Square-off not confirmed; execution worker remains active")
-                time.sleep(2)
-                continue
-            if now.hour*60 + now.minute >= 905:
+            if now.hour >= 15 and now.minute >= 5:
                 engine.print_summary()
                 logger.info("3:05 PM — square off")
                 save_daily_pnl(engine.risk, engine.signals,
@@ -2664,53 +2624,7 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
                 break
             time.sleep(10)
     except KeyboardInterrupt:
-        if engine.execution is not None:
-            # Ctrl+C requests an orderly exit; do not silently abandon positions.
-            engine.execution.request_flatten()
-            logger.warning("Shutdown requested: awaiting confirmed owned-position exits. Use Kite if broker access fails.")
-            while not engine.execution.snapshot().get("flat", False):
-                time.sleep(2)
-            engine.execution.stop_requested.set()
-            execution_worker.join(timeout=10)
         engine.print_summary()
-
-
-def main():
-    if EXECUTION_MODE == "paper":
-        return _run_signals()
-    if not API_KEY or not ACCESS_TOKEN:
-        raise SystemExit("Run scripts/kite_login.py first")
-    from order_manager import build_executor
-    import threading, time
-    kite = KiteConnect(api_key=API_KEY)
-    kite.set_access_token(ACCESS_TOKEN)
-    instruments = kite.instruments("NSE")
-    execution = build_executor(
-        kite, instruments, EXECUTION_MODE, daily_cap=MAX_DAILY_CAPITAL_INR,
-        min_ticket=MIN_TICKET_INR, max_risk=MAX_RISK_PER_TRADE_INR,
-        max_daily_loss=MAX_DAILY_LOSS_INR, max_positions=MAX_POSITIONS,
-        max_losses=MAX_CONSECUTIVE_LOSSES)
-    execution.step()
-    worker = threading.Thread(target=execution.run, daemon=True)
-    worker.start()
-    mirror = threading.Thread(target=execution.mirror_loop, daemon=True)
-    mirror.start()
-    try:
-        return _run_signals(kite, instruments, execution, worker)
-    finally:
-        # Includes signal-data/preflight failure: keep the executor alive until
-        # owned positions and pending orders have been resolved.
-        execution.request_flatten()
-        while not execution.snapshot().get("flat", False):
-            logger.warning("Waiting for confirmed square-off; check Kite if broker is unavailable")
-            time.sleep(5)
-        execution.stop_requested.set()
-        worker.join(timeout=10)
-        mirror.join(timeout=10)
-        execution.mirror_to_neon()
-        print(execution.report())
-        if not worker.is_alive() and not mirror.is_alive():
-            execution.journal.close()
 
 
 if __name__ == "__main__":

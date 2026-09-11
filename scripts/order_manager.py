@@ -492,7 +492,15 @@ class AutoOrderManager:
             if not t["partial_done"] and move >= risk:
                 if half: self._goal(t, half, "PARTIAL_1R")
                 else: t["partial_done"] = True
-            if half and self._exited(t) >= half: t["partial_done"] = True
+            if half and self._exited(t) >= half and not t["partial_done"]:
+                t["partial_done"] = True
+                partial_avg = sum(o["average"]*o["filled"] for o in t["orders"]
+                                  if o["kind"]=="EXIT" and o["filled"]) / max(self._exited(t),1)
+                self.alerts(
+                    f"{self.broker.mode}: {t['symbol']} PARTIAL EXIT"
+                    f" {self._exited(t)}sh @ ₹{partial_avg:.2f}"
+                    f" | Stop → breakeven"
+                )
             if t["partial_done"]:
                 levels = max(0, int(move / risk) - 1)
                 desired = tick_round(entry + sign*levels*risk*.5, tick, sign > 0)
@@ -555,7 +563,20 @@ class AutoOrderManager:
             self._halt("Protective stop rejected for " + t["symbol"] + "; attempting full exit")
             self._goal(t, qty, "PROTECTION_FAILED")
             return
+        # Alert: entry filled + stop placed
+        fill_qty = self._filled(t)
+        fill_avg = (sum(o["average"]*o["filled"] for o in t["orders"]
+                        if o["kind"]=="ENTRY" and o["filled"])
+                    / max(fill_qty, 1))
+        self.alerts(
+            f"{self.broker.mode}: {t['symbol']} FILLED {fill_qty}sh"
+            f" @ ₹{fill_avg:.2f}"
+        )
         self._submit(t, "STOP", remaining, trigger=t["stop"])
+        self.alerts(
+            f"{self.broker.mode}: {t['symbol']} STOP PLACED"
+            f" @ ₹{t['stop']:.2f}"
+        )
 
     def step(self):
         self.ready = False
