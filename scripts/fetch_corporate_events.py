@@ -154,6 +154,16 @@ def save_events(events: list[dict], sym_isin: dict):
         e["category"], e["description"], e["days_away"]
     ) for e in events]
 
+    # Deduplicate rows before upsert (same batch duplicates cause CardinalityViolation)
+    seen = set()
+    deduped = []
+    for row in rows:
+        key = (row[0], row[1], row[2])  # symbol, event_date, category
+        if key not in seen:
+            seen.add(key)
+            deduped.append(row)
+    rows = deduped
+
     execute_values(cur, """
         INSERT INTO investmitra.corporate_events
             (symbol, isin, company, event_date, purpose, category, description, days_away)
