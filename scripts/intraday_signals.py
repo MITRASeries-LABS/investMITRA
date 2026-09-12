@@ -1912,29 +1912,7 @@ class IntradayEngine:
 
         self._print_signal(self.signals[symbol], stock)
 
-        # Send Telegram alert immediately
-        try:
-            tg_notify = self.execution.alerts
-            sig = self.signals[symbol]
-            d   = sig['details']
-            direction = sig['direction']
-            emoji = 'LONG' if direction == 'LONG' else 'SHORT'
-            tg_notify(
-                f"{emoji} SIGNAL - {symbol} [{sig['cap']}]\n"
-                f"{stock.get('company_name','')[:30]}\n\n"
-                f"Entry:   {sig['entry']:,.2f}\n"
-                f"Target:  {sig['target']:,.2f} ({abs(sig['entry']-sig['target'])/sig['entry']*100:.1f}%)\n"
-                f"Stop:    {sig['stoploss']:,.2f}\n"
-                f"Size:    {sig['position_size']} shares\n"
-                f"Risk:    {sig['risk_inr']:.0f} + 80 brokerage\n"
-                f"Gap:     {sig['true_gap']:+.2f}% ({d['gap_type']})\n"
-                f"RVOL:    {d['rvol']:.1f}x\n"
-                f"Score:   {sig['final_score']:.1f}\n"
-                f"ATR:     {sig['atr']:.2f}\n\n"
-                f"Open Kite app and place order!"
-            )
-        except Exception as e:
-            pass
+
 
     def _print_signal(self, sig, stock):
         emoji  = "🟢 LONG " if sig["direction"]=="LONG" else "🔴 SHORT"
@@ -1964,6 +1942,28 @@ class IntradayEngine:
         print(f"  F-Score: {sig['piotroski']} | Screens: {sig['screens']} | {sig['session']}")
         print(f"  Time:         {sig['time']} | Net P&L: ₹{self.risk.net_pnl:.0f}")
         print(f"{'='*65}\n")
+        # Send full signal box to Telegram via execution alerts
+        try:
+            tg_notify = self.execution.alerts
+            cap52 = " 🏆 52W HIGH" if d.get("52w_high") and sig["entry"] >= d["52w_high"]*0.99 else ""
+            msg = (
+                f"{'='*45}\n"
+                f"{emoji} — {sig['symbol']} [{sig['cap']}]{bulk}{cap52}\n"
+                f"{stock.get('company_name','')[:40]}\n"
+                f"{'='*45}\n"
+                f"Entry:  ₹{sig['entry']:,.2f}\n"
+                f"Target: ₹{sig['target']:,.2f} (+{pct:.1f}%)\n"
+                f"Stop:   ₹{sig['stoploss']:,.2f} (-{sl_pct:.1f}%)\n"
+                f"Size:   {sig['position_size']}sh × ₹{sig['entry']:.0f}\n"
+                f"Gap:    {sig['true_gap']:+.2f}% ({d.get('gap_type','')})\n"
+                f"RVOL:   {d['rvol']:.1f}x\n"
+                f"Score:  {sig['final_score']:.1f}\n"
+                f"ATR:    {sig['atr']:.2f}\n"
+                f"Time:   {sig['time']} | P&L: ₹{self.risk.net_pnl:.0f}\n"
+                f"{'='*45}"
+            )
+            tg_notify(msg)
+        except Exception: pass
 
     def _is_fo_eligible(self, symbol: str) -> bool:
         """Check if stock is F&O eligible (can be shorted intraday)."""

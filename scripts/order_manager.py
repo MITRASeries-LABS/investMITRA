@@ -604,7 +604,7 @@ class AutoOrderManager:
             self._halt("Protective stop rejected for " + t["symbol"] + "; attempting full exit")
             self._goal(t, qty, "PROTECTION_FAILED")
             return
-        # Alert: entry filled + stop being placed
+        # Alert: entry filled + stop placed
         fill_qty = self._filled(t)
         if fill_qty:
             fill_avg = (sum(o["average"]*o["filled"] for o in t["orders"]
@@ -692,7 +692,9 @@ class AutoOrderManager:
                         DO UPDATE SET snapshot=EXCLUDED.snapshot,updated_at=NOW()
                     """, (view["account"], view["mode"], view["day"], json.dumps(view, allow_nan=False)))
         except Exception:
-            logger.warning("Neon execution mirror unavailable; local durable journal remains authoritative")
+            if not getattr(self, '_mirror_warned', False):
+                logger.warning("Neon execution mirror unavailable; local durable journal remains authoritative")
+                self._mirror_warned = True  # suppress repeated warningsns authoritative")
         finally:
             if conn is not None: conn.close()
 
