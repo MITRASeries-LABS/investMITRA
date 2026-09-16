@@ -1912,7 +1912,29 @@ class IntradayEngine:
 
         self._print_signal(self.signals[symbol], stock)
 
-
+        # Send Telegram alert immediately
+        try:
+            tg_notify = self.execution.alerts
+            sig = self.signals[symbol]
+            d   = sig['details']
+            direction = sig['direction']
+            emoji = 'LONG' if direction == 'LONG' else 'SHORT'
+            tg_notify(
+                f"{emoji} SIGNAL - {symbol} [{sig['cap']}]\n"
+                f"{stock.get('company_name','')[:30]}\n\n"
+                f"Entry:   {sig['entry']:,.2f}\n"
+                f"Target:  {sig['target']:,.2f} ({abs(sig['entry']-sig['target'])/sig['entry']*100:.1f}%)\n"
+                f"Stop:    {sig['stoploss']:,.2f}\n"
+                f"Size:    {sig['position_size']} shares\n"
+                f"Risk:    {sig['risk_inr']:.0f} + 80 brokerage\n"
+                f"Gap:     {sig['true_gap']:+.2f}% ({d['gap_type']})\n"
+                f"RVOL:    {d['rvol']:.1f}x\n"
+                f"Score:   {sig['final_score']:.1f}\n"
+                f"ATR:     {sig['atr']:.2f}\n\n"
+                f"Open Kite app and place order!"
+            )
+        except Exception as e:
+            pass
 
     def _print_signal(self, sig, stock):
         emoji  = "🟢 LONG " if sig["direction"]=="LONG" else "🔴 SHORT"
@@ -1942,28 +1964,6 @@ class IntradayEngine:
         print(f"  F-Score: {sig['piotroski']} | Screens: {sig['screens']} | {sig['session']}")
         print(f"  Time:         {sig['time']} | Net P&L: ₹{self.risk.net_pnl:.0f}")
         print(f"{'='*65}\n")
-        # Send full signal box to Telegram via execution alerts
-        try:
-            tg_notify = self.execution.alerts
-            cap52 = " 🏆 52W HIGH" if d.get("52w_high") and sig["entry"] >= d["52w_high"]*0.99 else ""
-            msg = (
-                f"{'='*45}\n"
-                f"{emoji} — {sig['symbol']} [{sig['cap']}]{bulk}{cap52}\n"
-                f"{stock.get('company_name','')[:40]}\n"
-                f"{'='*45}\n"
-                f"Entry:  ₹{sig['entry']:,.2f}\n"
-                f"Target: ₹{sig['target']:,.2f} (+{pct:.1f}%)\n"
-                f"Stop:   ₹{sig['stoploss']:,.2f} (-{sl_pct:.1f}%)\n"
-                f"Size:   {sig['position_size']}sh × ₹{sig['entry']:.0f}\n"
-                f"Gap:    {sig['true_gap']:+.2f}% ({d.get('gap_type','')})\n"
-                f"RVOL:   {d['rvol']:.1f}x\n"
-                f"Score:  {sig['final_score']:.1f}\n"
-                f"ATR:    {sig['atr']:.2f}\n"
-                f"Time:   {sig['time']} | P&L: ₹{self.risk.net_pnl:.0f}\n"
-                f"{'='*45}"
-            )
-            tg_notify(msg)
-        except Exception: pass
 
     def _is_fo_eligible(self, symbol: str) -> bool:
         """Check if stock is F&O eligible (can be shorted intraday)."""
@@ -2570,6 +2570,51 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
                 print(f"     {g['symbol']}: gap {g.get('gap_pct',0):+.2f}%")
 
     threading.Thread(target=_dynamic_scan, daemon=True).start()
+
+    # Second scan at 10:00 AM — catches stocks with RVOL that built up after open
+    def _late_scan():
+        import time as _time
+        # Wait until 10:00 AM
+        while True:
+            now = datetime.now(IST)
+            if now.hour > 10 or (now.hour == 10 and now.minute >= 0):
+                break
+            _time.sleep(15)
+        _time.sleep(30)  # Give WebSocket time to settle
+        logger.info("10 AM late scan — checking RVOL-qualified stocks")
+        existing = set(engine.all_stocks.keys())
+        try:
+            # Re-check Tier 1 watchlist stocks that were rejected at 9:35 AM
+            # by checking if they now have sufficient RVOL
+            all_syms = list(engine.long_map.keys()) + list(engine.short_map.keys())
+            quotes = kite.quote([f"NSE:{s}" for s in all_syms[:100]])
+            rvol_base = get_rvol_baseline()
+            IST_tz = datetime.now(IST)
+            mkt_min = IST_tz.hour*60+IST_tz.minute - (9*60+15)
+            frac = max(mkt_min/375, 0.05)
+            late_adds = []
+            for sym in all_syms[:100]:
+                if sym in engine.traded_today: continue
+                q = quotes.get(f"NSE:{sym}", {})
+                ohlc = q.get("ohlc", {})
+                prev  = float(ohlc.get("close", 0))
+                open_p = float(ohlc.get("open", 0))
+                ltp   = float(q.get("last_price", 0))
+                vol   = int(q.get("volume", 0))
+                if not prev or not open_p: continue
+                gap = (open_p - prev) / prev * 100
+                avg_vol = rvol_base.get(sym, 0)
+                rvol = min(vol / (avg_vol * frac), 200) if avg_vol * frac > 0 else 0
+                if abs(gap) >= 0.30 and rvol >= 2.0 and ltp >= open_p * 0.998:
+                    late_adds.append(f"{sym} gap{gap:+.2f}% RVOL{rvol:.1f}x")
+            if late_adds:
+                logger.info("10AM scan — qualified: %s", ", ".join(late_adds))
+            else:
+                logger.info("10AM scan — no additional qualifiers")
+        except Exception as e:
+            logger.warning("10AM late scan failed: %s", e)
+
+    threading.Thread(target=_late_scan, daemon=True).start()
 
     def on_connect(ws, response):
         logger.info("Connected — %d tokens", len(tokens))
