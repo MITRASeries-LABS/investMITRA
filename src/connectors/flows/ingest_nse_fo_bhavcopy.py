@@ -10,7 +10,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 
-def ingest_nse_fo_bhavcopy():
+def try:
+    ingest_nse_fo_bhavcopy()
+except Exception as e:
+    if 'No data' in str(e) or 'SourceUnavailable' in type(e).__name__:
+        print(f'Data not yet available: {e} ? skipping gracefully')
+        import sys; sys.exit(0)
+    raise:
     from src.connectors.nse_fo_bhavcopy import NSEFOBhavCopyConnector
     from src.transforms.lake_writer import write_to_lake
     from src.quality.db_logger import log_pipeline_run
@@ -47,4 +53,10 @@ def ingest_nse_fo_bhavcopy():
 
 
 if __name__ == "__main__":
+    try:
     ingest_nse_fo_bhavcopy()
+except Exception as e:
+    if 'No data' in str(e) or 'SourceUnavailable' in type(e).__name__:
+        print(f'Data not yet available: {e} ? skipping gracefully')
+        import sys; sys.exit(0)
+    raise
