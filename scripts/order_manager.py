@@ -620,6 +620,13 @@ class AutoOrderManager:
             if self.clock().date().isoformat() != self.state["day"]:
                 raise RuntimeError("Session date changed; restart only after reconciling previous session")
             if self.flatten_requested.is_set() or self.clock().hour*60+self.clock().minute >= 900:
+                if not self.state["flatten"]:  # alert only once
+                    open_trades = [s for s,t in self.state["trades"].items()
+                                   if not t.get("closed_at")]
+                    if open_trades:
+                        self.alerts(f"{self.broker.mode}: 3PM SQUARE OFF — closing {len(open_trades)} position(s): {", ".join(open_trades)}")
+                    else:
+                        self.alerts(f"{self.broker.mode}: 3PM — session complete, flat")
                 self.state["flatten"] = True
                 self.journal.save()
             pending = []
