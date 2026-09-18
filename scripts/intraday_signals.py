@@ -2522,10 +2522,16 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
     if market_direction == "BULLISH":
         short_list = []
     elif market_direction == "BEARISH":
-        # On bearish day add quality long stocks as short candidates
+        # On bearish day ? quality stocks become short candidates, clear long list
         quality_shorts = [dict(s, direction_override="SHORT") for s in long_list if s.get("quality_score",0) >= 60]
         short_list = quality_shorts + short_list
         long_list  = []
+    
+    # On ANY day ? add F&O eligible stocks as short candidates if they gap DOWN
+    # This catches short opportunities on NEUTRAL days too
+    fo_shorts = [dict(s, direction_override="SHORT") for s in long_list 
+                 if s.get("quality_score",0) >= 65 and s.get("fo_eligible", False)]
+    short_list = short_list + fo_shorts
 
     all_stocks = long_list + short_list
     if not all_stocks:
