@@ -1,31 +1,25 @@
-"""investMITRA — NSE F&O Flow (GitHub Actions + Prefect)"""
+"""investMITRA - NSE F&O Flow (GitHub Actions + Prefect)"""
 from __future__ import annotations
 import logging
 import os
 from datetime import date, datetime, timezone, timedelta
 
-IST = __import__('datetime').timezone(__import__('datetime').timedelta(hours=5, minutes=30))
+IST = timezone(timedelta(hours=5, minutes=30))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-
-try:
-    ingest_nse_fo_bhavcopy()
-except Exception as e:
-    if 'No data' in str(e) or 'SourceUnavailable' in type(e).__name__:
-        print(f'Data not yet available: {e} - skipping gracefully')
-        import sys; sys.exit(0)
-    raise
 from src.connectors.nse_fo_bhavcopy import NSEFOBhavCopyConnector
 from src.transforms.lake_writer import write_to_lake
 from src.quality.db_logger import log_pipeline_run
 
+
+def ingest_nse_fo_bhavcopy():
     date_str = os.getenv("TRADE_DATE", "")
     target_date = date.fromisoformat(date_str) if date_str else datetime.now(IST).date()
 
     if target_date.weekday() >= 5:
-        logger.info("Weekend — no F&O data. Skipping.")
+        logger.info("Weekend - no F&O data. Skipping.")
         return
 
     logger.info("NSE F&O ingestion for %s", target_date)
@@ -36,7 +30,7 @@ from src.quality.db_logger import log_pipeline_run
         df, result = connector.ingest(target_date)
     except Exception as e:
         if "404" in str(e):
-            logger.info("404 — market holiday. Skipping.")
+            logger.info("404 - market holiday. Skipping.")
             return
         raise
 
@@ -48,15 +42,16 @@ from src.quality.db_logger import log_pipeline_run
                   partition_date=target_date, source_id="nse_fo_bhavcopy",
                   quality_score=result.quality_score, run_id=run_id)
     log_pipeline_run(source_id="nse_fo_bhavcopy", run_date=target_date,
-                     status="success", rows_ingested=len(df), quality_score=result.quality_score)
-    logger.info("NSE F&O done — rows=%d", len(df))
+                     status="success", rows_ingested=len(df),
+                     quality_score=result.quality_score)
+    logger.info("NSE F&O done - rows=%d", len(df))
 
 
 if __name__ == "__main__":
     try:
-    ingest_nse_fo_bhavcopy()
-except Exception as e:
-    if 'No data' in str(e) or 'SourceUnavailable' in type(e).__name__:
-        print(f'Data not yet available: {e} ? skipping gracefully')
-        import sys; sys.exit(0)
-    raise
+        ingest_nse_fo_bhavcopy()
+    except Exception as e:
+        if "No data" in str(e) or "SourceUnavailable" in type(e).__name__:
+            print(f"Data not yet available: {e} - skipping gracefully")
+            import sys; sys.exit(0)
+        raise
