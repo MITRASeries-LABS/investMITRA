@@ -1,115 +1,166 @@
-"""
-auto_paper_summary.py — Daily P&L summary from auto_paper SQLite journal
-Run after market close: python scripts/auto_paper_summary.py
-"""
-import sqlite3, json, os, sys
-from datetime import datetime, timezone, timedelta
+"""Read-only daily report from the auto_paper SQLite journal.
 
-IST = timezone(timedelta(hours=5, minutes=30))
+Run: python scripts/auto_paper_summary.py [--date YYYY-MM-DD]
+Budget defaults match the uploaded executor. If its settings change, supply
+--daily-cap and --cost-reserve; these report options do not change execution.
+Signal cost estimates are not actual broker charges. Open-trade net includes
+the full estimated trade cost and excludes unrealised price movements.
+"""
+import argparse
+import json
+import os
+import sqlite3
+from decimal import Decimal
+from pathlib import Path
 
-def summarise(db_path='data/execution_auto_paper.sqlite3', target_date=None):
-    if not os.path.exists(db_path):
+TERMINAL = {"COMPLETE", "CANCELLED", "REJECTED"}
+ZERO = Decimal("0")
+
+
+def number(value):
+    result = Decimal(str(value))
+    if not result.is_finite():
+        raise ValueError("Non-finite value in journal or report settings")
+    return result
+
+
+def load_state(db_path, target_date=None):
+    """Use the actual Journal schema; never create or modify the database."""
+    uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        row = conn.execute("SELECT body FROM state WHERE id=1").fetchone()
+        state = json.loads(row[0]) if row else None
+        if target_date and (state is None or state.get("day") != target_date):
+            row = conn.execute(
+                "SELECT body FROM history WHERE day=?", (target_date,)
+            ).fetchone()
+            state = json.loads(row[0]) if row else None
+        return state
+    finally:
+        conn.close()
+
+
+def calculate(state, daily_cap=25000, cost_reserve=80):
+    """Derive usage from fills, including closed trades, as the executor does."""
+    cap, reserve = number(daily_cap), number(cost_reserve)
+    if cap <= 0 or reserve < 0:
+        raise ValueError("Daily cap must be positive; cost reserve cannot be negative")
+    totals = dict(tickets=ZERO, pending=ZERO, allowances=ZERO, exposure=ZERO,
+                  gross=ZERO, estimated_costs=ZERO, executor_costs=ZERO,
+                  wins=0, losses=0, breakeven=0, rows=[])
+    for symbol, trade in state.get("trades", {}).items():
+        orders = trade.get("orders", [])
+        entries = [o for o in orders if o["kind"] == "ENTRY"]
+        if len(entries) != 1:
+            raise ValueError(f"{symbol}: expected one entry order in executor journal")
+        entry = entries[0]
+        qty = number(entry.get("filled", 0))
+        ordered = number(entry["qty"])
+        average = number(entry.get("average", 0))
+        if qty < 0 or ordered < qty or (qty > 0 and average <= 0):
+            raise ValueError(f"{symbol}: invalid entry fill")
+        exits = [o for o in orders if o["kind"] in ("EXIT", "STOP")]
+        exited = ZERO
+        exit_value = ZERO
+        for order in exits:
+            filled, price = number(order.get("filled", 0)), number(order.get("average", 0))
+            if filled < 0 or (filled > 0 and price <= 0):
+                raise ValueError(f"{symbol}: invalid exit fill")
+            exited += filled
+            exit_value += filled * price
+        if exited > qty:
+            raise ValueError(f"{symbol}: exits exceed entry fills")
+        remaining = qty - exited
+        if trade.get("closed_at") and remaining:
+            raise ValueError(f"{symbol}: marked closed with unexited shares")
+        sign = number(trade["sign"])
+        if sign not in (1, -1):
+            raise ValueError(f"{symbol}: invalid direction")
+        entry_value = qty * average
+        gross = (exit_value - average * exited) * sign
+        pending = ZERO
+        active_entry = entry["status"] not in TERMINAL
+        if active_entry:
+            reservation = number(trade["reservation_price"])
+            if reservation <= 0:
+                raise ValueError(f"{symbol}: invalid reservation price")
+            pending = (ordered - qty) * reservation
+        allowance = reserve if active_entry or qty > 0 else ZERO
+        costs = number(trade.get("signal", {}).get("estimated_costs", reserve)) if qty else ZERO
+        if costs < 0:
+            raise ValueError(f"{symbol}: negative estimated costs")
+        closed = bool(trade.get("closed_at")) and qty > 0
+        status = (trade.get("exit_reason") or "CLOSED") if closed else (
+            "NOT FILLED" if not qty else "PARTIAL / OPEN" if exited else "OPEN")
+        net = gross - costs
+        if closed:
+            totals["wins" if net > 0 else "losses" if net < 0 else "breakeven"] += 1
+        for key, value in dict(tickets=entry_value, pending=pending,
+                               allowances=allowance, exposure=remaining * average,
+                               gross=gross, estimated_costs=costs,
+                               executor_costs=reserve if qty else ZERO).items():
+            totals[key] += value
+        totals["rows"].append(dict(symbol=trade.get("symbol", symbol),
+                                   direction="LONG" if sign > 0 else "SHORT",
+                                   qty=qty, exited=exited, entry=average,
+                                   exit=exit_value / exited if exited else ZERO,
+                                   gross=gross, net=net, status=status))
+    totals["budget_used"] = totals["tickets"] + totals["pending"] + totals["allowances"]
+    totals["remaining"] = max(ZERO, cap - totals["budget_used"])
+    totals["net"] = totals["gross"] - totals["estimated_costs"]
+    totals["executor_net"] = totals["gross"] - totals["executor_costs"]
+    return totals
+
+
+def summarise(db_path="data/execution_auto_paper.sqlite3", target_date=None,
+              daily_cap=25000, cost_reserve=80):
+    if not Path(db_path).is_file():
         print("Journal not found:", db_path)
         return
-
-    conn = sqlite3.connect(db_path)
-    cur  = conn.cursor()
-    cur.execute("SELECT * FROM state")
-    row = cur.fetchone()
-    conn.close()
-
-    if not row:
-        print("No state in journal.")
+    state = load_state(db_path, target_date)
+    if state is None:
+        print(f"No data for {target_date}" if target_date else "No state in journal.")
         return
+    result = calculate(state, daily_cap, cost_reserve)
+    print(f"\n{'='*80}\n  AUTO-PAPER SUMMARY — {state.get('day', '?')}")
+    print(f"  Mode: {state.get('mode', '?')} | Account: {state.get('account', '?')}")
+    print(f"{'='*80}")
+    print(f"\n  {'Symbol':<12} {'Dir':<5} {'Qty':>4} {'Exited':>6} {'Entry':>9} {'Exit':>9} {'Gross':>9} {'Est. net':>9}  Status")
+    for row in result["rows"]:
+        exit_text = f"{row['exit']:.2f}" if row["exited"] else "--"
+        print(f"  {row['symbol']:<12} {row['direction']:<5} {row['qty']:>4.0f} "
+              f"{row['exited']:>6.0f} {row['entry']:>9.2f} {exit_text:>9} "
+              f"{row['gross']:>+9.2f} {row['net']:>+9.2f}  {row['status']}")
+    print(f"\n  Realised gross: ₹{result['gross']:+,.2f}")
+    print(f"  Signal-estimated costs: ₹{result['estimated_costs']:,.2f} | Estimated net: ₹{result['net']:+,.2f}")
+    print(f"  Executor provisional net (₹{number(cost_reserve):,.2f}/filled trade): ₹{result['executor_net']:+,.2f}")
+    completed = result["wins"] + result["losses"] + result["breakeven"]
+    if completed:
+        print(f"  Closed trades: {completed} | Wins: {result['wins']} | Losses: {result['losses']} | Breakeven: {result['breakeven']} | Win rate: {result['wins']/completed*100:.0f}%")
+    else:
+        print("  No completed trades.")
+    print(f"\n  Daily entry allocation (closed trades retained): ₹{result['tickets']:,.2f}")
+    print(f"  Pending entry reservation: ₹{result['pending']:,.2f}")
+    print(f"  Executor cost allowances: ₹{result['allowances']:,.2f}")
+    print(f"  Budget used incl. reservations: ₹{result['budget_used']:,.2f} of ₹{number(daily_cap):,.2f}")
+    print(f"  Remaining daily allowance: ₹{result['remaining']:,.2f}")
+    print(f"  Open exposure at entry prices: ₹{result['exposure']:,.2f}")
+    if result["budget_used"] > number(daily_cap):
+        print("  WARNING: journal usage exceeds the configured report cap.")
+    print("  Costs are estimates, not confirmed broker charges; unrealised P&L excluded.")
+    print("  Budget reconstruction assumes --daily-cap and --cost-reserve match the executor.")
+    print(f"  Halt: {state.get('halt') or 'none'}\n{'='*80}\n")
 
-    state = json.loads(row[1])
-    day   = state.get('day', '?')
-
-    if target_date and day != target_date:
-        # Check history
-        conn = sqlite3.connect(db_path)
-        cur  = conn.cursor()
-        cur.execute("SELECT data FROM history WHERE data LIKE ?", (f'%"day": "{target_date}"%',))
-        row = cur.fetchone()
-        conn.close()
-        if row:
-            state = json.loads(row[0])
-            day   = target_date
-        else:
-            print(f"No data for {target_date}")
-            return
-
-    trades = state.get('trades', {})
-
-    print(f"\n{'='*60}")
-    print(f"  AUTO-PAPER SUMMARY — {day}")
-    print(f"  Mode: {state.get('mode','?')} | Account: {state.get('account','?')}")
-    print(f"{'='*60}")
-
-    total_gross  = 0
-    total_costs  = 0
-    wins = losses = 0
-
-    rows = []
-    for sym, t in trades.items():
-        sig       = t.get('signal', {})
-        orders    = t.get('orders', [])
-        direction = sig.get('direction', 'LONG')
-        sign      = t.get('sign', 1)
-
-        # Entry fills
-        entry_qty  = sum(o.get('filled',0) for o in orders if o['kind']=='ENTRY')
-        entry_val  = sum(o.get('filled',0)*o.get('average',0) for o in orders if o['kind']=='ENTRY')
-        entry_avg  = entry_val / entry_qty if entry_qty else 0
-
-        # Exit fills (EXIT or STOP)
-        exit_qty   = sum(o.get('filled',0) for o in orders if o['kind'] in ('EXIT','STOP') and o.get('filled',0)>0)
-        exit_val   = sum(o.get('filled',0)*o.get('average',0) for o in orders if o['kind'] in ('EXIT','STOP') and o.get('filled',0)>0)
-        exit_avg   = exit_val / exit_qty if exit_qty else 0
-
-        if entry_qty == 0:
-            status = "NOT FILLED"
-            gross  = 0
-        elif t.get('closed_at'):
-            gross  = (exit_val - entry_val) * sign
-            status = t.get('exit_reason', 'CLOSED')
-        else:
-            gross  = 0
-            status = "OPEN"
-
-        costs    = sig.get('estimated_costs', 80)
-        net      = gross - costs
-        total_gross += gross
-        total_costs += costs if entry_qty > 0 else 0
-
-        if entry_qty > 0 and t.get('closed_at'):
-            if net > 0: wins += 1
-            else:       losses += 1
-
-        rows.append((sym, direction, entry_qty, entry_avg, exit_avg, gross, net, status))
-
-    print(f"\n  {'Symbol':<12} {'Dir':<5} {'Qty':>4} {'Entry':>8} {'Exit':>8} {'Gross':>8} {'Net':>8}  Status")
-    print(f"  {'─'*75}")
-    for sym, direction, qty, entry_avg, exit_avg, gross, net, status in rows:
-        if qty == 0:
-            print(f"  {sym:<12} {direction:<5} {'--':>4} {'--':>8} {'--':>8} {'--':>8} {'--':>8}  {status}")
-        else:
-            print(f"  {sym:<12} {direction:<5} {qty:>4} {entry_avg:>8.2f} {exit_avg:>8.2f} "
-                  f"{gross:>+8.0f} {net:>+8.0f}  {status}")
-        total_gross += 0  # already counted above
-
-    total_net = total_gross - total_costs
-    print(f"\n  {'─'*75}")
-    print(f"  Gross: ₹{total_gross:+.2f} | Charges: ₹{total_costs:.2f} | NET: ₹{total_net:+.2f}")
-    print(f"  Wins: {wins} | Losses: {losses} | Win rate: {wins/(wins+losses)*100:.0f}%" if wins+losses else "  No completed trades.")
-    print(f"\n  Budget used: ₹{state.get('tickets',0):.2f} of ₹25,000")
-    print(f"  Halt: {state.get('halt','none') or 'none'}")
-    print(f"{'='*60}\n")
 
 if __name__ == "__main__":
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument('--date', default=None)
-    p.add_argument('--db',   default='data/execution_auto_paper.sqlite3')
-    args = p.parse_args()
-    summarise(args.db, args.date)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--date", default=None)
+    parser.add_argument("--db", default=os.getenv("INVESTMITRA_EXECUTION_DB", "data/execution_auto_paper.sqlite3"))
+    parser.add_argument("--daily-cap", type=Decimal, default=Decimal("25000"))
+    parser.add_argument("--cost-reserve", type=Decimal, default=Decimal("80"))
+    args = parser.parse_args()
+    try:
+        summarise(args.db, args.date, args.daily_cap, args.cost_reserve)
+    except (sqlite3.Error, ValueError, KeyError, TypeError, ArithmeticError) as error:
+        parser.exit(1, f"Cannot produce a reliable summary: {error}\n")
