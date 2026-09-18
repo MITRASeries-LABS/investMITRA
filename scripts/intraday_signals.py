@@ -54,22 +54,24 @@ NEON_URL     = os.getenv("CC_POSTGRES_URL")
 IST          = timezone(timedelta(hours=5, minutes=30))
 
 # ── Risk Parameters ────────────────────────────────────────────────────────────
-MAX_RISK_PER_TRADE_INR  = 2000
-MAX_CAPITAL_PER_TRADE   = 25000
+MAX_RISK_PER_TRADE_INR  = 1500   # proportional to Rs10k ticket
+MAX_CAPITAL_PER_TRADE   = 10000  # max per trade (3 trades of Rs10k)
+MAX_CONCURRENT_TRADES   = 3      # max simultaneous positions
+MIN_PRIORITY_SCORE      = 3.0    # RVOL x gap x score/100 minimum (raised for quality)
 MAX_DAILY_LOSS_INR      = 6000
 MAX_POSITIONS           = 3
 MAX_CONSECUTIVE_LOSSES  = 2
-ATR_STOP_MULT           = 1.5
-ATR_TARGET_MULT         = 1.5
+ATR_STOP_MULT           = 1.5   # stop at 1.5 ATR
+ATR_TARGET_MULT         = 3.0   # target at 3 ATR → 1:2 R:R
 BROKERAGE_PER_TRADE     = 80   # conservative fallback only
-MIN_NET_PROFIT          = 50   # lowered - filter by expected_net not fixed floor
+MIN_NET_PROFIT          = 300  # minimum expected net (raised for quality trades)
 EXECUTION_MODE         = os.getenv("INVESTMITRA_EXECUTION_MODE", "auto_paper").lower()
 if EXECUTION_MODE != "auto_paper":
     raise ValueError("Two-week trial requires INVESTMITRA_EXECUTION_MODE=auto_paper; legacy paper/live modes are disabled")
 from order_manager import BUILD_ID, MIN_SIGNAL_GAP_PCT, MIN_FINAL_SCORE, entry_policy_rejection
 PAPER_TRADING          = EXECUTION_MODE != "live"  # Live also requires explicit adapter activation
 PAPER_MAX_POSITIONS     = 9     # Max positions in paper trading mode
-MAX_DAILY_CAPITAL_INR  = 25000  # Cumulative entry tickets per day; exits do not replenish it
+MAX_DAILY_CAPITAL_INR  = 35000  # Rs30k deployable + Rs5k reserve
 MIN_TICKET_INR         = 1000
 DESK_CAPITAL_INR       = MAX_DAILY_CAPITAL_INR  # No leverage or extra desk allocation
 
@@ -1144,6 +1146,101 @@ class IntradayEngine:
             if session in ("momentum","choppy","afternoon"):
                 self._check_signal(symbol, ltp, volume, now, session)
 
+    def _trigger_post_exit_scan(self, closed_symbol):
+        """
+        After a position closes, scan for new qualifying stocks.
+        Runs in background thread — restores budget and finds fresh signals.
+        Only runs during momentum/afternoon sessions (not choppy).
+        """
+        import threading, time as _time
+
+        def _scan():
+            _time.sleep(5)  # brief pause for budget to restore
+            now_ist = datetime.now(IST)
+            hour    = now_ist.hour
+            minute  = now_ist.minute
+
+            # Only scan during active sessions
+            in_morning   = (hour == 9 and minute >= 35) or (hour == 10 and minute <= 30)
+            in_afternoon = (hour == 13 and minute >= 30) or hour == 14
+            if not (in_morning or in_afternoon):
+                logger.info("Post-exit scan skipped — outside active session")
+                return
+
+            logger.info("Post-exit scan triggered after %s closed", closed_symbol)
+            try:
+                rvol_base = get_rvol_baseline()
+                now2      = datetime.now(IST)
+                mkt_min   = now2.hour*60+now2.minute - (9*60+15)
+                frac      = max(mkt_min/375, 0.05)
+
+                all_syms = list(self.long_map.keys()) + list(self.short_map.keys())
+                all_syms += [s for s in self.all_stocks if s not in all_syms]
+                all_syms  = list(dict.fromkeys(all_syms))
+
+                qualified = []
+                for batch_start in range(0, len(all_syms), 100):
+                    batch = all_syms[batch_start:batch_start+100]
+                    try:
+                        quotes = self.kite.quote([f"NSE:{s}" for s in batch])
+                    except Exception as e:
+                        logger.warning("Post-exit quote batch failed: %s", e)
+                        continue
+                    for sym in batch:
+                        if sym in self.traded_today: continue
+                        if sym in self.signals: continue
+                        q      = quotes.get(f"NSE:{sym}", {})
+                        ohlc   = q.get("ohlc", {})
+                        prev   = float(ohlc.get("close", 0))
+                        open_p = float(ohlc.get("open", 0))
+                        ltp    = float(q.get("last_price", 0))
+                        vol    = int(q.get("volume", 0))
+                        if not prev or not open_p or ltp <= 0: continue
+                        gap    = (open_p - prev) / prev * 100
+                        avg_vol = rvol_base.get(sym, 0)
+                        rvol   = min(vol / (avg_vol * frac), 200) if avg_vol * frac > 0 else 0
+                        above_open = ltp >= open_p * 0.998
+                        if abs(gap) >= 0.30 and rvol >= 2.0 and above_open:
+                            qualified.append({
+                                "symbol": sym, "gap": gap, "rvol": rvol,
+                                "ltp": ltp, "open": open_p, "prev": prev,
+                                "stock": self.all_stocks.get(sym, self.long_map.get(sym, {}))
+                            })
+
+                if not qualified:
+                    logger.info("Post-exit scan — no qualifiers found")
+                    return
+
+                qualified.sort(key=lambda x: x["rvol"], reverse=True)
+                logger.info("Post-exit scan — %d qualified: %s", len(qualified),
+                            ", ".join(f"{q['symbol']} gap{q['gap']:+.2f}% RVOL{q['rvol']:.1f}x"
+                                      for q in qualified[:5]))
+
+                signalled = 0
+                import datetime as _dt
+                for q in qualified[:5]:  # max 5 new signals post-exit
+                    sym = q["symbol"]
+                    try:
+                        if sym not in self.all_stocks and q["stock"]:
+                            self.all_stocks[sym] = q["stock"]
+                        # Gap confirmed since open (>30 min ago)
+                        self.gap_first_seen[sym] = now2 - _dt.timedelta(minutes=10)
+                        self.gap_direction[sym]  = "LONG" if q["gap"] > 0 else "SHORT"
+                        self.today_open[sym]     = q["open"]
+                        self.prev_close[sym]     = q["prev"]
+                        self._check_signal(sym, q["ltp"], 0, now2, "momentum")
+                        if sym in self.signals:
+                            signalled += 1
+                            logger.info("Post-exit AUTO-SIGNAL: %s", sym)
+                    except Exception as e:
+                        logger.warning("Post-exit signal failed for %s: %s", sym, e)
+
+                logger.info("Post-exit scan complete — %d new signals", signalled)
+            except Exception as e:
+                logger.warning("Post-exit scan error: %s", e)
+
+        threading.Thread(target=_scan, daemon=True).start()
+
     def _record_exit(self, symbol, exit_price, outcome):
         """Record exit details, persist closed state, save trade immediately."""
         if symbol not in self.signals:
@@ -1157,6 +1254,11 @@ class IntradayEngine:
         if "entry_at" not in sig:
             pos = self.risk.positions.get(symbol, {})
             sig["entry_at"] = pos.get("signal_time", now_ist)
+
+        # Trigger post-exit rescan to find new signals with freed budget
+        try:
+            self._trigger_post_exit_scan(symbol)
+        except Exception: pass
 
         # Persist closed snapshot immediately (before summary save)
         try:
@@ -1707,7 +1809,9 @@ class IntradayEngine:
         direction = None
 
         # Minimum quality filters (Sonnet recommendation)
-        min_rvol = 2.0   # Minimum RVOL for any signal
+        min_rvol = 5.0   # Minimum RVOL for quality trades (₹10k budget)
+        tier = stock.get("tier", 1)
+        if tier == 2: min_rvol = 3.0  # dynamic scan stocks slightly lower
         tier = stock.get('tier', 1)
         if tier == 2:
             min_rvol = 3.0
@@ -1812,12 +1916,12 @@ class IntradayEngine:
         if round(ticket_value + trade_cost, 2) > self.risk.daily_budget_remaining:
             return
         expected_net = (abs(target - ltp) * size * 0.5) - trade_cost
-        # Minimum: expected net must exceed costs by at least 1x
-        # (costs already deducted — so min_profit = 0 means break-even, 
-        #  MIN_NET_PROFIT=50 means ₹50 above costs)
-        # For small tickets (< ₹5,000), relax to just beat costs
-        min_profit = MIN_NET_PROFIT if ltp * size >= 5000 else max(0, trade_cost * 0.5)
-        if expected_net < min_profit: return
+        # Minimum: expected net must exceed MIN_NET_PROFIT and 2x trade costs
+        _min_net = max(MIN_NET_PROFIT, trade_cost * 2)
+        if expected_net < _min_net:
+            logger.debug("Skip %s — expected net Rs%.0f below Rs%.0f",
+                         symbol, expected_net, _min_net)
+            return
 
         # Risk check AFTER sizing - includes candidate stop risk and costs
         candidate_stop_risk = abs(ltp - stop) * size
@@ -1864,13 +1968,37 @@ class IntradayEngine:
             piotroski=stock.get("piotroski",0),
             in_bulk=stock.get("in_bulk_deal",False),
         )
+        # ── Priority scoring ─────────────────────────────────────────
+        # priority = RVOL × |gap%| × (score/100)
+        # Higher = better signal quality
+        _rvol     = details.get("rvol", 1.0)
+        _gap_abs  = abs(true_gap_pct)
+        _priority = round(_rvol * _gap_abs * (final / 100), 3)
+        candidate["priority_score"] = _priority
+
+        # Reject weak signals when positions already running
+        _open_count = len(self.risk.positions) if hasattr(self, 'risk') else 0
+        if _open_count >= MAX_CONCURRENT_TRADES:
+            logger.debug("Skip %s — max %d concurrent trades reached",
+                         symbol, MAX_CONCURRENT_TRADES)
+            return
+        if _priority < MIN_PRIORITY_SCORE:
+            logger.info("PRIORITY REJECT %s: score %.3f below %.3f (RVOL%.1fx gap%.2f%% score%.0f)",
+                        symbol, _priority, MIN_PRIORITY_SCORE, _rvol, _gap_abs, final)
+            return
+
+        _rr = abs(target - ltp) / abs(ltp - stop) if abs(ltp - stop) > 0 else 0
+        logger.info("Signal accepted: %s priority=%.2f RVOL%.1fx gap%.2f%% score%.0f R:R=1:%.1f net=Rs%.0f",
+                    symbol, _priority, _rvol, _gap_abs, final, _rr, expected_net)
+
         if self.execution is not None:
             # Worker owns order state, quantities and P&L. Never create a
             # simulated engine position before the broker confirms a fill.
             candidate["offered_at"] = now.timestamp()
             if self.execution.offer(candidate):
                 self.execution_offers[symbol] = now.timestamp()
-                logger.info("Execution candidate queued: %s (%s)", symbol, EXECUTION_MODE)
+                logger.info("Execution candidate queued: %s (%s) priority=%.2f",
+                            symbol, EXECUTION_MODE, _priority)
             return
         self.traded_today.add(symbol)
         self.signals[symbol] = candidate
@@ -2570,6 +2698,107 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
                 print(f"     {g['symbol']}: gap {g.get('gap_pct',0):+.2f}%")
 
     threading.Thread(target=_dynamic_scan, daemon=True).start()
+
+    # Second scan at 10:00 AM — catches stocks with RVOL that built up after open
+    # AUTO-SIGNALS qualifying stocks directly into the executor
+    def _late_scan():
+        import time as _time
+        # Wait until 10:00 AM
+        while True:
+            now = datetime.now(IST)
+            if now.hour > 10 or (now.hour == 10 and now.minute >= 0):
+                break
+            _time.sleep(15)
+        _time.sleep(30)  # Give WebSocket time to settle
+        logger.info("10 AM late scan — checking RVOL-qualified stocks")
+        try:
+            rvol_base   = get_rvol_baseline()
+            now_ist     = datetime.now(IST)
+            mkt_min     = now_ist.hour*60+now_ist.minute - (9*60+15)
+            frac        = max(mkt_min/375, 0.05)
+
+            all_syms = list(engine.long_map.keys()) + list(engine.short_map.keys())
+            # Also include dynamic scan stocks
+            all_syms += [s for s in engine.all_stocks if s not in all_syms]
+            all_syms = list(dict.fromkeys(all_syms))  # dedupe
+
+            # Fetch quotes in batches of 100
+            qualified = []
+            for batch_start in range(0, len(all_syms), 100):
+                batch = all_syms[batch_start:batch_start+100]
+                try:
+                    quotes = kite.quote([f"NSE:{s}" for s in batch])
+                except Exception as e:
+                    logger.warning("10AM quote batch failed: %s", e)
+                    continue
+                for sym in batch:
+                    if sym in engine.traded_today: continue
+                    if sym in engine.signals: continue  # already in a trade
+                    q      = quotes.get(f"NSE:{sym}", {})
+                    ohlc   = q.get("ohlc", {})
+                    prev   = float(ohlc.get("close", 0))
+                    open_p = float(ohlc.get("open", 0))
+                    ltp    = float(q.get("last_price", 0))
+                    vol    = int(q.get("volume", 0))
+                    if not prev or not open_p or ltp <= 0: continue
+                    gap    = (open_p - prev) / prev * 100
+                    avg_vol = rvol_base.get(sym, 0)
+                    rvol   = min(vol / (avg_vol * frac), 200) if avg_vol * frac > 0 else 0
+                    # Must be above open (not fading)
+                    above_open = ltp >= open_p * 0.998
+                    if abs(gap) >= 0.30 and rvol >= 2.0 and above_open:
+                        stock = engine.all_stocks.get(sym, engine.long_map.get(sym, {}))
+                        score = stock.get("investmitra_score", 0)
+                        qualified.append({
+                            "symbol": sym, "gap": gap, "rvol": rvol,
+                            "ltp": ltp, "open": open_p, "prev": prev,
+                            "score": score, "stock": stock
+                        })
+
+            if not qualified:
+                logger.info("10AM scan — no additional qualifiers")
+                return
+
+            # Sort by RVOL (strongest first)
+            qualified.sort(key=lambda x: x["rvol"], reverse=True)
+            logger.info("10AM scan — %d qualified: %s", len(qualified),
+                        ", ".join(f"{q['symbol']} gap{q['gap']:+.2f}% RVOL{q['rvol']:.1f}x"
+                                  for q in qualified[:10]))
+
+            # Feed each qualified stock as a tick to _check_signal
+            # This triggers the normal signal pipeline including budget checks
+            signalled = 0
+            for q in qualified:
+                sym   = q["symbol"]
+                ltp   = q["ltp"]
+                vol_q = 0  # volume already checked — pass 0 to avoid re-check
+                try:
+                    # Ensure stock is in all_stocks for _check_signal
+                    if sym not in engine.all_stocks and q["stock"]:
+                        engine.all_stocks[sym] = q["stock"]
+
+                    # Set gap_first_seen so 5-min hold is bypassed
+                    # (gap has been holding since open — >45 min already confirmed)
+                    engine.gap_first_seen[sym]  = now_ist - __import__('datetime').timedelta(minutes=10)
+                    engine.gap_direction[sym]   = "LONG" if q["gap"] > 0 else "SHORT"
+                    engine.today_open[sym]       = q["open"]
+                    engine.prev_close[sym]       = q["prev"]
+
+                    # Trigger signal check
+                    engine._check_signal(sym, ltp, vol, now_ist, "momentum")
+                    if sym in engine.signals:
+                        signalled += 1
+                        logger.info("10AM AUTO-SIGNAL: %s gap%.2f%% RVOL%.1fx",
+                                    sym, q["gap"], q["rvol"])
+                except Exception as e:
+                    logger.warning("10AM signal check failed for %s: %s", sym, e)
+
+            logger.info("10AM scan complete — %d signals queued", signalled)
+
+        except Exception as e:
+            logger.warning("10AM late scan failed: %s", e)
+
+    threading.Thread(target=_late_scan, daemon=True).start()
 
     def on_connect(ws, response):
         logger.info("Connected — %d tokens", len(tokens))
