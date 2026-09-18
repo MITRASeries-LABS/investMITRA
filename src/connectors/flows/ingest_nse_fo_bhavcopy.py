@@ -18,8 +18,8 @@ except Exception as e:
         import sys; sys.exit(0)
     raise
 from src.connectors.nse_fo_bhavcopy import NSEFOBhavCopyConnector
-    from src.transforms.lake_writer import write_to_lake
-    from src.quality.db_logger import log_pipeline_run
+from src.transforms.lake_writer import write_to_lake
+from src.quality.db_logger import log_pipeline_run
 
     date_str = os.getenv("TRADE_DATE", "")
     target_date = date.fromisoformat(date_str) if date_str else datetime.now(IST).date()
