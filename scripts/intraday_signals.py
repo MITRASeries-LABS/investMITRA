@@ -54,24 +54,22 @@ NEON_URL     = os.getenv("CC_POSTGRES_URL")
 IST          = timezone(timedelta(hours=5, minutes=30))
 
 # ── Risk Parameters ────────────────────────────────────────────────────────────
-MAX_RISK_PER_TRADE_INR  = 1500   # proportional to Rs10k ticket
-MAX_CAPITAL_PER_TRADE   = 10000  # max per trade (3 trades of Rs10k)
-MAX_CONCURRENT_TRADES   = 3      # max simultaneous positions
-MIN_PRIORITY_SCORE      = 3.0    # RVOL x gap x score/100 minimum
+MAX_RISK_PER_TRADE_INR  = 2000
+MAX_CAPITAL_PER_TRADE   = 25000
 MAX_DAILY_LOSS_INR      = 6000
 MAX_POSITIONS           = 3
 MAX_CONSECUTIVE_LOSSES  = 2
 ATR_STOP_MULT           = 1.5
-ATR_TARGET_MULT         = 3.0   # target at 3 ATR - 1:2 R:R
+ATR_TARGET_MULT         = 1.5
 BROKERAGE_PER_TRADE     = 80   # conservative fallback only
-MIN_NET_PROFIT          = 300  # minimum expected net
+MIN_NET_PROFIT          = 50   # lowered - filter by expected_net not fixed floor
 EXECUTION_MODE         = os.getenv("INVESTMITRA_EXECUTION_MODE", "auto_paper").lower()
 if EXECUTION_MODE != "auto_paper":
     raise ValueError("Two-week trial requires INVESTMITRA_EXECUTION_MODE=auto_paper; legacy paper/live modes are disabled")
 from order_manager import BUILD_ID, MIN_SIGNAL_GAP_PCT, MIN_FINAL_SCORE, entry_policy_rejection
 PAPER_TRADING          = EXECUTION_MODE != "live"  # Live also requires explicit adapter activation
 PAPER_MAX_POSITIONS     = 9     # Max positions in paper trading mode
-MAX_DAILY_CAPITAL_INR  = 35000  # Rs30k deployable + Rs5k reserve
+MAX_DAILY_CAPITAL_INR  = 25000  # Cumulative entry tickets per day; exits do not replenish it
 MIN_TICKET_INR         = 1000
 DESK_CAPITAL_INR       = MAX_DAILY_CAPITAL_INR  # No leverage or extra desk allocation
 
