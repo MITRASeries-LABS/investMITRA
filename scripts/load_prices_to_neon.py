@@ -257,7 +257,16 @@ def main():
             load_date(d)
         verify(); return
 
-    target = args.date or datetime.now(IST).date()
+    if args.date:
+        target = args.date
+    else:
+        # Pipeline runs late night IST ? use previous business day
+        now_ist = datetime.now(IST)
+        target = now_ist.date()
+        if now_ist.hour >= 23 or now_ist.hour < 6:
+            target = target - timedelta(days=1)
+        while target.weekday() >= 5:
+            target = target - timedelta(days=1)
     load_date(target)
     verify()
 
