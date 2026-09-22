@@ -195,7 +195,14 @@ def main():
     args = parser.parse_args()
     if args.date:    print(run_for_date(args.date))
     elif args.start: run_date_range(args.start, args.end or datetime.now(IST).date())
-    else:            print(run_for_date(datetime.now(IST).date()))
+    else:
+        now_ist = datetime.now(IST)
+        target = now_ist.date()
+        if now_ist.hour >= 23 or now_ist.hour < 6:
+            target = target - timedelta(days=1)
+        while target.weekday() >= 5:
+            target = target - timedelta(days=1)
+        print(run_for_date(target))
 
 if __name__ == "__main__":
     main()
