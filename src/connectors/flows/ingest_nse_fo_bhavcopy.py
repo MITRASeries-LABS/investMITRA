@@ -16,7 +16,19 @@ from src.quality.db_logger import log_pipeline_run
 
 def ingest_nse_fo_bhavcopy():
     date_str = os.getenv("TRADE_DATE", "")
-    target_date = date.fromisoformat(date_str) if date_str else datetime.now(IST).date()
+    if date_str:
+        target_date = date.fromisoformat(date_str)
+    else:
+        # Pipeline runs late night IST ? use previous business day
+        # After midnight IST means we want yesterday's market date
+        now_ist = datetime.now(IST)
+        target_date = now_ist.date()
+        # If running after 11PM IST, use previous day
+        if now_ist.hour >= 23 or now_ist.hour < 6:
+            target_date = target_date - timedelta(days=1)
+        # Skip weekends
+        while target_date.weekday() >= 5:
+            target_date = target_date - timedelta(days=1)
 
     if target_date.weekday() >= 5:
         logger.info("Weekend - no F&O data. Skipping.")
