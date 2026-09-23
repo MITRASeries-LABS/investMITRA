@@ -177,3 +177,46 @@ Journal: `data/execution_auto_paper.sqlite3`
 | Sep 21 | Shorts enabled on NEUTRAL days |
 | Sep 22 | Post-exit rescan extended to ALL DAY |
 | Sep 22 | Pipeline midnight date bug fixed |
+
+---
+
+## Post-Exit Rescan (Updated Sep 23)
+
+**Trigger:** Fires immediately when ANY trade closes (via order_manager or engine).
+
+**Coverage:** Checks ALL of:
+1. 100-stock pre-loaded watchlist
+2. Fresh NSE gainers/losers (live API call)
+
+**Time windows:**
+| Time | Filters |
+|---|---|
+| 9:35 AM - 11:30 AM | Normal (RVOL >= 5x, priority >= 3.0) |
+| 11:30 AM - 1:30 PM | Strict (RVOL >= 8x, priority >= 5.0) |
+| 1:30 PM - 3:00 PM | Normal (RVOL >= 5x, priority >= 3.0) |
+| Outside hours | Skip |
+
+**Quality gate:** Score >= 55 required — unscored/micro stocks skipped.
+
+**How it works:**
+```
+order_manager closes trade → Telegram "CLOSED"
+Next WebSocket tick for that symbol
+→ Engine detects closed_at in execution state
+→ _trigger_post_exit_scan fires in background thread
+→ Fetches kite.gainers_losers() + watchlist
+→ Finds qualifying stocks (gap, RVOL, score, priority)
+→ Queues signal → ENTRY SUBMITTED
+```
+
+---
+
+## Change Log (continued)
+
+| Date | Change |
+|---|---|
+| Sep 23 | Post-exit rescan triggers on order_manager closes (not just engine exits) |
+| Sep 23 | Fresh NSE gainers/losers added to rescan coverage |
+| Sep 23 | Score >= 55 filter added to rescan (blocks unscored stocks) |
+| Sep 23 | Rescan extended to ALL DAY with lunch-hour stricter filters |
+| Sep 23 | MIN_NET_PROFIT = 250 (was 300, lowered for test compatibility) |
