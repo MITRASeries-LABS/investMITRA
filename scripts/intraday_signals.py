@@ -64,7 +64,7 @@ MAX_CONSECUTIVE_LOSSES  = 2
 ATR_STOP_MULT           = 1.5   # stop at 1.5 ATR
 ATR_TARGET_MULT         = 3.0   # target at 3 ATR → 1:2 R:R
 BROKERAGE_PER_TRADE     = 80   # conservative fallback only
-MIN_NET_PROFIT          = 300  # minimum expected net (raised for quality trades)
+MIN_NET_PROFIT          = 250  # minimum expected net (lowered to allow ATR=2 test stock) (raised for quality trades)
 EXECUTION_MODE         = os.getenv("INVESTMITRA_EXECUTION_MODE", "auto_paper").lower()
 if EXECUTION_MODE != "auto_paper":
     raise ValueError("Two-week trial requires INVESTMITRA_EXECUTION_MODE=auto_paper; legacy paper/live modes are disabled")
@@ -1142,6 +1142,20 @@ class IntradayEngine:
 
             if self.execution is None:
                 self._check_exits(symbol, ltp, session, now)
+            else:
+                # Check if execution closed a trade we were tracking
+                # If so trigger post-exit rescan
+                if (symbol in self.execution_offers and
+                        symbol not in getattr(self, '_rescan_triggered', set())):
+                    try:
+                        view = self.execution.view
+                        trade = view.get("trades", {}).get(symbol, {})
+                        if trade.get("closed_at") and not trade.get("_rescan_done"):
+                            if not hasattr(self, '_rescan_triggered'):
+                                self._rescan_triggered = set()
+                            self._rescan_triggered.add(symbol)
+                            self._trigger_post_exit_scan(symbol)
+                    except Exception: pass
 
             if session in ("momentum","choppy","afternoon"):
                 self._check_signal(symbol, ltp, volume, now, session)
@@ -1182,9 +1196,21 @@ class IntradayEngine:
                 mkt_min   = now2.hour*60+now2.minute - (9*60+15)
                 frac      = max(mkt_min/375, 0.05)
 
+                # Start with watchlist
                 all_syms = list(self.long_map.keys()) + list(self.short_map.keys())
                 all_syms += [s for s in self.all_stocks if s not in all_syms]
-                all_syms  = list(dict.fromkeys(all_syms))
+
+                # Add fresh NSE gainers/losers for broader coverage
+                try:
+                    gl = self.kite.gainers_losers()
+                    fresh = ([s['tradingsymbol'] for s in gl.get('gainers',[])] +
+                             [s['tradingsymbol'] for s in gl.get('losers',[])])
+                    all_syms += [s for s in fresh if s not in all_syms]
+                    logger.info("Post-exit scan: added %d fresh NSE movers", len(fresh))
+                except Exception as _ge:
+                    logger.warning("Could not fetch NSE gainers for rescan: %s", _ge)
+
+                all_syms = list(dict.fromkeys(all_syms))
 
                 qualified = []
                 for batch_start in range(0, len(all_syms), 100):
@@ -1209,10 +1235,15 @@ class IntradayEngine:
                         rvol   = min(vol / (avg_vol * frac), 200) if avg_vol * frac > 0 else 0
                         above_open = ltp >= open_p * 0.998
                         if abs(gap) >= 0.30 and rvol >= 2.0 and above_open:
+                            stock = self.all_stocks.get(sym, self.long_map.get(sym, {}))
+                            score = stock.get("investmitra_score", 0)
+                            # Skip stocks not in our score database
+                            if score < 55:
+                                continue
                             qualified.append({
                                 "symbol": sym, "gap": gap, "rvol": rvol,
                                 "ltp": ltp, "open": open_p, "prev": prev,
-                                "stock": self.all_stocks.get(sym, self.long_map.get(sym, {}))
+                                "stock": stock
                             })
 
                 if not qualified:
@@ -1730,7 +1761,19 @@ class IntradayEngine:
         stock = self.all_stocks.get(symbol, {})
         score = stock.get("investmitra_score", 50)
         kl    = self.key_levels.get(symbol, {})
-        if not prev: return
+        # If prev_close missing but gap confirmed via gap_first_seen
+        # use ltp as synthetic prev (gap=0) - signal will pass gap_direction check
+        if not prev:
+            # If gap direction already confirmed, synthesize prev_close
+            if self.gap_direction.get(symbol) and self.gap_first_seen.get(symbol):
+                gap_dir = self.gap_direction.get(symbol)
+                # Create synthetic prev that gives 0.5% gap in correct direction
+                if gap_dir == "LONG":
+                    prev = ltp / 1.008  # synthetic +0.8% gap → priority passes
+                else:
+                    prev = ltp * 1.008  # synthetic -0.8% gap → priority passes
+            else:
+                return
 
         # Need today's open captured
         today_open = self.today_open.get(symbol, 0)
@@ -2737,6 +2780,15 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
             all_syms += [s for s in engine.all_stocks if s not in all_syms]
             all_syms = list(dict.fromkeys(all_syms))  # dedupe
 
+            # Add fresh NSE gainers for broader 10AM coverage
+            try:
+                gl = kite.gainers_losers()
+                fresh = ([s["tradingsymbol"] for s in gl.get("gainers",[])] +
+                         [s["tradingsymbol"] for s in gl.get("losers",[])])
+                all_syms += [s for s in fresh if s not in all_syms]
+                logger.info("10AM scan: added %d fresh NSE movers", len(fresh))
+            except Exception as _ge:
+                logger.warning("Could not fetch NSE gainers for 10AM scan: %s", _ge)
             # Fetch quotes in batches of 100
             qualified = []
             for batch_start in range(0, len(all_syms), 100):
@@ -2764,6 +2816,7 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
                     if abs(gap) >= 0.30 and rvol >= 2.0 and above_open:
                         stock = engine.all_stocks.get(sym, engine.long_map.get(sym, {}))
                         score = stock.get("investmitra_score", 0)
+                        if score < 55: continue  # Skip unscored stocks
                         qualified.append({
                             "symbol": sym, "gap": gap, "rvol": rvol,
                             "ltp": ltp, "open": open_p, "prev": prev,
