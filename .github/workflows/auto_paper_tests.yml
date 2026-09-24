@@ -18,13 +18,18 @@ permissions:
 
 jobs:
   offline-tests:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.12', '3.13']
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python }}
       - name: Check syntax
         run: python -m py_compile scripts/intraday_signals.py scripts/order_manager.py scripts/signal_runtime.py scripts/auto_paper_summary.py intraday_signals.py
       - name: Run offline lifecycle and review regressions

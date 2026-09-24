@@ -33,7 +33,7 @@ class ReviewFixTests(unittest.TestCase):
 
         self.ns = self.engine._check_signal.__globals__
         self.ns.update(datetime=Clock, time=time)
-        tree = ast.parse((Path(__file__).parent / 'scripts/intraday_signals.py').read_text())
+        tree = ast.parse((Path(__file__).parent / 'scripts/intraday_signals.py').read_text(encoding='utf-8'))
         funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef)
                  and n.name in {'classify_gap', 'load_fo_eligible_symbols', 'preflight_check'}]
         exec(compile(ast.Module(body=funcs, type_ignores=[]), 'review-fixtures', 'exec'), self.ns)
