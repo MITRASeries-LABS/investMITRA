@@ -11,6 +11,7 @@ class RateLimitedKite:
         self._interval = interval
         self._condition = threading.Condition()
         self._next_quote = 0.0
+        self._quote_in_flight = False
         self._execution_waiters = 0
 
     def __getattr__(self, name):
@@ -29,15 +30,23 @@ class RateLimitedKite:
             try:
                 while True:
                     delay = self._next_quote - time.monotonic()
-                    if delay <= 0 and (execution or not self._execution_waiters):
-                        self._next_quote = time.monotonic() + self._interval
+                    if not self._quote_in_flight and delay <= 0 and (execution or not self._execution_waiters):
+                        self._quote_in_flight = True
                         break
                     self._condition.wait(timeout=max(delay, 0.01))
             finally:
                 if execution:
                     self._execution_waiters -= 1
                 self._condition.notify_all()
-        return self._kite.quote(*args, **kwargs)
+        try:
+            return self._kite.quote(*args, **kwargs)
+        finally:
+            # Pace from completion: reserving a start time before releasing the
+            # lock lets a descheduled thread bunch requests with the next one.
+            with self._condition:
+                self._next_quote = time.monotonic() + self._interval
+                self._quote_in_flight = False
+                self._condition.notify_all()
 
 
 def previous_session(today, holidays):

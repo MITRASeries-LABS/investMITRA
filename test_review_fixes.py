@@ -462,6 +462,44 @@ class CalendarAndQuoteTests(unittest.TestCase):
         self.assertEqual(len(times),3)
         self.assertTrue(all(b-a >= .035 for a,b in zip(times,times[1:])))
 
+    def test_slow_quote_cannot_overlap_or_bunch_next_request(self):
+        entered = threading.Event()
+        release = threading.Event()
+        second = threading.Event()
+        timestamps = {}
+        def quote(symbols):
+            if symbols == ['NSE:A']:
+                entered.set()
+                release.wait(timeout=2)
+                timestamps['first_end'] = time.monotonic()
+            else:
+                timestamps['second_start'] = time.monotonic()
+                second.set()
+            return {}
+        client = RateLimitedKite(SimpleNamespace(quote=quote), interval=.04)
+        first = threading.Thread(target=client.quote, args=(['NSE:A'],))
+        next_call = threading.Thread(target=client.execution_quote, args=(['NSE:B'],))
+        first.start()
+        try:
+            self.assertTrue(entered.wait(timeout=2))
+            next_call.start()
+            self.assertFalse(second.wait(timeout=.12))
+        finally:
+            release.set()
+            first.join(timeout=2)
+            if next_call.ident is not None:
+                next_call.join(timeout=2)
+        self.assertTrue(second.is_set())
+        self.assertGreaterEqual(timestamps['second_start'] - timestamps['first_end'], .035)
+
+    def test_failed_quote_releases_pacing_slot(self):
+        underlying = Mock(side_effect=[ConnectionError('quote unavailable'), {}])
+        client = RateLimitedKite(SimpleNamespace(quote=underlying), interval=0)
+        with self.assertRaises(ConnectionError):
+            client.quote(['NSE:A'])
+        self.assertFalse(client._quote_in_flight)
+        self.assertEqual(client.execution_quote(['NSE:B']), {})
+
 
 if __name__=='__main__':
     unittest.main()

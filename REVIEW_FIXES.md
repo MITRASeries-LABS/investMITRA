@@ -14,6 +14,9 @@
   BEARISH-day routing and F&O eligibility requirements are retained.
 - The Rs10,000 executor ticket ceiling was already included in the first patch.
   Capital limits, scoring weights and paper-only mode are unchanged.
+- Windows CI exposed a quote-pacing race after a thread reserves its time slot.
+  Only one quote call now runs at a time and the spacing starts at completion,
+  including failed calls. Waiting execution requests retain priority over scans.
 
 This change addresses the code review of `5e10bac`. It does not enable live orders.
 `SIGNAL_ENGINE.md` remains unchanged as requested; this document records the actual
