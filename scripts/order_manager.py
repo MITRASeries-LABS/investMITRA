@@ -23,7 +23,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 logger = logging.getLogger(__name__)
 TERMINAL = {"COMPLETE", "CANCELLED", "REJECTED"}
 PREFIX = "IM3"
-BUILD_ID = "2026-09-24-review-fix1"
+BUILD_ID = "2026-09-24-feature-completion1"
 MIN_SIGNAL_GAP_PCT = 0.30
 MIN_FINAL_SCORE = 55.0
 
@@ -43,6 +43,14 @@ def entry_policy_rejection(signal):
             return f"blocked gap type: {gap_type}"
         if score < MIN_FINAL_SCORE:
             return f"blended score {score:.2f} below {MIN_FINAL_SCORE:.2f}"
+        if signal.get("direction") == "SHORT":
+            regime = signal["market_direction"]
+            if regime not in {"BULLISH", "BEARISH", "NEUTRAL"}:
+                return "missing or invalid market direction for short"
+            if regime == "NEUTRAL":
+                stock_score = float(signal["stock_score"])
+                if not math.isfinite(stock_score) or stock_score < 65:
+                    return "neutral-day short requires stock score >=65"
     except (KeyError, ValueError, TypeError):
         return "missing or invalid signal gate metadata"
     return None
@@ -511,8 +519,21 @@ class AutoOrderManager:
                      partial_done=False, exit_goal=0, exit_reason="", exit_attempts=0,
                      entry_at=None, closed_at=None, below_open_at=None)
         self.state["trades"][symbol] = trade
-        self._submit(trade, "ENTRY", qty, price=limit)
-        self.alerts(f"{self.broker.mode}: {symbol} ENTRY SUBMITTED {qty} shares, limit Rs{limit:.2f}; awaiting fill")
+        action = self._submit(trade, "ENTRY", qty, price=limit)
+        status = ("ENTRY SUBMITTED; awaiting fill" if action["status"] == "SUBMITTED"
+                  else "ENTRY STATUS UNKNOWN; awaiting reconciliation")
+        # One executor-owned entry message with final resized quantity. The
+        # durable alert deduplication also applies across journal restarts.
+        self.alerts(
+            f"{self.broker.mode}: {sig['direction']} SIGNAL - {symbol} [{sig.get('cap', '?')}]\n"
+            f"{status}\n"
+            f"Entry limit: Rs{limit:.2f} | Qty: {qty} shares\n"
+            f"Target: Rs{target:.2f} | Stop: Rs{stop:.2f}\n"
+            f"Gap: {float(sig['true_gap']):+.2f}% | RVOL: {sig['details'].get('rvol', 'n/a')}x\n"
+            f"Blended score: {float(sig['final_score']):.2f}\n"
+            f"Planned stop risk: Rs{qty*risk_per_share:.2f} before costs/slippage\n"
+            f"Session: {sig.get('session', 'n/a')} | Market: {sig.get('market_direction', 'n/a')}"
+        )
         # Do not accept another candidate against the same broker snapshot.
         self.ready = False
 

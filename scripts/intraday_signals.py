@@ -1856,7 +1856,9 @@ class IntradayEngine:
 
         final = quality * 0.40 + opp * 0.60
         rejection = entry_policy_rejection(dict(true_gap=true_gap_pct,
-            final_score=final, gap_threshold=gap_thresh, details=details))
+            final_score=final, gap_threshold=gap_thresh, details=details,
+            direction="SHORT" if true_gap_pct < 0 else "LONG",
+            market_direction=self.market_direction, stock_score=score))
         if rejection:
             self._reject_signal(symbol, rejection, now)
             return
@@ -2016,7 +2018,7 @@ class IntradayEngine:
         _entry_at = datetime.now(IST)
         _trade_id = f"{_entry_at.date().isoformat()}_{symbol}_{_entry_at.strftime('%H%M%S')}"
         candidate = dict(
-            symbol=symbol, direction=direction, entry=ltp,
+            symbol=symbol, direction=direction, entry=ltp, market_direction=self.market_direction,
             estimated_costs=trade_cost,
             signal_time=_entry_at,
             entry_at=_entry_at,
@@ -2031,7 +2033,7 @@ class IntradayEngine:
             expected_net=round(expected_net,0),
             minimum_net_screen=_min_net, profit_screen_fraction=0.5,
             session=session, time=now.strftime("%H:%M:%S"),
-            details=details, cap=stock.get("cap","?"),
+            details=details, cap=stock.get("cap", stock.get("market_cap_category", "?")),
             screens=stock.get("screen_count",0),
             piotroski=stock.get("piotroski",0),
             in_bulk=stock.get("in_bulk_deal",False),
