@@ -61,7 +61,7 @@ class ExecutionTests(unittest.TestCase):
     def tearDown(self):self.journal.close();self.tmp.cleanup()
     def make_manager(self):return AutoOrderManager(self.broker,self.journal,self.meta,clock=self.clock,alerts=self.alerts.append)
     def signal(self,symbol='A',qty=20,direction='LONG'):
-        return dict(symbol=symbol,entry=100,position_size=qty,direction=direction,stoploss=98 if direction=='LONG' else 102,target=120 if direction=='LONG' else 80,today_open=100,offered_at=self.now.timestamp(),entry_at=self.now, true_gap=1., final_score=75., details={'gap_type':'continuation'})
+        return dict(symbol=symbol,entry=100,position_size=qty,direction=direction,stoploss=98 if direction=='LONG' else 102,target=120 if direction=='LONG' else 80,today_open=100,offered_at=self.now.timestamp(),entry_at=self.now, true_gap=1., final_score=75., stock_score=75., market_direction='NEUTRAL', details={'gap_type':'continuation'})
     def enter(self,**kwargs):self.manager.offer(self.signal(**kwargs));self.manager.step();self.manager.step()
     def restart(self):
         self.journal.close();self.journal=Journal(self.path,'test','auto_paper');self.manager=self.make_manager();self.manager.step()

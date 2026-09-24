@@ -219,6 +219,92 @@ class ReviewFixTests(unittest.TestCase):
         self.engine._check_signal('A',100,1000,self.f.now,'momentum')
         self.assertTrue(self.f.manager.inbox.empty())
 
+    def test_neutral_short_floor_covers_dedicated_and_override_routes(self):
+        for score, override in ((40, False), (64, True)):
+            with self.subTest(score=score, override=override):
+                self.configure_short(score)
+                e = self.engine
+                stock = e.all_stocks['A']
+                stock['direction_override'] = 'SHORT' if override else None
+                e.long_map = {}
+                e.short_map = {'A': stock}
+                e._check_signal('A', 100, 1000, self.f.now, 'momentum')
+                self.assertTrue(self.f.manager.inbox.empty())
+                self.assertIn('stock score >=65', e.signal_rejections['A'][0])
+
+    def test_bearish_dedicated_short_route_is_preserved(self):
+        self.configure_short(40)
+        e = self.engine
+        e.market_direction = 'BEARISH'
+        e.short_map = {'A': e.all_stocks['A']}
+        e.long_map = {}
+        e._check_signal('A', 100, 1000, self.f.now, 'momentum')
+        sig = self.f.manager.inbox.get_nowait()
+        self.assertEqual(sig['direction'], 'SHORT')
+        self.assertEqual(sig['market_direction'], 'BEARISH')
+
+    def test_executor_blocks_neutral_short_bypass_and_missing_metadata(self):
+        for changes in ({'stock_score': 40}, {'stock_score': 64},
+                        {'stock_score': float('nan')}, {'stock_score': None},
+                        {'market_direction': None}):
+            with self.subTest(changes=changes):
+                sig = self.f.signal(direction='SHORT')
+                sig.update(changes)
+                self.f.manager.quotes = self.f.broker.quotes(['A'])
+                self.f.manager._accept(sig)
+                self.assertEqual(self.f.broker.book, [])
+        sig = self.f.signal(direction='SHORT')
+        del sig['market_direction']
+        self.f.manager.offer(sig)
+        self.f.manager.step()
+        self.assertEqual(self.f.broker.book, [])
+
+    def test_executor_accepts_neutral_short_score_65(self):
+        sig = self.f.signal(direction='SHORT')
+        sig['stock_score'] = 65
+        self.f.manager.offer(sig)
+        self.f.manager.step()
+        self.assertEqual(self.f.broker.book[0]['transaction_type'], 'SELL')
+
+    def test_signal_box_uses_resized_ticket_and_is_not_duplicated_on_restart(self):
+        sig = self.f.signal(qty=250)
+        sig.update(cap='SMALL', session='momentum')
+        sig['details']['rvol'] = 8.5
+        self.f.manager.offer(sig)
+        self.f.manager.step()
+        messages = [m for m in self.f.alerts if ' SIGNAL - ' in m]
+        self.assertEqual(len(messages), 1)
+        message = messages[0]
+        qty = self.f.broker.book[0]['quantity']
+        self.assertLess(qty, 250)
+        for fragment in ('LONG SIGNAL - A [SMALL]', 'ENTRY SUBMITTED; awaiting fill',
+                         f'Qty: {qty} shares', 'Entry limit: Rs100.10',
+                         'Target: Rs120.00', 'Stop: Rs98.00',
+                         'RVOL: 8.5x', 'Blended score: 75.00'):
+            self.assertIn(fragment, message)
+        self.assertEqual(sum('ENTRY SUBMITTED' in m for m in self.f.alerts), 1)
+        self.assertNotIn('Open Kite', message)
+        self.f.manager.step()
+        self.f.restart()
+        self.assertEqual(sum(' SIGNAL - ' in m for m in self.f.alerts), 1)
+
+    def test_rejected_signal_does_not_send_signal_box(self):
+        sig = self.f.signal()
+        sig['final_score'] = 50
+        self.f.manager.offer(sig)
+        self.f.manager.step()
+        self.assertFalse(any(' SIGNAL - ' in m for m in self.f.alerts))
+
+    def test_unknown_entry_signal_box_does_not_claim_submission_or_fill(self):
+        self.f.broker.throw_after = True
+        self.f.manager.offer(self.f.signal())
+        self.f.manager.step()
+        messages = [m for m in self.f.alerts if ' SIGNAL - ' in m]
+        self.assertEqual(len(messages), 1)
+        self.assertIn('ENTRY STATUS UNKNOWN; awaiting reconciliation', messages[0])
+        self.assertNotIn('ENTRY SUBMITTED', messages[0])
+        self.assertNotIn('FILLED', messages[0])
+
     def test_failed_fo_lookup_does_not_allow_shorts(self):
         self.ns.update(psycopg2=SimpleNamespace(connect=Mock(side_effect=ConnectionError())), NEON_URL='unused')
         self.assertEqual(self.ns['load_fo_eligible_symbols'](), frozenset())

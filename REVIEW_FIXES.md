@@ -1,5 +1,20 @@
 # September 24 automatic-paper review fixes
 
+## Follow-up: 25-feature checklist
+
+- The executor entry alert now includes direction, symbol/cap category, actual
+  resized quantity, entry limit, target, stop, gap, RVOL and blended score. It
+  replaces the terse entry-submission alert, so it is one executor-owned message.
+  Unknown submission outcomes are labelled pending reconciliation, never as fills.
+  Existing durable alert deduplication and separate fill/stop/exit alerts remain.
+- Every NEUTRAL-day short now requires stock score >=65, including the dedicated
+  low-score and direction-override routes. Both the engine and executor enforce
+  this rule. Short offers with missing market context are rejected. This uses the
+  underlying stock score; the separate blended-score >=55 gate still applies.
+  BEARISH-day routing and F&O eligibility requirements are retained.
+- The Rs10,000 executor ticket ceiling was already included in the first patch.
+  Capital limits, scoring weights and paper-only mode are unchanged.
+
 This change addresses the code review of `5e10bac`. It does not enable live orders.
 `SIGNAL_ENGINE.md` remains unchanged as requested; this document records the actual
 corrected behaviour and the remaining validation limits.
