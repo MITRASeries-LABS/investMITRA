@@ -7,6 +7,8 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
 from order_manager import AutoOrderManager, Journal, KiteBroker, PaperBroker, IST, tick_round, entry_policy_rejection, MIN_SIGNAL_GAP_PCT, MIN_FINAL_SCORE
 
 class FakeBroker:
@@ -59,7 +61,7 @@ class ExecutionTests(unittest.TestCase):
     def tearDown(self):self.journal.close();self.tmp.cleanup()
     def make_manager(self):return AutoOrderManager(self.broker,self.journal,self.meta,clock=self.clock,alerts=self.alerts.append)
     def signal(self,symbol='A',qty=20,direction='LONG'):
-        return dict(symbol=symbol,entry=100,position_size=qty,direction=direction,stoploss=98 if direction=='LONG' else 102,target=103,today_open=100,offered_at=self.now.timestamp(),entry_at=self.now, true_gap=1., final_score=75., details={'gap_type':'continuation'})
+        return dict(symbol=symbol,entry=100,position_size=qty,direction=direction,stoploss=98 if direction=='LONG' else 102,target=120 if direction=='LONG' else 80,today_open=100,offered_at=self.now.timestamp(),entry_at=self.now, true_gap=1., final_score=75., details={'gap_type':'continuation'})
     def enter(self,**kwargs):self.manager.offer(self.signal(**kwargs));self.manager.step();self.manager.step()
     def restart(self):
         self.journal.close();self.journal=Journal(self.path,'test','auto_paper');self.manager=self.make_manager();self.manager.step()
@@ -80,11 +82,13 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(len(self.broker.book),1);self.assertEqual(self.manager.snapshot()['net'],0)
         self.assertEqual(self.manager.snapshot()['remaining'],25000)
     def test_daily_budget_reserves_charges(self):
+        self.manager.max_ticket=25000
         self.enter(qty=250);self.assertLessEqual(self.manager._budget_used(),25000)
         self.assertLess(self.broker.book[0]['quantity'],250)
         self.manager.offer(self.signal('B'));self.manager.step();self.assertNotIn('B',self.manager.state['trades'])
     def test_minimum_ticket(self):self.enter(qty=9);self.assertEqual(self.broker.book,[])
     def test_short_budget_and_exit_direction(self):
+        self.manager.max_ticket=25000
         self.enter(qty=250,direction='SHORT');t=self.manager.state['trades']['A']
         self.assertEqual(t['reservation_price'],120);self.assertLessEqual(t['orders'][0]['qty']*120+80,25000)
         self.assertEqual(t['orders'][1]['params']['transaction_type'],'BUY')
@@ -150,10 +154,10 @@ class ExecutionTests(unittest.TestCase):
         self.enter();self.manager.state['trades']={};self.manager.step();self.assertFalse(self.manager.snapshot()['ready'])
     def _make_signal_engine(self):
         from collections import defaultdict
-        import logging
+        import logging, threading, math
         from datetime import date
-        tree=ast.parse(Path(__file__).with_name('intraday_signals.py').read_text(encoding='utf-8'))
-        ns=dict(datetime=datetime,date=date,IST=IST,defaultdict=defaultdict,logger=logging.getLogger('integration'),
+        tree=ast.parse((Path(__file__).parent / 'scripts' / 'intraday_signals.py').read_text(encoding='utf-8'))
+        ns=dict(datetime=datetime,date=date,IST=IST,defaultdict=defaultdict,threading=threading,math=math,BUILD_ID="test",logger=logging.getLogger('integration'),
                 EXECUTION_MODE='auto_paper',PAPER_TRADING=True, entry_policy_rejection=entry_policy_rejection, MIN_SIGNAL_GAP_PCT=MIN_SIGNAL_GAP_PCT, MIN_FINAL_SCORE=MIN_FINAL_SCORE)
         # Import only literals, arithmetic assignments and the actual pure
         # classes/functions; exclude all production imports and startup calls.
@@ -162,7 +166,7 @@ class ExecutionTests(unittest.TestCase):
                 try:exec(compile(ast.Module(body=[node],type_ignores=[]),'config','exec'),ns)
                 except NameError:pass
         selected=[n for n in tree.body if (isinstance(n,ast.ClassDef) and n.name in {'DailyRiskManager','IntradayEngine'})
-                  or (isinstance(n,ast.FunctionDef) and n.name=='estimate_costs')]
+                  or (isinstance(n,ast.FunctionDef) and n.name in {'estimate_costs', 'get_current_session'})]
         exec(compile(ast.Module(body=selected,type_ignores=[]),'engine','exec'),ns)
         stock=dict(symbol='A',investmitra_score=90,quality_score=90,market_cap_category='MID')
         engine=ns['IntradayEngine']([stock],[],{'A':1},{'A':98},'NEUTRAL',{'vix_signal':'CALM'},
@@ -228,7 +232,7 @@ class ExecutionTests(unittest.TestCase):
         e._check_exits('A',100,'closing',self.now)
         self.assertIn('A',e.risk.positions)
     def test_paper_and_live_modes_rejected_at_config(self):
-        tree=ast.parse(Path(__file__).with_name('intraday_signals.py').read_text(encoding='utf-8'))
+        tree=ast.parse((Path(__file__).parent / 'scripts' / 'intraday_signals.py').read_text(encoding='utf-8'))
         guard=next(n for n in tree.body if isinstance(n,ast.If) and ast.unparse(n.test)=="EXECUTION_MODE != 'auto_paper'")
         compiled=compile(ast.Module(body=[guard],type_ignores=[]),'mode','exec')
         for mode in ('paper','live'):
@@ -239,11 +243,11 @@ class ExecutionTests(unittest.TestCase):
         self.restart();self.manager.alerts('event-one')
         self.assertEqual(len([m for m in self.alerts if 'event-one' in m]),1)
     def test_engine_has_no_direct_telegram_sender(self):
-        src=Path(__file__).with_name('intraday_signals.py').read_text(encoding='utf-8')
+        src=(Path(__file__).parent / 'scripts' / 'intraday_signals.py').read_text(encoding='utf-8')
         self.assertNotIn('from order_manager import notify',src)
 
     def test_engine_candidate_routed_before_paper_mutation(self):
-        tree=ast.parse(Path(__file__).with_name('intraday_signals.py').read_text(encoding='utf-8'))
+        tree=ast.parse((Path(__file__).parent / 'scripts' / 'intraday_signals.py').read_text(encoding='utf-8'))
         cls=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='IntradayEngine')
         method=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='_check_signal')
         src=ast.unparse(method)
@@ -278,7 +282,7 @@ class ExecutionTests(unittest.TestCase):
         self.assertTrue(self.manager.snapshot()['flat'])
     def test_single_share_never_submits_zero_partial(self):
         self.broker.price=1200
-        sig=self.signal(qty=1);sig.update(entry=1200,stoploss=1190,target=1215,today_open=1200)
+        sig=self.signal(qty=1);sig.update(entry=1200,stoploss=1190,target=1240,today_open=1200)
         self.manager.offer(sig);self.manager.step();self.manager.step()
         self.broker.price=1215;self.manager.step()
         self.assertTrue(all(o['quantity']>0 for o in self.broker.book))

@@ -18,9 +18,10 @@ KEY CHANGES from v9:
   12. Pre-open equilibrium as gap conviction boost
 """
 from __future__ import annotations
-import os, sys, time, logging, requests
+import os, sys, time, logging, requests, threading, math, hashlib, json
 from datetime import datetime, date, timedelta, timezone
 from collections import defaultdict
+from signal_runtime import RateLimitedKite, load_nse_holidays, previous_session, freshness_errors
 import psycopg2
 from dotenv import load_dotenv
 load_dotenv('.env.prod')
@@ -64,14 +65,14 @@ MAX_CONSECUTIVE_LOSSES  = 2
 ATR_STOP_MULT           = 1.5   # stop at 1.5 ATR
 ATR_TARGET_MULT         = 3.0   # target at 3 ATR → 1:2 R:R
 BROKERAGE_PER_TRADE     = 80   # conservative fallback only
-MIN_NET_PROFIT          = 250  # minimum expected net (lowered to allow ATR=2 test stock) (raised for quality trades)
+MIN_NET_PROFIT          = 250  # conservative target-profit screen, not statistical expectancy
 EXECUTION_MODE         = os.getenv("INVESTMITRA_EXECUTION_MODE", "auto_paper").lower()
 if EXECUTION_MODE != "auto_paper":
     raise ValueError("Two-week trial requires INVESTMITRA_EXECUTION_MODE=auto_paper; legacy paper/live modes are disabled")
 from order_manager import BUILD_ID, MIN_SIGNAL_GAP_PCT, MIN_FINAL_SCORE, entry_policy_rejection
 PAPER_TRADING          = EXECUTION_MODE != "live"  # Live also requires explicit adapter activation
 PAPER_MAX_POSITIONS     = 9     # Max positions in paper trading mode
-MAX_DAILY_CAPITAL_INR  = 35000  # Rs30k deployable + Rs5k reserve
+MAX_DAILY_CAPITAL_INR  = 35000  # cumulative entry tickets + cost allowances; exits do not refill
 MIN_TICKET_INR         = 1000
 DESK_CAPITAL_INR       = MAX_DAILY_CAPITAL_INR  # No leverage or extra desk allocation
 
@@ -177,11 +178,32 @@ def load_signal_weights() -> dict:
         if row:
             import json
             w = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+            for key, value in w.items():
+                if key.endswith('_score') or key in ('sector_rs', 'gap_threshold_momentum',
+                                                      'gap_threshold_choppy', 'gap_threshold_afternoon'):
+                    if not isinstance(value, (float, int)) or not math.isfinite(value) or value < 0:
+                        raise ValueError('Invalid signal weight: ' + key)
             logger.info("Loaded signal weights effective %s", w.get("effective_date","?"))
             return w
     except Exception as e:
         logger.warning("Load weights failed: %s ? using defaults", e)
     return {}
+
+
+def load_fo_eligible_symbols():
+    conn = None
+    try:
+        conn = psycopg2.connect(NEON_URL, connect_timeout=5,
+                                options="-c statement_timeout=5000")
+        with conn.cursor() as cur:
+            cur.execute("SELECT symbol FROM investmitra.fo_stocks")
+            return frozenset(str(row[0]).strip().upper() for row in cur.fetchall() if row[0])
+    except Exception:
+        logger.error("F&O universe unavailable; short entries disabled", exc_info=True)
+        return frozenset()
+    finally:
+        if conn is not None:
+            conn.close()
 
 SECTOR_INDEX_MAP = {
     "Technology":         "NSE:NIFTY IT",
@@ -501,7 +523,7 @@ def get_nse_gainers_losers() -> tuple[list[str], list[str]]:
     """
     Fetch NSE top gainers and losers in real time.
     Returns (gainers, losers) symbol lists.
-    Free NSE API — no rate limit.
+    Best-effort NSE discovery; callers coalesce scans and pace Kite quotes.
     """
     import requests
     headers = {
@@ -573,8 +595,8 @@ def get_dynamic_gappers(kite, existing_symbols: set, ctx: dict) -> list[dict]:
             FROM investmitra.equity_prices ep
             JOIN investmitra.company_master cm ON ep.isin = cm.isin
             LEFT JOIN investmitra.daily_scores ds ON ep.isin = ds.isin
-                AND ds.score_date = (SELECT MAX(score_date) FROM investmitra.daily_scores)
-            WHERE ep.trade_date = (SELECT MAX(trade_date) FROM investmitra.equity_prices)
+                AND ds.score_date = (SELECT MAX(score_date) FROM investmitra.daily_scores WHERE score_date < CURRENT_DATE)
+            WHERE ep.trade_date = (SELECT MAX(trade_date) FROM investmitra.equity_prices WHERE trade_date < CURRENT_DATE)
               AND cm.nse_symbol IS NOT NULL
               AND ep.close BETWEEN 50 AND 20000
               AND ep.close * ep.volume >= 2000000
@@ -597,8 +619,8 @@ def get_dynamic_gappers(kite, existing_symbols: set, ctx: dict) -> list[dict]:
             FROM investmitra.equity_prices ep
             JOIN investmitra.company_master cm ON ep.isin = cm.isin
             LEFT JOIN investmitra.daily_scores ds ON ep.isin = ds.isin
-                AND ds.score_date = (SELECT MAX(score_date) FROM investmitra.daily_scores)
-            WHERE ep.trade_date = (SELECT MAX(trade_date) FROM investmitra.equity_prices)
+                AND ds.score_date = (SELECT MAX(score_date) FROM investmitra.daily_scores WHERE score_date < CURRENT_DATE)
+            WHERE ep.trade_date = (SELECT MAX(trade_date) FROM investmitra.equity_prices WHERE trade_date < CURRENT_DATE)
               AND cm.nse_symbol IS NOT NULL
               AND ep.close BETWEEN 50 AND 20000
         """)
@@ -608,7 +630,8 @@ def get_dynamic_gappers(kite, existing_symbols: set, ctx: dict) -> list[dict]:
         candidates = []
         for row in rows:
             sym = row[0]
-            if sym in existing_symbols or not sym: continue
+            if sym in existing_symbols or not sym or sym not in all_candidates: continue
+            if row[2] is None: continue  # never invent a score for a fresh mover
             candidates.append({
                 'symbol':              sym,
                 'market_cap_category': row[1] or 'MID',
@@ -629,6 +652,7 @@ def get_dynamic_gappers(kite, existing_symbols: set, ctx: dict) -> list[dict]:
             return []
 
         results_today = ctx.get('results_today', set())
+        rvol_baselines = get_rvol_baseline()
         dynamic_gappers = []
 
         for i in range(0, len(candidates), 50):
@@ -641,7 +665,7 @@ def get_dynamic_gappers(kite, existing_symbols: set, ctx: dict) -> list[dict]:
 
             for c in batch:
                 sym = c['symbol']
-                if sym in results_today: continue
+                if sym in results_today or sym in ctx.get("results_3days", set()): continue
                 q      = quotes.get(f"NSE:{sym}", {})
                 ohlc   = q.get("ohlc", {})
                 open_p = float(ohlc.get("open", 0))
@@ -651,14 +675,12 @@ def get_dynamic_gappers(kite, existing_symbols: set, ctx: dict) -> list[dict]:
                 if not open_p or not prev or not ltp: continue
 
                 gap_pct = (open_p - prev) / prev * 100
-                avg_vol = c['avg_vol'] or 100000
-
-                from datetime import datetime, timezone, timedelta
-                _ist   = timezone(timedelta(hours=5, minutes=30))
-                _early = datetime.now(_ist).hour < 10
-                if _early: avg_vol *= 0.4
-
-                gap_type, _ = classify_gap(gap_pct, vol, avg_vol)
+                avg_daily = rvol_baselines.get(sym, 0)
+                if avg_daily <= 0:
+                    continue
+                scan_now = datetime.now(IST)
+                fraction = max((scan_now.hour * 60 + scan_now.minute - 555) / 375, .05)
+                gap_type, _ = classify_gap(gap_pct, vol, avg_daily * fraction)
                 cap    = c['market_cap_category']
                 thresh = GAP_THRESHOLDS.get('momentum', 0.30)
                 if cap in ('MICRO','SMALL'): thresh *= 0.7
@@ -795,7 +817,7 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
                    WHERE signal_date=(SELECT MAX(signal_date) FROM investmitra.screener_signals)
                    GROUP BY isin) ss ON ds.isin=ss.isin
         LEFT JOIN investmitra.value_quality vq ON ds.isin=vq.isin
-        WHERE ds.score_date=(SELECT MAX(score_date) FROM investmitra.daily_scores)
+        WHERE ds.score_date=(SELECT MAX(score_date) FROM investmitra.daily_scores WHERE score_date < CURRENT_DATE)
           AND cm.nse_symbol IS NOT NULL
                     AND cm.market_cap_category IN ('MID','LARGE','SMALL','MICRO')
           -- All cap categories included
@@ -894,8 +916,8 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
             FROM investmitra.equity_prices ep
             JOIN investmitra.company_master cm ON ep.isin = cm.isin
             LEFT JOIN investmitra.daily_scores ds ON ep.isin = ds.isin
-                AND ds.score_date = (SELECT MAX(score_date) FROM investmitra.daily_scores)
-            WHERE ep.trade_date = (SELECT MAX(trade_date) FROM investmitra.equity_prices)
+                AND ds.score_date = (SELECT MAX(score_date) FROM investmitra.daily_scores WHERE score_date < CURRENT_DATE)
+            WHERE ep.trade_date = (SELECT MAX(trade_date) FROM investmitra.equity_prices WHERE trade_date < CURRENT_DATE)
               AND ep.close BETWEEN 50 AND 20000
               AND ep.volume * ep.close >= %s
               AND cm.nse_symbol IS NOT NULL
@@ -1099,8 +1121,24 @@ class IntradayEngine:
         self.execution        = None
         self.execution_offers = {}
         self.signal_rejections = {}
+        self._state_lock = threading.RLock()
+        self._scan_stop = threading.Event()
+        self._rescan_requested = threading.Event()
+        self._closed_seen = set()
+        self._scan_lock = threading.Lock()
+        self.signal_weights = {}
+        self.fo_eligible_symbols = frozenset()
+        self.strategy_id = BUILD_ID
+        self.ticker = None
+        self.instrument_tokens = {}
+        self._last_tick_at = {}
+
 
     def on_tick(self, ws, ticks):
+        with self._state_lock:
+            self._on_tick_locked(ws, ticks)
+
+    def _on_tick_locked(self, ws, ticks):
         now     = datetime.now(IST)
         session = get_current_session(now)
         for tick in ticks:
@@ -1112,10 +1150,26 @@ class IntradayEngine:
             if ltp <= 0: continue
 
             # Capture today's open
-            if session in ("opening","momentum") and not self.open_captured[symbol]:
+            if not self.open_captured[symbol]:
                 ohlc_open = tick.get("ohlc", {}).get("open", 0)
-                self.today_open[symbol] = ohlc_open if ohlc_open > 0 else ltp
-                self.open_captured[symbol] = True
+                if ohlc_open > 0:
+                    self.today_open[symbol] = ohlc_open
+                    self.open_captured[symbol] = True
+            prev = tick.get("ohlc", {}).get("close", 0)
+            if prev > 0:
+                self.prev_close[symbol] = prev
+            previous_tick = self._last_tick_at.get(symbol)
+            if previous_tick and (now - previous_tick).total_seconds() > 60:
+                self.gap_first_seen.pop(symbol, None)
+            self._last_tick_at[symbol] = now
+
+            observed_prev = self.prev_close.get(symbol, 0)
+            observed_open = self.today_open.get(symbol, 0)
+            if observed_prev and observed_open:
+                confirms = ((observed_open > observed_prev and ltp > observed_prev * 1.001)
+                            or (observed_open < observed_prev and ltp < observed_prev * .999))
+                if not confirms:
+                    self.gap_first_seen.pop(symbol, None)
 
             # VWAP - use average traded price from tick if available
             avg_traded_price = tick.get("average_traded_price", 0)
@@ -1142,150 +1196,130 @@ class IntradayEngine:
 
             if self.execution is None:
                 self._check_exits(symbol, ltp, session, now)
-            else:
-                # Check if execution closed a trade we were tracking
-                # If so trigger post-exit rescan
-                if (symbol in self.execution_offers and
-                        symbol not in getattr(self, '_rescan_triggered', set())):
-                    try:
-                        view = self.execution.view
-                        trade = view.get("trades", {}).get(symbol, {})
-                        if trade.get("closed_at") and not trade.get("_rescan_done"):
-                            if not hasattr(self, '_rescan_triggered'):
-                                self._rescan_triggered = set()
-                            self._rescan_triggered.add(symbol)
-                            self._trigger_post_exit_scan(symbol)
-                    except Exception: pass
-
             if session in ("momentum","choppy","afternoon"):
                 self._check_signal(symbol, ltp, volume, now, session)
 
     def _trigger_post_exit_scan(self, closed_symbol):
-        """
-        After a position closes, scan for new qualifying stocks.
-        Runs in background thread — restores budget and finds fresh signals.
-        Only runs during momentum/afternoon sessions (not choppy).
-        """
-        import threading, time as _time
+        # Coalesce multiple closes; cumulative daily capital is never refunded.
+        self._rescan_requested.set()
 
-        def _scan():
-            _time.sleep(5)  # brief pause for budget to restore
-            now_ist = datetime.now(IST)
-            hour    = now_ist.hour
-            minute  = now_ist.minute
+    def _poll_closed_trades(self):
+        if self.execution is None:
+            return
+        closed = {symbol for symbol, trade in self.execution.snapshot().get("trades", {}).items()
+                  if trade.get("closed_at") and trade["orders"][0].get("filled", 0)}
+        if closed - self._closed_seen:
+            self._rescan_requested.set()
+        self._closed_seen.update(closed)
 
-            # Only scan during active sessions
-            # Dynamic session check — allow entry if momentum still building
-            # Hard blocks: before 9:35 AM and after 3:00 PM
-            if hour < 9 or (hour == 9 and minute < 35) or hour >= 15:
-                logger.info("Post-exit scan skipped — outside trading hours")
-                return
-
-            # Skip lunch hour ONLY if no strong momentum
-            # Strong momentum = NIFTY advancing + broad breadth
-            in_lunch = (hour == 11 and minute >= 30) or hour == 12 or (hour == 13 and minute < 30)
-            if in_lunch:
-                # Still scan but require higher quality threshold
-                logger.info("Post-exit scan in lunch hour — using stricter filters")
-                # Will use priority >= 5.0 and RVOL >= 8x in lunch hour
-
-            logger.info("Post-exit scan triggered after %s closed", closed_symbol)
-            try:
-                rvol_base = get_rvol_baseline()
-                now2      = datetime.now(IST)
-                mkt_min   = now2.hour*60+now2.minute - (9*60+15)
-                frac      = max(mkt_min/375, 0.05)
-
-                # Start with watchlist
-                all_syms = list(self.long_map.keys()) + list(self.short_map.keys())
-                all_syms += [s for s in self.all_stocks if s not in all_syms]
-
-                # Add fresh NSE gainers/losers for broader coverage
-                try:
-                    gl = self.kite.gainers_losers()
-                    fresh = ([s['tradingsymbol'] for s in gl.get('gainers',[])] +
-                             [s['tradingsymbol'] for s in gl.get('losers',[])])
-                    all_syms += [s for s in fresh if s not in all_syms]
-                    logger.info("Post-exit scan: added %d fresh NSE movers", len(fresh))
-                except Exception as _ge:
-                    logger.warning("Could not fetch NSE gainers for rescan: %s", _ge)
-
-                all_syms = list(dict.fromkeys(all_syms))
-
-                qualified = []
-                for batch_start in range(0, len(all_syms), 100):
-                    batch = all_syms[batch_start:batch_start+100]
-                    try:
-                        quotes = self.kite.quote([f"NSE:{s}" for s in batch])
-                    except Exception as e:
-                        logger.warning("Post-exit quote batch failed: %s", e)
+    def _scan_market(self, reason):
+        """One scan at a time. Network work stays outside the engine state lock."""
+        if not self._scan_lock.acquire(blocking=False):
+            self._rescan_requested.set()
+            return 0
+        try:
+            now = datetime.now(IST)
+            first_minute = 571 if reason == "morning" else 575
+            if not (first_minute <= now.hour * 60 + now.minute < 900):
+                return 0
+            view = self.execution.snapshot()
+            if not view.get("ready") or view.get("remaining", 0) < MIN_TICKET_INR:
+                return None
+            with self._state_lock:
+                existing = set(self.all_stocks)
+            new_stocks = get_dynamic_gappers(self.kite, existing, self.ctx)
+            new_symbols = [stock["symbol"] for stock in new_stocks]
+            levels = get_key_levels(new_symbols) if new_symbols else {}
+            baselines = get_rvol_baseline() if new_symbols else {}
+            new_tokens = []
+            with self._state_lock:
+                self.key_levels.update(levels)
+                self.rvol_baseline.update(baselines)
+                for stock in new_stocks:
+                    symbol = stock["symbol"]
+                    token = self.instrument_tokens.get(symbol)
+                    if not token or symbol not in levels or not self.rvol_baseline.get(symbol):
                         continue
-                    for sym in batch:
-                        if sym in self.traded_today: continue
-                        if sym in self.signals: continue
-                        q      = quotes.get(f"NSE:{sym}", {})
-                        ohlc   = q.get("ohlc", {})
-                        prev   = float(ohlc.get("close", 0))
-                        open_p = float(ohlc.get("open", 0))
-                        ltp    = float(q.get("last_price", 0))
-                        vol    = int(q.get("volume", 0))
-                        if not prev or not open_p or ltp <= 0: continue
-                        gap    = (open_p - prev) / prev * 100
-                        avg_vol = rvol_base.get(sym, 0)
-                        rvol   = min(vol / (avg_vol * frac), 200) if avg_vol * frac > 0 else 0
-                        above_open = ltp >= open_p * 0.998
-                        if abs(gap) >= 0.30 and rvol >= 2.0 and above_open:
-                            stock = self.all_stocks.get(sym, self.long_map.get(sym, {}))
-                            score = stock.get("investmitra_score", 0)
-                            # Skip stocks not in our score database
-                            if score < 55:
-                                continue
-                            qualified.append({
-                                "symbol": sym, "gap": gap, "rvol": rvol,
-                                "ltp": ltp, "open": open_p, "prev": prev,
-                                "stock": stock
-                            })
+                    self.all_stocks[symbol] = stock
+                    if self.market_direction == "BEARISH":
+                        self.short_map[symbol] = dict(stock, direction_override="SHORT")
+                        self.all_stocks[symbol] = self.short_map[symbol]
+                    else:
+                        self.long_map[symbol] = stock
+                    self.token_map[symbol] = token
+                    self.rev_tokens[token] = symbol
+                    new_tokens.append(token)
+                symbols = list(self.all_stocks)
+            if new_tokens and self.ticker is not None:
+                try:
+                    self.ticker.subscribe(new_tokens)
+                    self.ticker.set_mode(self.ticker.MODE_FULL, new_tokens)
+                except Exception:
+                    logger.warning("Rescan subscriptions unavailable; retry on reconnect", exc_info=True)
+            queued = 0
+            for offset in range(0, len(symbols), 100):
+                if self._scan_stop.is_set():
+                    break
+                batch = symbols[offset:offset + 100]
+                try:
+                    quotes = self.kite.quote(["NSE:" + symbol for symbol in batch])
+                except Exception:
+                    logger.warning("%s quote batch unavailable", reason, exc_info=True)
+                    continue
+                queued += self._process_scan_quotes(quotes)
+            logger.info("%s scan complete: %d candidates queued (not confirmed fills)", reason, queued)
+            return queued
+        finally:
+            self._scan_lock.release()
 
-                if not qualified:
-                    logger.info("Post-exit scan — no qualifiers found")
-                    return
+    def _process_scan_quotes(self, quotes):
+        """Feed each fresh quote through the same observed-hold and session gates."""
+        queued = 0
+        for instrument, quote in quotes.items():
+            symbol = instrument.removeprefix("NSE:")
+            # The executor also rechecks freshness; do not manufacture a quote timestamp.
+            if not self.execution._fresh(quote):
+                continue
+            with self._state_lock:
+                token = self.token_map.get(symbol)
+                if token is None:
+                    continue
+                before = self.execution_offers.get(symbol)
+                tick = dict(quote, instrument_token=token,
+                            volume_traded=quote.get("volume", 0))
+                self._on_tick_locked(self.ticker, [tick])
+                queued += self.execution_offers.get(symbol) != before
+        return queued
 
-                # Apply stricter filter during lunch hour
-                if in_lunch:
-                    qualified = [q for q in qualified 
-                                 if q["rvol"] >= 8.0 and 
-                                 q["rvol"] * abs(q["gap"]) * (q.get("score",55)/100) >= 5.0]
-                    logger.info("Lunch hour — stricter filter: %d remaining", len(qualified))
-
-                qualified.sort(key=lambda x: x["rvol"], reverse=True)
-                logger.info("Post-exit scan — %d qualified: %s", len(qualified),
-                            ", ".join(f"{q['symbol']} gap{q['gap']:+.2f}% RVOL{q['rvol']:.1f}x"
-                                      for q in qualified[:5]))
-
-                signalled = 0
-                import datetime as _dt
-                for q in qualified[:5]:  # max 5 new signals post-exit
-                    sym = q["symbol"]
+    def _maintenance_loop(self):
+        """Observe closes without WebSocket ticks and serialize all scheduled scans."""
+        done = set()
+        last_scan = 0.0
+        self._closed_seen = {symbol for symbol, trade in self.execution.snapshot().get("trades", {}).items()
+                             if trade.get("closed_at")}
+        while not self._scan_stop.is_set():
+            try:
+                self._poll_closed_trades()
+                now = datetime.now(IST)
+                minute = now.hour * 60 + now.minute
+                due = next((name for name, at in (("morning", 571), ("10 AM", 600))
+                            if minute >= at and name not in done), None)
+                requested = self._rescan_requested.is_set()
+                if 571 <= minute < 900 and (due or (requested and minute >= 575)) and time.monotonic() - last_scan >= 30:
+                    self._rescan_requested.clear()
+                    last_scan = time.monotonic()
                     try:
-                        if sym not in self.all_stocks and q["stock"]:
-                            self.all_stocks[sym] = q["stock"]
-                        # Gap confirmed since open (>30 min ago)
-                        self.gap_first_seen[sym] = now2 - _dt.timedelta(minutes=10)
-                        self.gap_direction[sym]  = "LONG" if q["gap"] > 0 else "SHORT"
-                        self.today_open[sym]     = q["open"]
-                        self.prev_close[sym]     = q["prev"]
-                        self._check_signal(sym, q["ltp"], 0, now2, "momentum")
-                        if sym in self.signals:
-                            signalled += 1
-                            logger.info("Post-exit AUTO-SIGNAL: %s", sym)
-                    except Exception as e:
-                        logger.warning("Post-exit signal failed for %s: %s", sym, e)
-
-                logger.info("Post-exit scan complete — %d new signals", signalled)
-            except Exception as e:
-                logger.warning("Post-exit scan error: %s", e)
-
-        threading.Thread(target=_scan, daemon=True).start()
+                        result = self._scan_market(due or "post-exit")
+                    except Exception:
+                        self._rescan_requested.set()
+                        raise
+                    if result is None:
+                        self._rescan_requested.set()
+                    elif due:
+                        done.add(due)
+            except Exception:
+                logger.warning("Signal maintenance failed; execution worker remains independent", exc_info=True)
+            self._scan_stop.wait(2)
 
     def _record_exit(self, symbol, exit_price, outcome):
         """Record exit details, persist closed state, save trade immediately."""
@@ -1301,7 +1335,7 @@ class IntradayEngine:
             pos = self.risk.positions.get(symbol, {})
             sig["entry_at"] = pos.get("signal_time", now_ist)
 
-        # Trigger post-exit rescan to find new signals with freed budget
+        # Trigger post-exit rescan; daily entry allocations remain spent
         try:
             self._trigger_post_exit_scan(symbol)
         except Exception: pass
@@ -1606,7 +1640,9 @@ class IntradayEngine:
         nifty_data = self.breadth.get("NIFTY 50", {})
         nifty_chg  = nifty_data.get("pct_change", 0)
         stock_chg  = true_gap_pct
-        if stock_chg > sector_chg > nifty_chg and true_gap_pct > 0: sector_rs = 90
+        sign = 1 if true_gap_pct > 0 else -1
+        stock_chg, sector_chg, nifty_chg = (value * sign for value in (stock_chg, sector_chg, nifty_chg))
+        if stock_chg > sector_chg > nifty_chg: sector_rs = 90
         elif stock_chg > sector_chg:                                  sector_rs = 70
         elif stock_chg > nifty_chg:                                   sector_rs = 55
         else:                                                          sector_rs = 35
@@ -1616,32 +1652,33 @@ class IntradayEngine:
         high_52w = kl.get("high_52w", 0); low_52w = kl.get("low_52w", 0)
         kl_score = 50
         if ma20 and ma50:
-            if ltp > ma20 and ltp > ma50: kl_score = 70
-            elif ltp > ma20:              kl_score = 55
+            if (ltp - ma20) * sign > 0 and (ltp - ma50) * sign > 0: kl_score = 70
+            elif (ltp - ma20) * sign > 0:              kl_score = 55
             else:                         kl_score = 30
         # 52-week high breakout bonus
-        if high_52w and ltp >= high_52w * 0.99:
+        if sign > 0 and high_52w and ltp >= high_52w * 0.99:
             kl_score += 20  # Near 52-week high = breakout potential
         # 52-week low bounce bonus for shorts
-        if low_52w and ltp <= low_52w * 1.01:
+        if sign < 0 and low_52w and ltp <= low_52w * 1.01:
             kl_score += 15
 
         # Breadth
         adv = nifty_data.get("advances", 0); dec = nifty_data.get("declines", 0)
-        ad_ratio = adv / dec if dec > 0 else 1.0
-        breadth_score = min(ad_ratio/3.0*100, 100) if true_gap_pct>0 and ad_ratio>1 else 30
+        favourable, opposing = (adv, dec) if sign > 0 else (dec, adv)
+        ad_ratio = favourable / max(opposing, 1) if favourable + opposing else 1.0
+        breadth_score = min(ad_ratio / 3.0 * 100, 100) if ad_ratio > 1 else 30
 
         # ORB
         orb_score = 0
         if self.or_set.get(symbol):
             or_range = or_h - or_l
             if or_range > 0 and or_l < float('inf'):
-                if ltp > or_h:   orb_score = min((ltp-or_h)/or_range*100, 100)
-                elif ltp < or_l: orb_score = min((or_l-ltp)/or_range*100, 100)
+                if sign > 0 and ltp > or_h:   orb_score = min((ltp-or_h)/or_range*100, 100)
+                elif sign < 0 and ltp < or_l: orb_score = min((or_l-ltp)/or_range*100, 100)
 
         # Sentiment
         sent = self.sentiment.get(symbol, 0)
-        sent_score = 80 if sent>0.3 else 20 if sent<-0.3 else 50
+        sent_score = 80 if sent * sign > 0.3 else 20 if sent * sign < -0.3 else 50
 
         # Bulk deal bonus
         bulk_score = 70 if stock.get("in_bulk_deal") else 50
@@ -1655,23 +1692,15 @@ class IntradayEngine:
         preopen_gap   = stock.get("preopen_gap", 0)
         preopen_score = 80 if abs(preopen_gap)>0.5 else 60 if abs(preopen_gap)>0.2 else 40
 
-        vwap_score  = 80 if ltp > vwap else 20
+        vwap_score  = 80 if (ltp - vwap) * sign > 0 else 20
         rvol_score  = min((rvol-1)/3.0*100, 100) if rvol > 1 else 0
         gap_score   = min(abs(true_gap_pct)/2.0, 1.0) * 100 * gap_mult
-        regime_score= 70 if self.market_direction=="BULLISH" else 30 if self.market_direction=="BEARISH" else 50
+        regime = 1 if self.market_direction == "BULLISH" else -1 if self.market_direction == "BEARISH" else 0
+        regime_score = 50 + 20 * regime * sign
         sess_mult   = {"momentum":1.0,"choppy":0.7,"afternoon":0.85}.get(session, 0.5)
 
-        # Load Opus weights
-        try:
-            import json as _j
-            _conn = psycopg2.connect(NEON_URL, connect_timeout=5)
-            _cur  = _conn.cursor()
-            _cur.execute("SELECT weights FROM investmitra.signal_weights WHERE effective_date<=CURRENT_DATE ORDER BY effective_date DESC LIMIT 1")
-            _row  = _cur.fetchone()
-            _cur.close(); _conn.close()
-            _w = _row[0] if isinstance(_row[0], dict) else _j.loads(_row[0]) if _row else {}
-        except:
-            _w = {}
+        # Frozen at startup; no database I/O or mid-session parameter changes.
+        _w = self.signal_weights
 
         opp = (
             gap_score     * _w.get("gap_score",     0.15) +
@@ -1694,8 +1723,8 @@ class IntradayEngine:
             "vwap_score": vwap_score, "orb_score": round(orb_score,1),
             "holding_score": holding_score, "preopen_score": preopen_score,
             "sector_rs": round(sector_rs,1), "breadth": round(breadth_score,1),
-            "kl_score": kl_score, "sector_chg": round(sector_chg,2),
-            "stock_vs_sector": round(stock_chg-sector_chg,2),
+            "kl_score": kl_score, "sector_chg": round(sector_chg*sign,2),
+            "stock_vs_sector": round((stock_chg-sector_chg)*sign,2),
             "sentiment": round(sent,2), "bulk_deal": stock.get("in_bulk_deal",False),
             "today_open": round(today_open,2), "52w_high": round(high_52w,2),
         }
@@ -1708,6 +1737,9 @@ class IntradayEngine:
             self.signal_rejections[symbol] = (reason, now)
 
     def _check_signal(self, symbol, ltp, volume, now, session):
+        session = get_current_session(now)
+        if session not in ("momentum", "choppy", "afternoon"):
+            return
         if self.execution is None:
             self._entry_blocked = True
             self._reject_signal(symbol, "automatic executor missing; no legacy fallback", now)
@@ -1761,33 +1793,10 @@ class IntradayEngine:
         stock = self.all_stocks.get(symbol, {})
         score = stock.get("investmitra_score", 50)
         kl    = self.key_levels.get(symbol, {})
-        # If prev_close missing but gap confirmed via gap_first_seen
-        # use ltp as synthetic prev (gap=0) - signal will pass gap_direction check
-        if not prev:
-            # If gap direction already confirmed, synthesize prev_close
-            if self.gap_direction.get(symbol) and self.gap_first_seen.get(symbol):
-                gap_dir = self.gap_direction.get(symbol)
-                # Create synthetic prev that gives 0.5% gap in correct direction
-                if gap_dir == "LONG":
-                    prev = ltp / 1.008  # synthetic +0.8% gap → priority passes
-                else:
-                    prev = ltp * 1.008  # synthetic -0.8% gap → priority passes
-            else:
-                return
-
-        # Need today's open captured
         today_open = self.today_open.get(symbol, 0)
-        if today_open == 0:
-            # Fallback: fetch open from Kite quote
-            try:
-                q = self.kite.quote([f"NSE:{symbol}"])
-                today_open = float(q.get(f"NSE:{symbol}", {}).get("ohlc", {}).get("open", 0))
-                if today_open > 0:
-                    self.today_open[symbol] = today_open
-                else:
-                    return
-            except:
-                return
+        if not prev or not today_open:
+            self._reject_signal(symbol, "missing observed open/previous close", now)
+            return
 
         # TRUE GAP
         true_gap_pct = (today_open - prev) / prev * 100
@@ -1796,7 +1805,7 @@ class IntradayEngine:
         gap_thresh = max(MIN_SIGNAL_GAP_PCT, GAP_THRESHOLDS.get(session, 0.4))
         if self.vix_signal == "ELEVATED": gap_thresh *= 1.5
 
-        if abs(true_gap_pct) > gap_thresh:
+        if abs(true_gap_pct) >= gap_thresh:
             # Check live price still confirms gap direction
             gap_is_long = true_gap_pct > 0
             live_confirms = (gap_is_long and ltp > prev * 1.001) or                            (not gap_is_long and ltp < prev * 0.999)
@@ -1836,6 +1845,9 @@ class IntradayEngine:
                 del self.gap_first_seen[symbol]
             return
 
+        if now.hour * 60 + now.minute < 575:
+            return
+
         above_vwap = ltp > vwap * 1.001
         below_vwap = ltp < vwap * 0.999
 
@@ -1852,6 +1864,8 @@ class IntradayEngine:
         # fade_risk: only allow if RVOL > 2.5x AND quality > 65
         # Otherwise skip — Sonnet confirmed fade_risk consistently loses
         if details["gap_type"] == "fade_risk":
+            if self.signal_weights.get("skip_fade_risk"):
+                return
             if details["rvol"] < 2.5 or quality < 65:
                 logger.debug("Skip %s — fade_risk with weak RVOL %.1fx", symbol, details["rvol"])
                 return
@@ -1859,20 +1873,9 @@ class IntradayEngine:
         final = quality * 0.40 + opp * 0.60
         if final < MIN_FINAL_SCORE: return
 
-        # Check market breadth for bearish bias
-        breadth     = getattr(self, "ctx", {}).get("breadth", {})
-        ad_ratio    = breadth.get("adv_ratio", 1.0) if isinstance(breadth, dict) else 1.0
-        weak_market = ad_ratio < 0.3 or self.market_direction == "BEARISH"
-
         direction = None
 
-        # Minimum quality filters (Sonnet recommendation)
-        min_rvol = 5.0   # Minimum RVOL for quality trades (₹10k budget)
-        tier = stock.get("tier", 1)
-        if tier == 2: min_rvol = 3.0  # dynamic scan stocks slightly lower
-        tier = stock.get('tier', 1)
-        if tier == 2:
-            min_rvol = 3.0
+        min_rvol = 8.0 if session == "choppy" else 5.0
 
         # Calculate time-adjusted RVOL (matches _compute_opportunity_score)
         avg_vol_check = self.rvol_baseline.get(symbol, 0)
@@ -1887,7 +1890,7 @@ class IntradayEngine:
         # LONG: quality stock gapping up in neutral/bullish market
         if (symbol in self.long_map and
                 self.market_direction in ("BULLISH","NEUTRAL") and
-                true_gap_pct > gap_thresh and
+                true_gap_pct >= gap_thresh and
                 ltp >= today_open * 0.998 and
                 above_vwap and
                 score >= (55 if stock.get("market_cap_category","MID") in ("MICRO","SMALL") else 60)):
@@ -1897,7 +1900,7 @@ class IntradayEngine:
         elif (symbol in self.short_map and
                 stock.get("direction_override") != "SHORT" and  # not a quality short
                 self.market_direction in ("BEARISH","NEUTRAL") and
-                true_gap_pct < -gap_thresh and
+                true_gap_pct <= -gap_thresh and
                 ltp <= today_open * 1.002 and
                 below_vwap and score <= 40):
             direction = "SHORT"
@@ -1906,28 +1909,32 @@ class IntradayEngine:
         # These are quality stocks moved to short list by main() on bearish days
         elif (symbol in self.short_map and
                 stock.get("direction_override") == "SHORT" and
-                true_gap_pct < -gap_thresh and
+                true_gap_pct <= -gap_thresh and
                 ltp <= today_open * 1.002 and
                 below_vwap and score >= 55 and
                 self._is_fo_eligible(symbol)):
             direction = "SHORT"
             logger.info("Quality SHORT: %s gap %.2f%% (bearish day F&O)", symbol, true_gap_pct)
 
-        # SHORT Option 3: HIGH QUALITY stock gapping DOWN on weak/bearish day (long_map)
+        # SHORT Option 3: quality F&O stock gapping down on a neutral/bearish day
         elif (symbol in self.long_map and
-                weak_market and
-                true_gap_pct < -gap_thresh and
+                self.market_direction in ("BEARISH", "NEUTRAL") and
+                true_gap_pct <= -gap_thresh and
                 ltp <= today_open * 1.002 and
-                below_vwap and score >= 55 and
-                self._is_fo_eligible(symbol) and
-                abs(true_gap_pct) > 0.5):
+                below_vwap and score >= 65 and
+                self._is_fo_eligible(symbol)):
             direction = "SHORT"
             logger.info("Bearish SHORT: %s gap %.2f%% (F&O eligible)", symbol, true_gap_pct)
 
         if not direction: return
+        if direction == "SHORT" and not self._is_fo_eligible(symbol):
+            return
 
-        # ATR from 14-day daily range
-        atr = kl.get("atr14", 0) or kl.get("daily_range", 0) or ltp * 0.01
+        # Stops require an observed ATR; do not fabricate volatility from price.
+        atr = float(kl.get("atr14", 0) or 0)
+        if not math.isfinite(atr) or atr <= 0:
+            self._reject_signal(symbol, "missing valid ATR", now)
+            return
 
         stop   = round(ltp - atr*ATR_STOP_MULT, 2) if direction=="LONG" else round(ltp + atr*ATR_STOP_MULT, 2)
         target = round(ltp + atr*ATR_TARGET_MULT, 2) if direction=="LONG" else round(ltp - atr*ATR_TARGET_MULT, 2)
@@ -1973,6 +1980,7 @@ class IntradayEngine:
         trade_cost   = estimate_costs(ltp, size, target)
         if round(ticket_value + trade_cost, 2) > self.risk.daily_budget_remaining:
             return
+        # A conservative target-profit screen, not an estimated probability of winning.
         expected_net = (abs(target - ltp) * size * 0.5) - trade_cost
         # Minimum: expected net must exceed MIN_NET_PROFIT and 2x trade costs
         _min_net = max(MIN_NET_PROFIT, trade_cost * 2)
@@ -2006,7 +2014,7 @@ class IntradayEngine:
             return
 
         _entry_at = datetime.now(IST)
-        _trade_id = f"{date.today().isoformat()}_{symbol}_{_entry_at.strftime('%H%M%S')}"
+        _trade_id = f"{_entry_at.date().isoformat()}_{symbol}_{_entry_at.strftime('%H%M%S')}"
         candidate = dict(
             symbol=symbol, direction=direction, entry=ltp,
             estimated_costs=trade_cost,
@@ -2014,12 +2022,14 @@ class IntradayEngine:
             entry_at=_entry_at,
             trade_id=_trade_id,
             target=target, stoploss=stop, atr=round(atr,2),
-            true_gap=round(true_gap_pct,2), today_open=today_open,
+            true_gap=true_gap_pct, today_open=today_open,
+            strategy_id=self.strategy_id, signal_weights=dict(self.signal_weights),
             vwap=vwap, final_score=final,
             quality_score=quality, opp_score=opp, stock_score=score, gap_threshold=gap_thresh,
             position_size=size, stop_dist=round(stop_dist,2),
             risk_inr=round(stop_dist*size,0),
             expected_net=round(expected_net,0),
+            minimum_net_screen=_min_net, profit_screen_fraction=0.5,
             session=session, time=now.strftime("%H:%M:%S"),
             details=details, cap=stock.get("cap","?"),
             screens=stock.get("screen_count",0),
@@ -2040,13 +2050,14 @@ class IntradayEngine:
             logger.debug("Skip %s — max %d concurrent trades reached",
                          symbol, MAX_CONCURRENT_TRADES)
             return
-        if _priority < MIN_PRIORITY_SCORE:
+        required_priority = max(MIN_PRIORITY_SCORE, 5.0) if session == "choppy" else MIN_PRIORITY_SCORE
+        if _priority < required_priority:
             logger.info("PRIORITY REJECT %s: score %.3f below %.3f (RVOL%.1fx gap%.2f%% score%.0f)",
-                        symbol, _priority, MIN_PRIORITY_SCORE, _rvol, _gap_abs, final)
+                        symbol, _priority, required_priority, _rvol, _gap_abs, final)
             return
 
         _rr = abs(target - ltp) / abs(ltp - stop) if abs(ltp - stop) > 0 else 0
-        logger.info("Signal accepted: %s priority=%.2f RVOL%.1fx gap%.2f%% score%.0f R:R=1:%.1f net=Rs%.0f",
+        logger.info("Signal accepted: %s priority=%.2f RVOL%.1fx gap%.2f%% score%.0f target/stop=%.1f target-screen=Rs%.0f",
                     symbol, _priority, _rvol, _gap_abs, final, _rr, expected_net)
 
         if self.execution is not None:
@@ -2152,16 +2163,8 @@ class IntradayEngine:
         print(f"{'='*65}\n")
 
     def _is_fo_eligible(self, symbol: str) -> bool:
-        """Check if stock is F&O eligible (can be shorted intraday)."""
-        try:
-            conn = psycopg2.connect(NEON_URL, connect_timeout=5)
-            cur  = conn.cursor()
-            cur.execute("SELECT 1 FROM investmitra.fo_stocks WHERE symbol=%s", (symbol,))
-            result = cur.fetchone() is not None
-            cur.close(); conn.close()
-            return result
-        except:
-            return True  # Default allow if DB check fails
+        """Strategy universe restriction, frozen at startup; missing data rejects."""
+        return symbol in self.fo_eligible_symbols
 
     def _save_trades_to_neon(self):
         """Auto-save all signals and exits to Neon trade_log."""
@@ -2463,24 +2466,31 @@ def preflight_check() -> bool:
             subprocess.run(["python", "scripts/fetch_global_sentiment.py"], timeout=60)
         except: pass
 
-    # 2. Neon connection + data freshness
+    # 2. Require the prior exchange session, not merely any rows in 30 days.
+    conn = None
     try:
-        conn = psycopg2.connect(NEON_URL, connect_timeout=5)
-        cur  = conn.cursor()
-        cur.execute("SELECT MAX(score_date) FROM investmitra.daily_scores")
-        score_date = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM investmitra.equity_prices WHERE trade_date >= CURRENT_DATE - INTERVAL '30 days'")
-        price_rows = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM investmitra.market_indices WHERE fetch_date = CURRENT_DATE")
-        indices_today = cur.fetchone()[0]
-        conn.close()
-        fresh = score_date and (date.today() - score_date).days <= 3
-        print(f"  {'✅' if fresh else '⚠️ '} Scores: latest {score_date} {'(fresh)' if fresh else '(stale — check pipeline)'}")
-        print(f"  {'✅' if price_rows > 10000 else '⚠️ '} Price data: {price_rows:,} rows")
-        print(f"  {'✅' if indices_today > 0 else '⚠️ '} Market indices: {'fetched today' if indices_today > 0 else 'NOT fetched today'}")
+        today = datetime.now(IST).date()
+        expected = previous_session(today, load_nse_holidays(today))
+        conn = psycopg2.connect(NEON_URL, connect_timeout=5,
+                                options="-c statement_timeout=5000")
+        with conn.cursor() as cur:
+            cur.execute("SELECT MAX(score_date) FROM investmitra.daily_scores WHERE score_date < %s", (today,))
+            score_date = cur.fetchone()[0]
+            cur.execute("SELECT MAX(trade_date), COUNT(*) FROM investmitra.equity_prices "
+                        "WHERE trade_date >= %s AND trade_date < %s", (today - timedelta(days=30), today))
+            price_date, price_rows = cur.fetchone()
+            cur.execute("SELECT COUNT(*) FROM investmitra.market_indices WHERE fetch_date = %s", (today,))
+            indices_today = cur.fetchone()[0]
+        errors = freshness_errors(today, expected, score_date, price_date, indices_today, price_rows)
+        for error in errors:
+            logger.error("Preflight blocked: %s", error)
+        all_ok = all_ok and not errors
     except Exception as e:
-        print(f"  ❌ Neon connection failed: {e}")
+        logger.error("Calendar/data validation unavailable; entries blocked: %s", e)
         all_ok = False
+    finally:
+        if conn is not None:
+            conn.close()
 
     # 3. kiteconnect library
     try:
@@ -2572,11 +2582,6 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
     rvol_baseline         = get_rvol_baseline()
     long_list, short_list = get_intraday_watchlist(ctx)
 
-    # On weak breadth days ? allow quality stocks to go SHORT too
-    breadth = ctx.get("breadth", {})
-    adv_ratio = breadth.get("adv_ratio", 1.0) if isinstance(breadth, dict) else 1.0
-    weak_market = adv_ratio < 0.3 or market_direction == "BEARISH"
-
     if market_direction == "BULLISH":
         short_list = []
     elif market_direction == "BEARISH":
@@ -2629,7 +2634,7 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
                 atr = kl.get("atr14", 0)
                 print(f"  {s['symbol']:<13} {s.get('cap', s.get('market_cap_category','?')):<7} {s['quality_score']:>5.1f} {s['investmitra_score']:>6.1f} ATR:{atr:.1f}")
     print(f"\n  Capturing opens 9:15-9:30 → gap hold 5min → signals 9:35+")
-    print(f"  Exits: partial@1R | trail | reversal | dead@45min | 3PM")
+    print(f"  Exits: partial@1R | remainder@target/trail | reversal | dead@40min | 3PM")
     print(f"{'='*65}\n")
 
     tokens = list(token_map.values())
@@ -2637,6 +2642,15 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
                             market_direction, ctx, rvol_baseline,
                             key_levels, sector_quotes, sentiment)
     engine.kite = kite
+    engine.signal_weights = dict(weights)
+    engine.strategy_id = BUILD_ID + ":" + hashlib.sha256(json.dumps({
+        "weights": weights, "gap_thresholds": GAP_THRESHOLDS,
+        "daily_cap": MAX_DAILY_CAPITAL_INR, "max_ticket": MAX_CAPITAL_PER_TRADE,
+        "max_risk": MAX_RISK_PER_TRADE_INR, "min_profit": MIN_NET_PROFIT,
+        "priority": MIN_PRIORITY_SCORE, "stop_atr": ATR_STOP_MULT, "target_atr": ATR_TARGET_MULT,
+    }, sort_keys=True).encode()).hexdigest()[:12]
+    engine.fo_eligible_symbols = load_fo_eligible_symbols()
+    logger.info("Frozen strategy configuration: %s", engine.strategy_id)
 
     # The automatic executor has its own fill ledger. Never mix its actual
     # order state with the legacy paper engine_positions/trade_log snapshots.
@@ -2683,195 +2697,12 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
             logger.info("If this is a fresh session with no open positions, "
                         "manually set engine._entry_blocked = False to resume.")
 
-    # Dynamic gap scan ? runs once after WebSocket stable
-    import threading
-    _dynamic_done = [False]
-    def _dynamic_scan():
-        import time as _time
-        # Wait 60 seconds for WebSocket to fully stabilize
-        _time.sleep(60)
-        # Then wait until after 9:30 AM
-        while True:
-            now = datetime.now(IST)
-            if now.hour > 9 or (now.hour == 9 and now.minute >= 30):
-                break
-            _time.sleep(10)
-        if _dynamic_done[0]: return
-        _dynamic_done[0] = True
-
-        existing = set(engine.all_stocks.keys())
-        new_gappers = get_dynamic_gappers(kite, existing, ctx)
-
-        if new_gappers:
-            # Add to engine watchlist
-            for g in new_gappers:
-                g['direction'] = 'LONG' if g.get('gap_pct',0) > 0 else 'SHORT'
-                engine.long_map[g['symbol']] = g
-                engine.all_stocks[g['symbol']] = g
-                # Also add to short_map if bearish gap
-                if g.get('gap_pct',0) < 0:
-                    engine.short_map[g['symbol']] = g
-
-            # Subscribe new tokens
-            new_tokens = []
-            for g in new_gappers:
-                try:
-                    instr = kite.ltp([f"NSE:{g['symbol']}"])
-                    for k,v in instr.items():
-                        tok = v.get('instrument_token')
-                        if tok:
-                            engine.token_map[g['symbol']] = tok
-                            engine.rev_tokens[tok] = g['symbol']
-                            new_tokens.append(tok)
-                except: pass
-
-            if new_tokens:
-                logger.info("Subscribing %d dynamic gapper tokens", len(new_tokens))
-                import time as _t
-                _t.sleep(2)  # Wait for WebSocket stability
-                try:
-                    ticker.subscribe(new_tokens)
-                    ticker.set_mode(ticker.MODE_FULL, new_tokens)
-                    _t.sleep(1)
-                except Exception as e:
-                    logger.warning("Token subscribe failed: %s", e)
-
-            # Pre-populate opens for dynamic stocks immediately
-            dynamic_syms = [g["symbol"] for g in new_gappers]
-            try:
-                dyn_quotes = kite.quote([f"NSE:{s}" for s in dynamic_syms])
-                for g in new_gappers:
-                    sym = g["symbol"]
-                    q   = dyn_quotes.get(f"NSE:{sym}", {})
-                    open_p = float(q.get("ohlc", {}).get("open", 0))
-                    prev_c = float(q.get("ohlc", {}).get("close", 0))
-                    if open_p > 0:
-                        engine.today_open[sym] = open_p
-                        engine.prev_close[sym] = prev_c
-                        logger.info("Pre-populated open: %s @ %.2f", sym, open_p)
-            except Exception as e:
-                logger.warning("Pre-populate opens: %s", e)
-            print(f"\n  🔍 Dynamic scan: {len(new_gappers)} new gappers added")
-            for g in new_gappers:
-                print(f"     {g['symbol']}: gap {g.get('gap_pct',0):+.2f}%")
-
-    threading.Thread(target=_dynamic_scan, daemon=True).start()
-
-    # Second scan at 10:00 AM — catches stocks with RVOL that built up after open
-    # AUTO-SIGNALS qualifying stocks directly into the executor
-    def _late_scan():
-        import time as _time
-        # Wait until 10:00 AM
-        while True:
-            now = datetime.now(IST)
-            if now.hour > 10 or (now.hour == 10 and now.minute >= 0):
-                break
-            _time.sleep(15)
-        _time.sleep(30)  # Give WebSocket time to settle
-        logger.info("10 AM late scan — checking RVOL-qualified stocks")
-        try:
-            rvol_base   = get_rvol_baseline()
-            now_ist     = datetime.now(IST)
-            mkt_min     = now_ist.hour*60+now_ist.minute - (9*60+15)
-            frac        = max(mkt_min/375, 0.05)
-
-            all_syms = list(engine.long_map.keys()) + list(engine.short_map.keys())
-            # Also include dynamic scan stocks
-            all_syms += [s for s in engine.all_stocks if s not in all_syms]
-            all_syms = list(dict.fromkeys(all_syms))  # dedupe
-
-            # Add fresh NSE gainers for broader 10AM coverage
-            try:
-                gl = kite.gainers_losers()
-                fresh = ([s["tradingsymbol"] for s in gl.get("gainers",[])] +
-                         [s["tradingsymbol"] for s in gl.get("losers",[])])
-                all_syms += [s for s in fresh if s not in all_syms]
-                logger.info("10AM scan: added %d fresh NSE movers", len(fresh))
-            except Exception as _ge:
-                logger.warning("Could not fetch NSE gainers for 10AM scan: %s", _ge)
-            # Fetch quotes in batches of 100
-            qualified = []
-            for batch_start in range(0, len(all_syms), 100):
-                batch = all_syms[batch_start:batch_start+100]
-                try:
-                    quotes = kite.quote([f"NSE:{s}" for s in batch])
-                except Exception as e:
-                    logger.warning("10AM quote batch failed: %s", e)
-                    continue
-                for sym in batch:
-                    if sym in engine.traded_today: continue
-                    if sym in engine.signals: continue  # already in a trade
-                    q      = quotes.get(f"NSE:{sym}", {})
-                    ohlc   = q.get("ohlc", {})
-                    prev   = float(ohlc.get("close", 0))
-                    open_p = float(ohlc.get("open", 0))
-                    ltp    = float(q.get("last_price", 0))
-                    vol    = int(q.get("volume", 0))
-                    if not prev or not open_p or ltp <= 0: continue
-                    gap    = (open_p - prev) / prev * 100
-                    avg_vol = rvol_base.get(sym, 0)
-                    rvol   = min(vol / (avg_vol * frac), 200) if avg_vol * frac > 0 else 0
-                    # Must be above open (not fading)
-                    above_open = ltp >= open_p * 0.998
-                    if abs(gap) >= 0.30 and rvol >= 2.0 and above_open:
-                        stock = engine.all_stocks.get(sym, engine.long_map.get(sym, {}))
-                        score = stock.get("investmitra_score", 0)
-                        if score < 55: continue  # Skip unscored stocks
-                        qualified.append({
-                            "symbol": sym, "gap": gap, "rvol": rvol,
-                            "ltp": ltp, "open": open_p, "prev": prev,
-                            "score": score, "stock": stock
-                        })
-
-            if not qualified:
-                logger.info("10AM scan — no additional qualifiers")
-                return
-
-            # Sort by RVOL (strongest first)
-            qualified.sort(key=lambda x: x["rvol"], reverse=True)
-            logger.info("10AM scan — %d qualified: %s", len(qualified),
-                        ", ".join(f"{q['symbol']} gap{q['gap']:+.2f}% RVOL{q['rvol']:.1f}x"
-                                  for q in qualified[:10]))
-
-            # Feed each qualified stock as a tick to _check_signal
-            # This triggers the normal signal pipeline including budget checks
-            signalled = 0
-            for q in qualified:
-                sym   = q["symbol"]
-                ltp   = q["ltp"]
-                vol_q = 0  # volume already checked — pass 0 to avoid re-check
-                try:
-                    # Ensure stock is in all_stocks for _check_signal
-                    if sym not in engine.all_stocks and q["stock"]:
-                        engine.all_stocks[sym] = q["stock"]
-
-                    # Set gap_first_seen so 5-min hold is bypassed
-                    # (gap has been holding since open — >45 min already confirmed)
-                    engine.gap_first_seen[sym]  = now_ist - __import__('datetime').timedelta(minutes=10)
-                    engine.gap_direction[sym]   = "LONG" if q["gap"] > 0 else "SHORT"
-                    engine.today_open[sym]       = q["open"]
-                    engine.prev_close[sym]       = q["prev"]
-
-                    # Trigger signal check
-                    engine._check_signal(sym, ltp, vol, now_ist, "momentum")
-                    if sym in engine.signals:
-                        signalled += 1
-                        logger.info("10AM AUTO-SIGNAL: %s gap%.2f%% RVOL%.1fx",
-                                    sym, q["gap"], q["rvol"])
-                except Exception as e:
-                    logger.warning("10AM signal check failed for %s: %s", sym, e)
-
-            logger.info("10AM scan complete — %d signals queued", signalled)
-
-        except Exception as e:
-            logger.warning("10AM late scan failed: %s", e)
-
-    threading.Thread(target=_late_scan, daemon=True).start()
-
     def on_connect(ws, response):
         logger.info("Connected — %d tokens", len(tokens))
-        ws.subscribe(tokens)
-        ws.set_mode(ws.MODE_FULL, tokens)
+        with engine._state_lock:
+            current_tokens = list(engine.token_map.values())
+        ws.subscribe(current_tokens)
+        ws.set_mode(ws.MODE_FULL, current_tokens)
         # Subscribe tokens for positions restored after restart
         # Entries stay blocked until ALL restored positions are monitored
         restored = getattr(engine, "_restored_symbols", [])
@@ -2954,7 +2785,12 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
 
     logger.info("Live — 9:15 open capture → 9:35+ signals")
     try:
+        engine.ticker = ticker
+        engine.instrument_tokens = {i["tradingsymbol"]: i["instrument_token"] for i in instruments
+                                    if i.get("segment") == "NSE"}
         ticker.connect(threaded=True)
+        maintenance = threading.Thread(target=engine._maintenance_loop, daemon=True)
+        maintenance.start()
         while True:
             now = datetime.now(IST)
             if engine.execution is not None:
@@ -2987,6 +2823,12 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
             execution_worker.join(timeout=10)
         engine.print_summary()
 
+    finally:
+        engine._scan_stop.set()
+        if "maintenance" in locals():
+            maintenance.join(timeout=15)
+        ticker.close()
+
 
 def main():
     from pathlib import Path
@@ -2996,12 +2838,12 @@ def main():
         raise SystemExit("Run scripts/kite_login.py first")
     from order_manager import build_executor
     import threading, time
-    kite = KiteConnect(api_key=API_KEY)
+    kite = RateLimitedKite(KiteConnect(api_key=API_KEY))
     kite.set_access_token(ACCESS_TOKEN)
     instruments = kite.instruments("NSE")
     execution = build_executor(
         kite, instruments, EXECUTION_MODE, daily_cap=MAX_DAILY_CAPITAL_INR,
-        min_ticket=MIN_TICKET_INR, max_risk=MAX_RISK_PER_TRADE_INR,
+        min_ticket=MIN_TICKET_INR, max_ticket=MAX_CAPITAL_PER_TRADE, max_risk=MAX_RISK_PER_TRADE_INR,
         max_daily_loss=MAX_DAILY_LOSS_INR, max_positions=MAX_POSITIONS,
         max_losses=MAX_CONSECUTIVE_LOSSES)
     execution.step()
