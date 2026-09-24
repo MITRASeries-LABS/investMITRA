@@ -23,7 +23,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 logger = logging.getLogger(__name__)
 TERMINAL = {"COMPLETE", "CANCELLED", "REJECTED"}
 PREFIX = "IM3"
-BUILD_ID = "2026-09-11-trial-fix1"
+BUILD_ID = "2026-09-24-review-fix1"
 MIN_SIGNAL_GAP_PCT = 0.30
 MIN_FINAL_SCORE = 55.0
 
@@ -146,7 +146,8 @@ class KiteBroker:
 
     def orders(self): return self.kite.orders()
     def positions(self): return self.kite.positions()["net"]
-    def quotes(self, symbols): return self.kite.quote(["NSE:" + s for s in symbols])
+    def quotes(self, symbols):
+        return getattr(self.kite, "execution_quote", self.kite.quote)(["NSE:" + s for s in symbols])
     def place(self, params): return self.kite.place_order(**params)
     def cancel(self, order_id): return self.kite.cancel_order(variety="regular", order_id=order_id)
     def modify(self, order_id, **params):
@@ -173,7 +174,7 @@ class PaperBroker:
                                    (json.dumps(self.book),))
 
     def quotes(self, symbols):
-        quotes = self.kite.quote(["NSE:" + s for s in symbols])
+        quotes = getattr(self.kite, "execution_quote", self.kite.quote)(["NSE:" + s for s in symbols])
         self.last.update(quotes)
         for order in self.book:
             self._match(order)
@@ -229,13 +230,14 @@ class PaperBroker:
 class AutoOrderManager:
     """Serial execution state machine. All public broker work runs in step()."""
     def __init__(self, broker, journal, instruments, *, daily_cap=25000,
-                 min_ticket=1000, cost_reserve=80, max_risk=2000,
+                 min_ticket=1000, cost_reserve=80, max_risk=2000, max_ticket=10000,
                  max_daily_loss=6000, max_positions=3, max_losses=2,
                  clock=lambda: datetime.now(IST), alerts=async_notify):
         self.broker, self.journal, self.state = broker, journal, journal.state
         self.meta = {i["tradingsymbol"]: i for i in instruments
                      if i.get("exchange", "NSE") == "NSE" and i.get("segment") == "NSE"}
         self.daily_cap, self.min_ticket, self.cost_reserve = daily_cap, min_ticket, cost_reserve
+        self.max_ticket = max_ticket
         self.max_risk, self.max_daily_loss = max_risk, max_daily_loss
         self.max_positions, self.max_losses = max_positions, max_losses
         self.clock, self._deliver_alert = clock, alerts
@@ -260,6 +262,10 @@ class AutoOrderManager:
             if isinstance(broker, PaperBroker):
                 broker.book = []; broker._save()
         self.state["day"] = today
+        self.state["limits"] = dict(daily_cap=daily_cap, min_ticket=min_ticket, max_ticket=max_ticket,
+                                    cost_reserve=cost_reserve, max_risk=max_risk,
+                                    max_daily_loss=max_daily_loss, max_positions=max_positions,
+                                    max_losses=max_losses)
         self.journal.save()
 
     def alerts(self, message):
@@ -341,6 +347,7 @@ class AutoOrderManager:
                              tickets=sum(self._filled(t)*self._entry_price(t) for t in trades.values()),
                              gross=gross, costs=costs, net=gross-costs, losses=losses,
                              exposure=exposure, flat=self.ready and all(not self._remaining(t) and not self._active(t) for t in trades.values()),
+                             limits=dict(self.state["limits"]),
                              mode=self.broker.mode, account=self.state["account"], day=self.state["day"])
 
     def _fresh(self, quote):
@@ -453,7 +460,7 @@ class AutoOrderManager:
 
     def _accept(self, sig):
         now = self.clock()
-        if not self.ready or self.state["halt"] or self.state["flatten"] or not (570 <= now.hour*60+now.minute < 900): return
+        if not self.ready or self.state["halt"] or self.state["flatten"] or not (575 <= now.hour*60+now.minute < 900): return
         if self._protection_pending(): return
         rejection = entry_policy_rejection(sig)
         if rejection:
@@ -470,6 +477,8 @@ class AutoOrderManager:
         view = self.snapshot()
         count = sum(bool(self._remaining(t) or self._active(t)) for t in self.state["trades"].values())
         if count >= self.max_positions or view.get("losses", 0) >= self.max_losses: return
+        if sig.get("direction") not in ("LONG", "SHORT"):
+            return
         sign = 1 if sig["direction"] == "LONG" else -1
         ltp, tick = float(quote["last_price"]), float(self.meta[symbol]["tick_size"])
         if abs(ltp / float(sig["entry"]) - 1) > 0.003: return  # no chasing stale signals
@@ -479,17 +488,25 @@ class AutoOrderManager:
         reserve_price = limit if sign > 0 else float(quote.get("upper_circuit_limit") or 0)
         if reserve_price < limit: return
         stop = tick_round(float(sig["stoploss"]), tick, sign > 0)
+        target = float(sig.get("target") or 0)
+        if not math.isfinite(target) or target <= 0 or sign * (target - limit) <= 0:
+            return
         if sign * (limit - stop) <= 0: return
         risk_per_share = abs(reserve_price - stop) if sign > 0 else abs(stop - limit)
         remaining = self.daily_cap - self._budget_used() - self.cost_reserve
         qty = min(int(sig["position_size"]), int(remaining / reserve_price),
+                  int(Decimal(str(self.max_ticket)) / Decimal(str(reserve_price))),
                   int(self.max_risk / risk_per_share))
         if qty <= 0 or qty * limit < self.min_ticket: return
+        if sig.get("minimum_net_screen") is not None:
+            screened_net = (target - limit) * sign * qty * float(sig.get("profit_screen_fraction", .5)) - float(sig["estimated_costs"])
+            if screened_net < float(sig["minimum_net_screen"]):
+                return
         open_risk = sum(max(0, (self._entry_price(t)-t["stop"])*t["sign"]) * self._remaining(t)
                         for t in self.state["trades"].values())
         if view.get("net", 0) - open_risk - qty*risk_per_share - self.cost_reserve <= -self.max_daily_loss: return
         if sign > 0 and qty*limit + self.cost_reserve > self.daily_cap + min(0,view.get("net",0))-view.get("exposure",0): return
-        trade = dict(symbol=symbol, sign=sign, signal=copy.deepcopy(sig), orders=[],
+        trade = dict(symbol=symbol, sign=sign, signal=copy.deepcopy(sig), target=target, orders=[],
                      reservation_price=reserve_price, stop=stop, initial_risk=None,
                      partial_done=False, exit_goal=0, exit_reason="", exit_attempts=0,
                      entry_at=None, closed_at=None, below_open_at=None)
@@ -528,6 +545,9 @@ class AutoOrderManager:
         if self.state["flatten"]:
             self._goal(t, qty, "SQUAREOFF")
         elif fresh:
+            target = float(t.get("target") or t["signal"].get("target") or 0)
+            if target > 0 and math.isfinite(target) and (px - target) * sign >= 0:
+                self._goal(t, qty, "TARGET")
             move = (px-entry)*sign
             half = qty // 2
             if not t["partial_done"] and move >= risk:
@@ -552,7 +572,8 @@ class AutoOrderManager:
             gap_intact = (px-today_open)*sign >= 0
             if minutes > 40 and not t["partial_done"] and (move < 0 or (not gap_intact and minutes >= 120)):
                 self._goal(t, qty, "DEAD_TRADE")
-            below_open = sign > 0 and px < today_open*.995 and px < entry*.998
+            below_open = ((px - today_open) * sign < -today_open * .005
+                          and (px - entry) * sign < -entry * .002)
             if below_open:
                 t["below_open_at"] = t["below_open_at"] or self.clock().isoformat()
                 if (self.clock()-datetime.fromisoformat(t["below_open_at"])).total_seconds() >= 600:
@@ -646,6 +667,9 @@ class AutoOrderManager:
                 self.state["flatten"] = True; self.journal.save()
             if self._budget_used() > self.daily_cap:
                 self._halt("Actual fills exceed daily reservation; review execution prices")
+            if any(self._filled(t) * self._entry_price(t) > self.max_ticket + .005
+                   for t in self.state["trades"].values()):
+                self._halt("Actual entry fill exceeds per-ticket cap; no further entries")
             for t in list(self.state["trades"].values()): self._manage(t)
             # Refresh after any stop/exit action before considering another entry.
             self._refresh(); self._publish()

@@ -1,8 +1,8 @@
 """Read-only daily report from the auto_paper SQLite journal.
 
 Run: python scripts/auto_paper_summary.py [--date YYYY-MM-DD]
-Budget defaults match the uploaded executor. If its settings change, supply
---daily-cap and --cost-reserve; these report options do not change execution.
+Budget limits come from the journal. Legacy journals default to Rs35,000 and
+Rs80; use --daily-cap and --cost-reserve to override report settings.
 Signal cost estimates are not actual broker charges. Open-trade net includes
 the full estimated trade cost and excludes unrealised price movements.
 """
@@ -41,8 +41,15 @@ def load_state(db_path, target_date=None):
         conn.close()
 
 
-def calculate(state, daily_cap=25000, cost_reserve=80):
+def report_limits(state, daily_cap=None, cost_reserve=None):
+    limits = state.get("limits", {})
+    return (daily_cap if daily_cap is not None else limits.get("daily_cap", 35000),
+            cost_reserve if cost_reserve is not None else limits.get("cost_reserve", 80))
+
+
+def calculate(state, daily_cap=None, cost_reserve=None):
     """Derive usage from fills, including closed trades, as the executor does."""
+    daily_cap, cost_reserve = report_limits(state, daily_cap, cost_reserve)
     cap, reserve = number(daily_cap), number(cost_reserve)
     if cap <= 0 or reserve < 0:
         raise ValueError("Daily cap must be positive; cost reserve cannot be negative")
@@ -114,7 +121,7 @@ def calculate(state, daily_cap=25000, cost_reserve=80):
 
 
 def summarise(db_path="data/execution_auto_paper.sqlite3", target_date=None,
-              daily_cap=25000, cost_reserve=80):
+              daily_cap=None, cost_reserve=None):
     if not Path(db_path).is_file():
         print("Journal not found:", db_path)
         return
@@ -122,6 +129,7 @@ def summarise(db_path="data/execution_auto_paper.sqlite3", target_date=None,
     if state is None:
         print(f"No data for {target_date}" if target_date else "No state in journal.")
         return
+    daily_cap, cost_reserve = report_limits(state, daily_cap, cost_reserve)
     result = calculate(state, daily_cap, cost_reserve)
     print(f"\n{'='*80}\n  AUTO-PAPER SUMMARY — {state.get('day', '?')}")
     print(f"  Mode: {state.get('mode', '?')} | Account: {state.get('account', '?')}")
@@ -149,7 +157,10 @@ def summarise(db_path="data/execution_auto_paper.sqlite3", target_date=None,
     if result["budget_used"] > number(daily_cap):
         print("  WARNING: journal usage exceeds the configured report cap.")
     print("  Costs are estimates, not confirmed broker charges; unrealised P&L excluded.")
-    print("  Budget reconstruction assumes --daily-cap and --cost-reserve match the executor.")
+    if not state.get("limits"):
+        print("  Legacy journal has no recorded limits; verify --daily-cap and --cost-reserve.")
+    else:
+        print("  Limits read from journal unless explicitly overridden.")
     print(f"  Halt: {state.get('halt') or 'none'}\n{'='*80}\n")
 
 
@@ -157,8 +168,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--date", default=None)
     parser.add_argument("--db", default=os.getenv("INVESTMITRA_EXECUTION_DB", "data/execution_auto_paper.sqlite3"))
-    parser.add_argument("--daily-cap", type=Decimal, default=Decimal("25000"))
-    parser.add_argument("--cost-reserve", type=Decimal, default=Decimal("80"))
+    parser.add_argument("--daily-cap", type=Decimal, default=None)
+    parser.add_argument("--cost-reserve", type=Decimal, default=None)
     args = parser.parse_args()
     try:
         summarise(args.db, args.date, args.daily_cap, args.cost_reserve)
