@@ -119,7 +119,8 @@ class ExecutionTests(unittest.TestCase):
     def test_restart_existing_stop_not_duplicated(self):
         self.enter();before=self.manager.snapshot()['remaining'];self.restart()
         self.assertEqual(self.manager.snapshot()['remaining'],before);self.assertEqual(len(self.broker.book),2)
-    def test_closed_ticket_stays_spent_after_restart(self):
+    def test_legacy_closed_ticket_stays_spent_after_restart(self):
+        self.manager.state['capital_model']='cumulative_tickets_v1'
         self.enter();before=self.manager.snapshot()['remaining'];self.manager.request_flatten()
         for _ in range(4):self.manager.step()
         self.assertTrue(self.manager.snapshot()['flat']);self.restart()

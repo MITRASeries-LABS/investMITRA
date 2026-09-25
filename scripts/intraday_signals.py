@@ -59,9 +59,8 @@ MAX_RISK_PER_TRADE_INR  = 1500   # proportional to Rs10k ticket
 MAX_CAPITAL_PER_TRADE   = 10000  # max per trade (3 trades of Rs10k)
 MAX_CONCURRENT_TRADES   = 3      # max simultaneous positions
 MIN_PRIORITY_SCORE      = 3.0    # RVOL x gap x score/100 minimum (raised for quality)
-MAX_DAILY_LOSS_INR      = 6000
+MAX_DAILY_LOSS_INR      = 1500   # combined realised + unrealised loss, including provisional costs
 MAX_POSITIONS           = 3
-MAX_CONSECUTIVE_LOSSES  = 2
 ATR_STOP_MULT           = 1.5   # stop at 1.5 ATR
 ATR_TARGET_MULT         = 3.0   # target at 3 ATR → 1:2 R:R
 BROKERAGE_PER_TRADE     = 80   # conservative fallback only
@@ -72,7 +71,9 @@ if EXECUTION_MODE != "auto_paper":
 from order_manager import BUILD_ID, MIN_SIGNAL_GAP_PCT, MIN_FINAL_SCORE, entry_policy_rejection
 PAPER_TRADING          = EXECUTION_MODE != "live"  # Live also requires explicit adapter activation
 PAPER_MAX_POSITIONS     = 9     # Max positions in paper trading mode
-MAX_DAILY_CAPITAL_INR  = 35000  # cumulative entry tickets + cost allowances; exits do not refill
+MAX_DAILY_CAPITAL_INR  = 35000  # equity/open commitments ceiling; confirmed exits release capital
+RESCAN_INTERVAL_SECONDS = 300
+HEARTBEAT_INTERVAL_SECONDS = 60
 MIN_TICKET_INR         = 1000
 DESK_CAPITAL_INR       = MAX_DAILY_CAPITAL_INR  # No leverage or extra desk allocation
 
@@ -987,6 +988,7 @@ class DailyRiskManager:
         self.trades_today       = 0
         self.daily_capital_used  = 0.0
         self.daily_budget_restored = False
+        self.execution_remaining = None
         self.consecutive_losses = 0
         self.positions          = {}
 
@@ -995,6 +997,8 @@ class DailyRiskManager:
 
     @property
     def daily_budget_remaining(self):
+        if self.execution_remaining is not None:
+            return self.execution_remaining  # authoritative executor accounting, including reservations
         # Reserve estimated round-trip charges; realised profits never refill this.
         return max(0.0, round(MAX_DAILY_CAPITAL_INR - self.daily_capital_used
                               - self.daily_brokerage, 2))
@@ -1008,8 +1012,6 @@ class DailyRiskManager:
             return False, f"Max trades ({self.trades_today})"
         if len(self.positions) >= MAX_POSITIONS:
             return False, f"Max positions ({len(self.positions)})"
-        if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-            return False, f"Consecutive losses: {self.consecutive_losses}"
         return True, "OK"
 
     def open_position(self, symbol, entry, stop, size, target, atr, estimated_costs=None):
@@ -1132,9 +1134,19 @@ class IntradayEngine:
         self.ticker = None
         self.instrument_tokens = {}
         self._last_tick_at = {}
+        self._last_ws_tick_at = None
+        self._last_heartbeat_at = None
+        self._last_scan_status = None
+        self._candidate_logged = set()
+        self.shadow = None  # optional observer: never involved in trading decisions
+        self._shadow_scored = None
+        self._shadow_opening = {}
+        self._shadow_error_logged = False
 
 
     def on_tick(self, ws, ticks):
+        if ticks:
+            self._last_ws_tick_at = datetime.now(IST)  # REST scan quotes never update this
         with self._state_lock:
             self._on_tick_locked(ws, ticks)
 
@@ -1196,11 +1208,34 @@ class IntradayEngine:
 
             if self.execution is None:
                 self._check_exits(symbol, ltp, session, now)
+            self._shadow_scored = None
             if session in ("momentum","choppy","afternoon"):
                 self._check_signal(symbol, ltp, volume, now, session)
+            if self.shadow is not None:
+                self._observe_shadow(symbol, ltp, now, session, tick)
+
+    def _observe_shadow(self, symbol, ltp, now, session, tick):
+        """Nonblocking research capture after the normal decision, including exits' ticks."""
+        try:
+            from shadow_validation import capture_features, timestamp
+            if session == "opening":
+                minute = now.hour * 60 + now.minute
+                span = self._shadow_opening.setdefault(symbol,
+                    dict(first=minute, last=minute, at=now.timestamp(), max_gap=0))
+                span["max_gap"] = max(span["max_gap"], now.timestamp() - span["at"])
+                span["last"], span["at"] = minute, now.timestamp()
+            if self._shadow_scored is not None:
+                queued = self.execution_offers.get(symbol) == now.timestamp()
+                self.shadow.candidate(capture_features(self, symbol, ltp, now, session,
+                                                       self._shadow_scored, tick, queued))
+            self.shadow.quote(symbol, ltp, now.timestamp(), timestamp(tick.get("last_trade_time")))
+        except Exception:
+            if not self._shadow_error_logged:
+                logger.exception("Shadow capture failed; research incomplete; trading decisions unchanged")
+                self._shadow_error_logged = True
 
     def _trigger_post_exit_scan(self, closed_symbol):
-        # Coalesce multiple closes; cumulative daily capital is never refunded.
+        # Coalesce closes; executor confirms fills before releasing capital.
         self._rescan_requested.set()
 
     def _poll_closed_trades(self):
@@ -1210,6 +1245,8 @@ class IntradayEngine:
                   if trade.get("closed_at") and trade["orders"][0].get("filled", 0)}
         if closed - self._closed_seen:
             self._rescan_requested.set()
+            logger.info("Execution closes observed: %s; rescan requested",
+                        ", ".join(sorted(closed - self._closed_seen)))
         self._closed_seen.update(closed)
 
     def _scan_market(self, reason):
@@ -1223,7 +1260,13 @@ class IntradayEngine:
             if not (first_minute <= now.hour * 60 + now.minute < 900):
                 return 0
             view = self.execution.snapshot()
-            if not view.get("ready") or view.get("remaining", 0) < MIN_TICKET_INR:
+            blockers = [b for b in view.get("entry_blockers", []) if b != "outside entry window"]
+            if not view.get("ready") or view.get("remaining", 0) < MIN_TICKET_INR or blockers:
+                status = "; ".join(blockers) or "executor not ready or insufficient capital"
+                previous = self._last_scan_status
+                if previous is None or previous[0] != status or (now-previous[1]).total_seconds() >= 60:
+                    logger.info("%s scan deferred: %s; available Rs%.2f", reason, status, view.get("remaining", 0))
+                    self._last_scan_status = (status, now)
                 return None
             with self._state_lock:
                 existing = set(self.all_stocks)
@@ -1291,6 +1334,42 @@ class IntradayEngine:
                 queued += self.execution_offers.get(symbol) != before
         return queued
 
+    def _scan_reason(self, now, done, last_scan, monotonic_now):
+        minute = now.hour*60 + now.minute
+        if not 571 <= minute < 900 or monotonic_now-last_scan < 30:
+            return None
+        due = next((name for name, at in (("morning", 571), ("10 AM", 600))
+                    if minute >= at and name not in done), None)
+        if due:
+            return due
+        if minute >= 575 and self._rescan_requested.is_set():
+            return "post-exit/retry"
+        if minute >= 575 and monotonic_now-last_scan >= RESCAN_INTERVAL_SECONDS:
+            return "periodic"
+        return None
+
+    def _log_heartbeat(self):
+        now = datetime.now(IST)
+        if self._last_heartbeat_at and (now-self._last_heartbeat_at).total_seconds() < HEARTBEAT_INTERVAL_SECONDS:
+            return
+        self._last_heartbeat_at = now
+        view = self.execution.snapshot()
+        def age(value):
+            if not value: return "never"
+            if isinstance(value, str): value = datetime.fromisoformat(value)
+            return f"{max(0, (now-value).total_seconds()):.0f}s"
+        quote_status = ", ".join(f"{s}:{'fresh' if ok else 'STALE'}"
+                                 for s, ok in sorted(view.get("quote_fresh", {}).items())) or "no open positions"
+        combined = view.get("combined_net")
+        logger.info("HEARTBEAT: WS tick age=%s; executor cycle age=%s; successful cycle age=%s; "
+                    "open exposure=Rs%.2f; available=Rs%.2f; entries=%s; %s; "
+                    "quotes at last cycle=%s; combined net at last cycle=%s",
+                    age(self._last_ws_tick_at), age(view.get("cycle_completed_at")),
+                    age(view.get("cycle_success_at")), view.get("exposure", 0), view.get("remaining", 0),
+                    "allowed" if view.get("entry_allowed") else "blocked",
+                    "; ".join(view.get("entry_blockers", [])), quote_status,
+                    "unknown" if combined is None else f"Rs{combined:.2f}")
+
     def _maintenance_loop(self):
         """Observe closes without WebSocket ticks and serialize all scheduled scans."""
         done = set()
@@ -1301,22 +1380,19 @@ class IntradayEngine:
             try:
                 self._poll_closed_trades()
                 now = datetime.now(IST)
-                minute = now.hour * 60 + now.minute
-                due = next((name for name, at in (("morning", 571), ("10 AM", 600))
-                            if minute >= at and name not in done), None)
-                requested = self._rescan_requested.is_set()
-                if 571 <= minute < 900 and (due or (requested and minute >= 575)) and time.monotonic() - last_scan >= 30:
+                reason = self._scan_reason(now, done, last_scan, time.monotonic())
+                if reason:
                     self._rescan_requested.clear()
                     last_scan = time.monotonic()
                     try:
-                        result = self._scan_market(due or "post-exit")
+                        result = self._scan_market(reason)
                     except Exception:
                         self._rescan_requested.set()
                         raise
                     if result is None:
                         self._rescan_requested.set()
-                    elif due:
-                        done.add(due)
+                    elif reason in ("morning", "10 AM"):
+                        done.add(reason)
             except Exception:
                 logger.warning("Signal maintenance failed; execution worker remains independent", exc_info=True)
             self._scan_stop.wait(2)
@@ -1731,12 +1807,15 @@ class IntradayEngine:
         return round(opp, 2), details
 
     def _reject_signal(self, symbol, reason, now):
+        if self._shadow_scored is not None:
+            self._shadow_scored["reason"] = reason
         previous = self.signal_rejections.get(symbol)
         if previous is None or previous[0] != reason or (now-previous[1]).total_seconds() >= 60:
             logger.info("SIGNAL REJECT %s: %s", symbol, reason)
             self.signal_rejections[symbol] = (reason, now)
 
     def _check_signal(self, symbol, ltp, volume, now, session):
+        self._shadow_scored = None
         session = get_current_session(now)
         if session not in ("momentum", "choppy", "afternoon"):
             return
@@ -1748,11 +1827,15 @@ class IntradayEngine:
             view = self.execution.snapshot()
             if not view.get("ready"):
                 return
+            if view.get("entry_allowed") is False and any(
+                    b != "outside entry window" for b in view.get("entry_blockers", [])):
+                return
             if now.timestamp() - self.execution_offers.get(symbol, 0) < 5:
                 return
             # Sizing reads the last confirmed execution view; the worker performs
             # the authoritative budget/risk check again before submitting.
             self.risk.daily_capital_used = view.get("tickets", 0)
+            self.risk.execution_remaining = view.get("remaining", 0)
             self.risk.daily_brokerage = view.get("costs", 0)
             self.risk.daily_pnl = view.get("gross", 0)
             self.risk.consecutive_losses = view.get("losses", 0)
@@ -1778,9 +1861,6 @@ class IntradayEngine:
         # Risk checks - checked again after sizing below
         if self.risk.net_pnl <= -MAX_DAILY_LOSS_INR:
             logger.debug("Daily loss limit hit: Rs%.0f", self.risk.net_pnl)
-            return
-        if self.risk.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-            logger.debug("Consecutive losses: %d", self.risk.consecutive_losses)
             return
         # Position cap - explicit paper/live limits
         pos_limit = PAPER_MAX_POSITIONS if PAPER_TRADING else MAX_POSITIONS
@@ -1855,6 +1935,9 @@ class IntradayEngine:
         opp, details = self._compute_opportunity_score(symbol, ltp, volume, true_gap_pct, session)
 
         final = quality * 0.40 + opp * 0.60
+        if self.shadow is not None:
+            self._shadow_scored = dict(gap=true_gap_pct, quality=quality,
+                opportunity=opp, blended=final, details=details)
         rejection = entry_policy_rejection(dict(true_gap=true_gap_pct,
             final_score=final, gap_threshold=gap_thresh, details=details,
             direction="SHORT" if true_gap_pct < 0 else "LONG",
@@ -1916,7 +1999,7 @@ class IntradayEngine:
                 below_vwap and score >= 55 and
                 self._is_fo_eligible(symbol)):
             direction = "SHORT"
-            logger.info("Quality SHORT: %s gap %.2f%% (bearish day F&O)", symbol, true_gap_pct)
+            logger.debug("Quality SHORT candidate: %s gap %.2f%% (bearish day F&O)", symbol, true_gap_pct)
 
         # SHORT Option 3: quality F&O stock gapping down on a neutral/bearish day
         elif (symbol in self.long_map and
@@ -1926,7 +2009,7 @@ class IntradayEngine:
                 below_vwap and score >= 65 and
                 self._is_fo_eligible(symbol)):
             direction = "SHORT"
-            logger.info("Bearish SHORT: %s gap %.2f%% (F&O eligible)", symbol, true_gap_pct)
+            logger.debug("Bearish SHORT candidate: %s gap %.2f%% (F&O eligible)", symbol, true_gap_pct)
 
         if not direction: return
         if direction == "SHORT" and not self._is_fo_eligible(symbol):
@@ -1945,9 +2028,10 @@ class IntradayEngine:
 
         # Available capital = starting equity minus realised losses and committed capital
         # Equity after realised P&L and costs (negative net_pnl reduces available capital)
-        realised_equity   = DESK_CAPITAL_INR + self.risk.net_pnl  # net_pnl already deducts costs
+        realised_equity   = DESK_CAPITAL_INR + min(0, self.risk.net_pnl)
         committed_capital = sum(p["entry"] * p["size"] for p in self.risk.positions.values())
-        candidate_cost    = estimate_costs(ltp, int(MAX_CAPITAL_PER_TRADE / ltp) or 1, target)
+        candidate_cost    = max(view.get("limits", {}).get("cost_reserve", BROKERAGE_PER_TRADE),
+                                estimate_costs(ltp, int(MAX_CAPITAL_PER_TRADE / ltp) or 1, target))
         available_capital = max(0, min(
             realised_equity - committed_capital - candidate_cost,
             self.risk.daily_budget_remaining - candidate_cost))
@@ -2054,13 +2138,8 @@ class IntradayEngine:
             return
         required_priority = max(MIN_PRIORITY_SCORE, 5.0) if session == "choppy" else MIN_PRIORITY_SCORE
         if _priority < required_priority:
-            logger.info("PRIORITY REJECT %s: score %.3f below %.3f (RVOL%.1fx gap%.2f%% score%.0f)",
-                        symbol, _priority, required_priority, _rvol, _gap_abs, final)
+            self._reject_signal(symbol, f"priority below {required_priority:.3f}", now)
             return
-
-        _rr = abs(target - ltp) / abs(ltp - stop) if abs(ltp - stop) > 0 else 0
-        logger.info("Signal accepted: %s priority=%.2f RVOL%.1fx gap%.2f%% score%.0f target/stop=%.1f target-screen=Rs%.0f",
-                    symbol, _priority, _rvol, _gap_abs, final, _rr, expected_net)
 
         if self.execution is not None:
             # Worker owns order state, quantities and P&L. Never create a
@@ -2068,8 +2147,10 @@ class IntradayEngine:
             candidate["offered_at"] = now.timestamp()
             if self.execution.offer(candidate):
                 self.execution_offers[symbol] = now.timestamp()
-                logger.info("Execution candidate queued: %s (%s) priority=%.2f",
-                            symbol, EXECUTION_MODE, _priority)
+                if symbol not in self._candidate_logged:
+                    logger.info("Execution candidate queued (not accepted/filled): %s (%s) priority=%.2f",
+                                symbol, EXECUTION_MODE, _priority)
+                    self._candidate_logged.add(symbol)  # diagnostic dedup only; eligibility remains unchanged
             return
         self.traded_today.add(symbol)
         self.signals[symbol] = candidate
@@ -2615,8 +2696,9 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
     print(f"  INTRADAY WATCHLIST v10 — {date.today()} | {market_direction}")
     print(f"  TRUE GAP | 5-min hold | ATR 14-day | Traded value filter")
     print(f"  Execution: {EXECUTION_MODE} (auto_paper sends no real orders)")
-    print(f"  Daily budget: ₹{MAX_DAILY_CAPITAL_INR:,} | Ticket: ₹{MIN_TICKET_INR:,}–₹{MAX_CAPITAL_PER_TRADE:,}")
-    print("  Entry tickets + estimated charges share the daily budget; exits do not refill it.")
+    print(f"  Capital ceiling: ₹{MAX_DAILY_CAPITAL_INR:,} | Ticket: ₹{MIN_TICKET_INR:,}–₹{MAX_CAPITAL_PER_TRADE:,}")
+    print(f"  Capital model: {execution.snapshot().get('capital_model') if execution else 'executor unavailable'}")
+    print("  New sessions reuse capital after confirmed exits, less losses/costs/reservations; risk limits still apply.")
     print(f"{'='*65}")
     if long_list:
         print(f"\n  🟢 LONG ({len(long_list)}) — sorted by Quality:")
@@ -2647,8 +2729,10 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
     engine.signal_weights = dict(weights)
     engine.strategy_id = BUILD_ID + ":" + hashlib.sha256(json.dumps({
         "weights": weights, "gap_thresholds": GAP_THRESHOLDS,
+        "capital_model": execution.snapshot().get("capital_model") if execution else None,
         "daily_cap": MAX_DAILY_CAPITAL_INR, "max_ticket": MAX_CAPITAL_PER_TRADE,
         "max_risk": MAX_RISK_PER_TRADE_INR, "min_profit": MIN_NET_PROFIT,
+        "max_daily_loss": MAX_DAILY_LOSS_INR,
         "priority": MIN_PRIORITY_SCORE, "stop_atr": ATR_STOP_MULT, "target_atr": ATR_TARGET_MULT,
     }, sort_keys=True).encode()).hexdigest()[:12]
     engine.fo_eligible_symbols = load_fo_eligible_symbols()
@@ -2780,8 +2864,8 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
     ticker = KiteTicker(API_KEY, ACCESS_TOKEN, reconnect=True, reconnect_max_tries=300, reconnect_max_delay=5)
     ticker.on_connect = on_connect
     ticker.on_ticks   = engine.on_tick
-    ticker.on_close        = lambda ws,c,r: None
-    ticker.on_error        = lambda ws,c,r: None
+    ticker.on_close        = lambda ws,c,r: logger.warning("Market stream closed: code=%s reason=%s", c, r)
+    ticker.on_error        = lambda ws,c,r: logger.error("Market stream error: code=%s reason=%s", c, r)
     ticker.on_reconnect    = on_reconnect
     ticker.on_noreconnect  = on_noreconnect
 
@@ -2790,12 +2874,20 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
         engine.ticker = ticker
         engine.instrument_tokens = {i["tradingsymbol"]: i["instrument_token"] for i in instruments
                                     if i.get("segment") == "NSE"}
+        if os.getenv("INVESTMITRA_SHADOW_ENABLED", "1") == "1":
+            try:
+                from shadow_validation import ShadowObserver, VERSION
+                engine.shadow = ShadowObserver(os.getenv("INVESTMITRA_SHADOW_DB", "data/shadow_validation.sqlite3"))
+                logger.info("Shadow candidate observation enabled: %s; entry rules unchanged", VERSION)
+            except Exception:
+                logger.exception("Shadow observation unavailable; trading configuration unchanged")
         ticker.connect(threaded=True)
         maintenance = threading.Thread(target=engine._maintenance_loop, daemon=True)
         maintenance.start()
         while True:
             now = datetime.now(IST)
             if engine.execution is not None:
+                engine._log_heartbeat()
                 if now.hour*60 + now.minute >= 900:
                     engine.execution.request_flatten()
                 if now.hour*60 + now.minute >= 905:
@@ -2830,6 +2922,8 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
         if "maintenance" in locals():
             maintenance.join(timeout=15)
         ticker.close()
+        if engine.shadow is not None:
+            engine.shadow.close()
 
 
 def main():
@@ -2846,8 +2940,7 @@ def main():
     execution = build_executor(
         kite, instruments, EXECUTION_MODE, daily_cap=MAX_DAILY_CAPITAL_INR,
         min_ticket=MIN_TICKET_INR, max_ticket=MAX_CAPITAL_PER_TRADE, max_risk=MAX_RISK_PER_TRADE_INR,
-        max_daily_loss=MAX_DAILY_LOSS_INR, max_positions=MAX_POSITIONS,
-        max_losses=MAX_CONSECUTIVE_LOSSES)
+        max_daily_loss=MAX_DAILY_LOSS_INR, max_positions=MAX_POSITIONS)
     execution.step()
     worker = threading.Thread(target=execution.run, daemon=True)
     worker.start()

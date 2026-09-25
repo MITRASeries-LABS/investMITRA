@@ -18,12 +18,13 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
+from execution_capital import capital_snapshot, REUSABLE, LEGACY
 
 IST = timezone(timedelta(hours=5, minutes=30))
 logger = logging.getLogger(__name__)
 TERMINAL = {"COMPLETE", "CANCELLED", "REJECTED"}
 PREFIX = "IM3"
-BUILD_ID = "2026-09-24-feature-completion1"
+BUILD_ID = "2026-09-25-capital-visibility2"
 MIN_SIGNAL_GAP_PCT = 0.30
 MIN_FINAL_SCORE = 55.0
 
@@ -59,7 +60,6 @@ def entry_policy_rejection(signal):
 def notify(message: str, silent: bool = False):
     token, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat:
-        logger.info("%s", message)
         return
     try:
         import requests
@@ -239,7 +239,7 @@ class AutoOrderManager:
     """Serial execution state machine. All public broker work runs in step()."""
     def __init__(self, broker, journal, instruments, *, daily_cap=25000,
                  min_ticket=1000, cost_reserve=80, max_risk=2000, max_ticket=10000,
-                 max_daily_loss=6000, max_positions=3, max_losses=2,
+                 max_daily_loss=1500, max_positions=3,
                  clock=lambda: datetime.now(IST), alerts=async_notify):
         self.broker, self.journal, self.state = broker, journal, journal.state
         self.meta = {i["tradingsymbol"]: i for i in instruments
@@ -247,7 +247,7 @@ class AutoOrderManager:
         self.daily_cap, self.min_ticket, self.cost_reserve = daily_cap, min_ticket, cost_reserve
         self.max_ticket = max_ticket
         self.max_risk, self.max_daily_loss = max_risk, max_daily_loss
-        self.max_positions, self.max_losses = max_positions, max_losses
+        self.max_positions = max_positions
         self.clock, self._deliver_alert = clock, alerts
         self.state.setdefault("alert_events", [])
         self.inbox = queue.Queue(maxsize=100)
@@ -259,6 +259,8 @@ class AutoOrderManager:
         self.flatten_requested = threading.Event()
         self.stop_requested = threading.Event()
         self._last_error = None
+        self._cycle_completed_at = None
+        self._cycle_success_at = None
         today = self.clock().date().isoformat()
         if self.state["day"] not in (None, today):
             if any(self._remaining(t) or self._active(t) for t in self.state["trades"].values()):
@@ -266,14 +268,24 @@ class AutoOrderManager:
             with journal.db:
                 journal.db.execute("INSERT OR REPLACE INTO history VALUES (?, ?)",
                                    (self.state["day"], json.dumps(self.state, allow_nan=False)))
-            self.state.update(day=today, trades={}, halt="", flatten=False, alert_events=[])
+            self.state.update(day=today, trades={}, halt="", flatten=False, alert_events=[],
+                              capital_model=REUSABLE)
+            self.state.pop("entry_status", None)
+            self.state.pop("flatten_reason", None)
             if isinstance(broker, PaperBroker):
                 broker.book = []; broker._save()
         self.state["day"] = today
+        # Preserve today's accounting on upgrade, including any open positions.
+        # New sessions use reusable capital; historical reports retain their model.
+        self.state.setdefault("capital_model", LEGACY if self.state["trades"] else REUSABLE)
+        if self.state["capital_model"] not in {LEGACY, REUSABLE}:
+            raise ValueError("Unknown journal capital model")
+        if self.state["capital_model"] == LEGACY:
+            logger.warning("Legacy cumulative budget retained for this session; reusable capital starts next session")
         self.state["limits"] = dict(daily_cap=daily_cap, min_ticket=min_ticket, max_ticket=max_ticket,
                                     cost_reserve=cost_reserve, max_risk=max_risk,
                                     max_daily_loss=max_daily_loss, max_positions=max_positions,
-                                    max_losses=max_losses)
+                                    max_losses=None)  # loss streak is diagnostic, not an entry rule
         self.journal.save()
 
     def alerts(self, message):
@@ -287,7 +299,9 @@ class AutoOrderManager:
         except Exception:
             logger.error("Alert journal write failed; message kept in console: %s", message)
             return
-        self._deliver_alert(f"[investMITRA {self.broker.mode} {BUILD_ID}] {message}")
+        message = f"[investMITRA {self.broker.mode} {BUILD_ID}] {message}"
+        logger.info("%s", message)  # independent of Telegram configuration/delivery
+        self._deliver_alert(message)
 
     def snapshot(self):
         with self.lock: return copy.deepcopy(self.view)
@@ -315,15 +329,10 @@ class AutoOrderManager:
         exits = sum(o["filled"] * o["average"] for o in trade["orders"][1:])
         return (exits - self._entry_price(trade) * self._exited(trade)) * trade["sign"]
     def _budget_used(self):
-        value = 0
-        for t in self.state["trades"].values():
-            e = self._entry(t)
-            value += e["filled"] * e["average"]
-            if e["status"] not in TERMINAL:
-                value += (e["qty"] - e["filled"]) * t["reservation_price"] + self.cost_reserve
-            else:
-                value += self._cost(t)
-        return round(value, 2)
+        return float(self._capital()["budget_used"])
+
+    def _capital(self):
+        return capital_snapshot(self.state, self.daily_cap, self.cost_reserve)
 
     def _halt(self, reason):
         if self.state["halt"] != reason:
@@ -348,12 +357,43 @@ class AutoOrderManager:
         for t in closed:
             losses = losses + 1 if self._gross(t) - self._cost(t) <= 0 else 0
         exposure = sum(self._remaining(t) * self._entry_price(t) for t in trades.values())
+        capital = self._capital()
+        protected = not self._protection_pending()
+        active_count = sum(bool(self._remaining(t) or self._active(t)) for t in trades.values())
+        blockers = []
+        if not self.ready: blockers.append("executor recovery/reconciliation pending")
+        if self.state["halt"]: blockers.append(self.state["halt"])
+        if self.state["flatten"]: blockers.append(self.state.get("flatten_reason") or "square-off requested")
+        if not protected: blockers.append("position protection pending")
+        if capital["remaining"] < self.min_ticket + self.cost_reserve:
+            blockers.append("insufficient available capital for minimum ticket and cost reserve")
+        if gross-costs <= -self.max_daily_loss: blockers.append("daily loss limit")
+        if active_count >= self.max_positions: blockers.append("concurrent-position limit")
+        if not 575 <= self.clock().hour*60+self.clock().minute < 900:
+            blockers.append("outside entry window")
+        quote_fresh = {s: self._fresh(self.quotes.get("NSE:"+s, {}))
+                       for s, t in trades.items() if self._remaining(t)}
+        if not all(quote_fresh.values()): blockers.append("open-position quotes stale/unavailable")
+        unrealised = sum((float(self.quotes['NSE:'+s]['last_price']) - self._entry_price(t))
+                         * t['sign'] * self._remaining(t)
+                         for s, t in trades.items() if quote_fresh.get(s))
+        combined_net = gross-costs+unrealised if all(quote_fresh.values()) else None
+        if combined_net is not None and combined_net <= -self.max_daily_loss:
+            blockers.append(f"combined daily loss limit Rs{self.max_daily_loss:.0f}")
         with self.lock:
-            self.view = dict(ready=self.ready and not self.state["halt"] and not self.state["flatten"] and not self._protection_pending(),
+            self.view = dict(ready=self.ready and not self.state["halt"] and not self.state["flatten"] and protected,
                              reason=self.state["halt"], trades=trades,
-                             remaining=max(0, self.daily_cap - self._budget_used()),
+                             remaining=float(capital["remaining"]),
+                             capital_model=capital["capital_model"],
+                             capital_used=float(capital["budget_used"]),
+                             pending=float(capital["pending"]), equity=float(capital["equity"]),
+                             entry_allowed=not blockers, entry_blockers=blockers,
+                             active_count=active_count, quote_fresh=quote_fresh,
+                             cycle_completed_at=self._cycle_completed_at,
+                             cycle_success_at=self._cycle_success_at,
                              tickets=sum(self._filled(t)*self._entry_price(t) for t in trades.values()),
                              gross=gross, costs=costs, net=gross-costs, losses=losses,
+                             combined_net=combined_net, unrealised=unrealised,
                              exposure=exposure, flat=self.ready and all(not self._remaining(t) and not self._active(t) for t in trades.values()),
                              limits=dict(self.state["limits"]),
                              mode=self.broker.mode, account=self.state["account"], day=self.state["day"])
@@ -393,6 +433,7 @@ class AutoOrderManager:
             self._halt("Other intraday orders exist in this account; daily budget cannot be isolated")
         uncertain = False
         for t in self.state["trades"].values():
+            exit_kinds_now = set()
             for action in t["orders"]:
                 matches = by_tag.get(action["tag"], [])
                 if len(matches) > 1: raise RuntimeError("Duplicate broker orders for one execution intent")
@@ -409,14 +450,36 @@ class AutoOrderManager:
                 avg = float(o.get("average_price") or 0)
                 if not 0 <= filled <= action["qty"] or filled < action["filled"] or (filled and (not math.isfinite(avg) or avg <= 0)):
                     raise RuntimeError("Invalid or regressing fill report")
+                previous_filled = action["filled"]
                 action.update(order_id=o["order_id"], status=o["status"], filled=filled, average=avg,
                               message=o.get("status_message", ""))
+                if filled > previous_filled:
+                    if action["kind"] in {"STOP", "EXIT"}:
+                        exit_kinds_now.add(action["kind"])
+                        # Persist alongside fills before sending the alert, so a
+                        # restart between fill recognition and closure keeps provenance.
+                        t["last_exit_kind"] = action["kind"] if len(exit_kinds_now) == 1 else "MIXED"
+                        t["last_exit_reason"] = action.get("exit_reason") or t["exit_reason"]
+                    self.alerts(f"{self.broker.mode}: {t['symbol']} {action['kind']} FILLED "
+                                f"{filled}/{action['qty']}sh @ Rs{avg:.2f} average "
+                                f"(order {action['order_id']})")
                 if o.get("trigger_price") is not None:
                     action["broker_trigger"] = float(o["trigger_price"])
             if self._remaining(t) < 0: raise RuntimeError("Exit fills exceed owned entry quantity")
             if self._filled(t) and not self._remaining(t) and not self._active(t) and not t.get("closed_at"):
                 t["closed_at"] = self.clock().isoformat()
-                self.alerts(f"{self.broker.mode}: {t['symbol']} CLOSED, gross Rs{self._gross(t):.2f}; charges provisional")
+                last_kind = t.get("last_exit_kind")
+                if last_kind is None:  # older journals: do not invent fill chronology
+                    kinds = {o["kind"] for o in t["orders"][1:] if o["filled"]}
+                    last_kind = next(iter(kinds)) if len(kinds) == 1 else "MIXED"
+                t["closed_reason"] = ("STOPLOSS" if last_kind == "STOP" else
+                                      "MIXED_EXITS" if last_kind == "MIXED" else
+                                      t.get("last_exit_reason") or t["exit_reason"] or "CLOSED")
+                exit_average = sum(o["filled"]*o["average"] for o in t["orders"][1:]) / self._exited(t)
+                self.alerts(f"{self.broker.mode}: {t['symbol']} CLOSED ({t['closed_reason']}); "
+                            f"exited {self._exited(t)}sh @ Rs{exit_average:.2f} average; "
+                            f"gross Rs{self._gross(t):.2f}; provisional net "
+                            f"Rs{self._gross(t)-self._cost(t):.2f} (estimated costs Rs{self._cost(t):.2f})")
         self.journal.save()
         if uncertain: raise RuntimeError("Submission outcome unknown; waiting for broker tag reconciliation (no resubmission)")
         for t in self.state["trades"].values():
@@ -442,7 +505,8 @@ class AutoOrderManager:
         if price is not None: params["price"] = price
         if kind == "STOP" or market: params["market_protection"] = -1
         action = dict(kind=kind, tag=params["tag"], params=params, qty=int(qty), filled=0,
-                      average=0, status="PREPARED", order_id=None, created=self.clock().isoformat(), cancels=0)
+                      average=0, status="PREPARED", order_id=None, created=self.clock().isoformat(), cancels=0,
+                      exit_reason=trade.get("exit_reason", "") if kind == "EXIT" else kind)
         trade["orders"].append(action)
         self.journal.save()  # reservation + intent committed before broker call
         try:
@@ -453,6 +517,11 @@ class AutoOrderManager:
             self.ready = False
             logger.exception("Order response uncertain; will reconcile tag")
         self.journal.save()
+        if kind != "ENTRY":
+            self.alerts(f"{self.broker.mode}: {trade['symbol']} {kind} {action['status']} "
+                        f"{qty}sh; reason={action['exit_reason']}; "
+                        f"price={price if price is not None else trigger if trigger is not None else 'MARKET'}; "
+                        f"intent={action['tag']}")
         return action
 
     def _cancel(self, action):
@@ -483,8 +552,9 @@ class AutoOrderManager:
         if any(key(o["tradingsymbol"], o["exchange"], o["product"]) == key(symbol)
                and o["status"] not in TERMINAL for o in self.orders): return
         view = self.snapshot()
+        if not view.get("entry_allowed", False): return
         count = sum(bool(self._remaining(t) or self._active(t)) for t in self.state["trades"].values())
-        if count >= self.max_positions or view.get("losses", 0) >= self.max_losses: return
+        if count >= self.max_positions: return
         if sig.get("direction") not in ("LONG", "SHORT"):
             return
         sign = 1 if sig["direction"] == "LONG" else -1
@@ -564,7 +634,7 @@ class AutoOrderManager:
         if any(o["kind"] == "STOP" and o["filled"] for o in t["orders"]):
             self._goal(t, qty, "STOPLOSS")
         if self.state["flatten"]:
-            self._goal(t, qty, "SQUAREOFF")
+            self._goal(t, qty, "DAILY_LOSS" if self.state.get("flatten_reason", "").startswith("combined daily loss") else "SQUAREOFF")
         elif fresh:
             target = float(t.get("target") or t["signal"].get("target") or 0)
             if target > 0 and math.isfinite(target) and (px - target) * sign >= 0:
@@ -646,15 +716,8 @@ class AutoOrderManager:
             self._halt("Protective stop rejected for " + t["symbol"] + "; attempting full exit")
             self._goal(t, qty, "PROTECTION_FAILED")
             return
-        # Alert: entry filled + stop placed
-        fill_qty = self._filled(t)
-        if fill_qty:
-            fill_avg = (sum(o["average"]*o["filled"] for o in t["orders"]
-                            if o["kind"]=="ENTRY" and o["filled"])
-                        / fill_qty)
-            self.alerts(f"{self.broker.mode}: {t['symbol']} FILLED {fill_qty}sh @ ₹{fill_avg:.2f}")
+        # Fill confirmations come from _refresh, not from stop submission.
         self._submit(t, "STOP", remaining, trigger=t["stop"])
-        self.alerts(f"{self.broker.mode}: {t['symbol']} STOP PLACED @ ₹{t['stop']:.2f}")
 
     def step(self):
         self.ready = False
@@ -682,12 +745,16 @@ class AutoOrderManager:
                 except Exception: self.quotes = {}  # broker-side protection remains; timed exits still run
             self._refresh()
             self._publish()
-            unrealised = sum((float(self.quotes.get("NSE:"+t["symbol"], {}).get("last_price") or self._entry_price(t))-self._entry_price(t))
-                             *t["sign"]*self._remaining(t) for t in self.state["trades"].values())
-            if self.snapshot()["net"] + unrealised <= -self.max_daily_loss:
-                self.state["flatten"] = True; self.journal.save()
+            view = self.snapshot()
+            combined = view["combined_net"]
+            if view["net"] <= -self.max_daily_loss or (combined is not None and combined <= -self.max_daily_loss):
+                reason = f"combined daily loss limit Rs{self.max_daily_loss:.0f} reached"
+                self.state["flatten_reason"] = reason
+                self.state["flatten"] = True
+                self._halt(reason)  # latched for the day, including across restart/recovery
+                self.journal.save()
             if self._budget_used() > self.daily_cap:
-                self._halt("Actual fills exceed daily reservation; review execution prices")
+                self._halt("Capital commitments exceed allowance; review execution prices and losses")
             if any(self._filled(t) * self._entry_price(t) > self.max_ticket + .005
                    for t in self.state["trades"].values()):
                 self._halt("Actual entry fill exceeds per-ticket cap; no further entries")
@@ -697,6 +764,7 @@ class AutoOrderManager:
             for sig in pending:
                 if self.ready: self._accept(sig)
             self._last_error = None
+            self._cycle_success_at = self.clock().isoformat()
         except Exception as exc:
             self.ready = False
             message = str(exc)
@@ -705,7 +773,19 @@ class AutoOrderManager:
                 self._last_error = message
             logger.exception("Execution cycle failed; no blind retry of submissions")
         finally:
+            self._cycle_completed_at = self.clock().isoformat()
             self._publish()
+            view = self.snapshot()
+            # Reporting status only; admission always recomputes actual state.
+            self.state["entry_status"] = dict(as_of=self._cycle_completed_at,
+                                              allowed=view["entry_allowed"], blockers=view["entry_blockers"],
+                                              combined_net=view["combined_net"], consecutive_losses=view["losses"])
+            try:
+                self.journal.save()
+            except Exception:
+                self.ready = False
+                self._publish()
+                logger.exception("Execution status could not be persisted; entries blocked")
 
     def run(self):
         while not self.stop_requested.is_set():
@@ -757,10 +837,11 @@ class AutoOrderManager:
 
     def report(self):
         v = self.snapshot()
-        return (f"Execution {self.broker.mode}: tickets Rs{v.get('tickets',0):.2f}; "
+        return (f"Execution {self.broker.mode} ({v.get('capital_model')}): turnover Rs{v.get('tickets',0):.2f}; "
                 f"remaining after reservations Rs{v.get('remaining',0):.2f}; "
                 f"gross Rs{v.get('gross',0):.2f}; provisional net Rs{v.get('net',0):.2f}; "
-                f"flat={v.get('flat',False)}; {v.get('reason','')}")
+                f"flat={v.get('flat',False)}; entries={'allowed' if v.get('entry_allowed') else 'blocked'}; "
+                f"{'; '.join(v.get('entry_blockers', []))}")
 
 
 def build_executor(kite, instruments, mode, **limits):
