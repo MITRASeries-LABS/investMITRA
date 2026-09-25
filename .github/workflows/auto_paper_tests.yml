@@ -17,6 +17,10 @@ on:
       - 'scripts/load_scores_to_neon.py'
       - 'scripts/compute_investmitra_score.py'
       - 'test_pipeline_dates.py'
+      - 'test_overnight_readiness.py'
+      - 'scripts/pipeline_readiness.py'
+      - 'scripts/pipeline_readiness_report.py'
+      - '.github/workflows/overnight_readiness.yml'
       - '.github/workflows/market_data.yml'
       - '.github/workflows/feature_engineering.yml'
   workflow_dispatch:
@@ -38,7 +42,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - run: pip install PyYAML
       - name: Check syntax
         run: python -m py_compile scripts/intraday_signals.py scripts/order_manager.py scripts/signal_runtime.py scripts/auto_paper_summary.py intraday_signals.py
       - name: Run offline lifecycle and review regressions
-        run: python -m unittest -v test_auto_trading test_review_fixes test_pipeline_dates
+        run: python -m unittest -v test_auto_trading test_review_fixes test_pipeline_dates test_overnight_readiness

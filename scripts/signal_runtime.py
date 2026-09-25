@@ -63,7 +63,7 @@ def previous_session(today, holidays):
     return previous
 
 
-def load_nse_holidays(today):
+def load_nse_holidays(today, *, validate_session=True):
     """Official capital-market calendar. Failure blocks new session startup."""
     import requests
     with requests.Session() as session:
@@ -74,7 +74,10 @@ def load_nse_holidays(today):
         response.raise_for_status()
         holidays = {datetime.strptime(row["tradingDate"], "%d-%b-%Y").date()
                     for row in response.json()["CM"]}
-    previous_session(today, holidays)  # validate coverage and session before use
+    if today.year not in {d.year for d in holidays}:
+        raise ValueError("NSE holiday calendar does not cover the current year")
+    if validate_session:
+        previous_session(today, holidays)  # engine startup still requires a session
     return holidays
 
 

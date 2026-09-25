@@ -1,9 +1,20 @@
 name: Feature Engineering — Daily Price Features
 
 on:
-  schedule:
-    # Run at 10:30 PM IST (17:00 UTC) Mon-Fri — after market data is loaded to Neon
-    - cron: "0 17 * * 1-5"
+  workflow_call:
+    inputs:
+      automatic:
+        type: boolean
+        default: false
+      date:
+        type: string
+        required: true
+      start:
+        type: string
+        default: ''
+      end:
+        type: string
+        default: ''
   workflow_dispatch:
     inputs:
       date:
@@ -19,6 +30,13 @@ on:
         required: false
         default: ""
 
+permissions:
+  contents: read
+
+concurrency:
+  group: feature_engineering-production
+  cancel-in-progress: false
+
 jobs:
   compute-features:
     runs-on: ubuntu-latest
@@ -32,11 +50,15 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: Refuse late automatic rebuild
+        if: inputs.automatic
+        run: python scripts/pipeline_readiness.py --check-cutoff
+
       - name: Resolve trade date once
         env:
-          INPUT_DATE: ${{ github.event.inputs.date }}
-          INPUT_START: ${{ github.event.inputs.start }}
-          INPUT_END: ${{ github.event.inputs.end }}
+          INPUT_DATE: ${{ inputs.date }}
+          INPUT_START: ${{ inputs.start }}
+          INPUT_END: ${{ inputs.end }}
         run: |
           trade_date=$(python scripts/pipeline_date.py --date "$INPUT_DATE" --start "$INPUT_START" --end "$INPUT_END")
           echo "TRADE_DATE=$trade_date" >> "$GITHUB_ENV"

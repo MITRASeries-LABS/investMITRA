@@ -24,10 +24,16 @@ def verify(target, stage):
         path = (f'{prefix}/features/price_features/year={target.year}/month={target.month:02d}'
                 f'/price_features_{target:%Y%m%d}.parquet')
         column = 'feature_date'
-    else:
+    elif stage == 'momentum':
         path = (f'{prefix}/scores/momentum/year={target.year}/month={target.month:02d}'
                 f'/momentum_{target:%Y%m%d}.parquet')
         column = 'score_date'
+    elif stage == 'composite':
+        path = (f'{prefix}/scores/investmitra_score/year={target.year}/month={target.month:02d}'
+                f'/investmitra_score_{target:%Y%m%d}.parquet')
+        column = 'score_date'
+    else:
+        raise ValueError(f'Unknown stage: {stage}')
     con = get_duckdb_con()
     try:
         total, matching = con.execute(
@@ -42,7 +48,7 @@ def verify(target, stage):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--date', required=True, type=date.fromisoformat)
-    parser.add_argument('--stage', required=True, choices=['prices', 'features', 'momentum'])
+    parser.add_argument('--stage', required=True, choices=['prices', 'features', 'momentum', 'composite'])
     args = parser.parse_args()
     verify(args.date, args.stage)
 
