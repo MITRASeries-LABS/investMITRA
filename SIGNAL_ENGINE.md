@@ -1,7 +1,7 @@
 # investMITRA — Signal Engine Feature Reference
 
 Updated: 25 September 2026. Capital reuse and operational visibility revision.
-Engine build: `2026-09-25-capital-visibility1`. All times below are IST.
+Engine build: `2026-09-25-capital-visibility2`. All times below are IST.
 
 This document describes the implemented automatic-paper system. Changes to trading
 parameters require testing and explicit sign-off. Updating this reference does not
@@ -24,7 +24,7 @@ change parameters or enable live trading.
 |---|---|---|
 | 1 | Maximum ticket | ₹10,000; enforced independently by the executor after price/quantity adjustment. |
 | 2 | Reusable capital | ₹35,000 equity/open-commitment ceiling; confirmed exit fills release capital, net of realised losses, provisional costs and pending reservations. |
-| 3 | Planned stop risk | Maximum ₹1,500 per trade for sizing; gaps, slippage and costs can make realised losses larger. |
+| 3 | Planned stop risk | Per-trade sizing ceiling ₹1,500, further restricted by the remaining ₹1,500 combined daily loss allowance including costs and open risk. |
 | 4 | ATR target | Target at 3×ATR; initial stop at 1.5×ATR. The initial target/stop geometry is 2:1. |
 | 5 | Minimum net screen | Estimated net must be at least ₹250 and twice estimated costs; executor rechecks after resizing. |
 | 6 | Priority score | RVOL × absolute gap percentage × blended score / 100; minimum 3, or 5 during lunch. |
@@ -56,8 +56,8 @@ change parameters or enable live trading.
 | Ticket size | ₹1,000 minimum; ₹10,000 maximum |
 | Maximum planned stop risk per trade | ₹1,500 |
 | Maximum simultaneous positions | 3 |
-| Daily loss threshold | ₹6,000, with open-risk checks before entry |
-| Consecutive-loss entry limit | 2 |
+| Combined daily loss threshold | ₹1,500 across realised P&L, fresh open-position P&L and provisional costs; latched halt and square-off at the threshold. |
+| Consecutive-loss entry limit | None; streak count is diagnostic only. |
 | Executor provisional cost allowance | ₹80 per filled trade/reserved entry |
 
 **There is no separately protected ₹5,000 reserve.** The earlier description
@@ -79,8 +79,21 @@ available = max(0, 35000 - capital reduction - remaining entry-price exposure
 ```
 
 Profits may offset realised losses/costs but never raise the ₹35,000 ceiling.
-No unrealised gains finance new entries. Daily loss/open-risk checks and the
-two-consecutive-loss limit remain enforced even when capital becomes available.
+No unrealised gains finance new entries. Daily loss/open-risk checks remain
+enforced even when capital becomes available. The approved daily loss threshold
+is **₹1,500 combined**, replacing the earlier ₹6,000 and two-loss configuration.
+Before a new entry, realised net loss, existing planned open risk, the candidate's
+planned stop risk and its cost reserve must fit within this daily threshold.
+Two small losses alone do not block a third qualifying trade.
+
+At the combined threshold the executor persists a daily halt, requests closure of
+all owned positions and blocks new entries for the rest of the session, including
+after restart. Stale/unavailable open quotes make combined P&L unknown and block
+new entries; realised-loss checks, protective stops and timed exits continue.
+This is a risk-control trigger, not a guaranteed final loss ceiling: gaps, slippage,
+delayed quotes, order failures and differences from provisional charges can cause
+the final result to exceed it. The ₹1,500 per-trade sizing ceiling does not provide
+a separate allowance on top of the daily limit.
 Short entries retain upper-circuit reservation and per-ticket bounds.
 
 An existing session with trades but no capital-model field retains

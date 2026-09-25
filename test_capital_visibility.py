@@ -54,15 +54,87 @@ class CapitalVisibilityTests(unittest.TestCase):
         self.assertFalse(self.m.state['halt'])
         self.assertEqual(self.m.snapshot()['remaining'], 420)
 
-    def test_two_losses_still_block_with_reusable_capital(self):
+    def test_two_losses_do_not_block_when_monetary_risk_allows(self):
         self.f.enter(); self.close(price=99)
         self.f.broker.price = 100
         self.f.enter(symbol='B'); self.close('B', price=99)
         self.assertEqual(self.m.snapshot()['losses'], 2)
         self.assertGreater(self.m.snapshot()['remaining'], 1000)
-        self.assertIn('consecutive-loss limit (2/2)', self.m.snapshot()['entry_blockers'])
+        self.assertTrue(self.m.snapshot()['entry_allowed'])
+        self.f.broker.price = 100
         self.m.offer(self.f.signal('C')); self.m.step()
-        self.assertNotIn('C', self.m.state['trades'])
+        self.assertIn('C', self.m.state['trades'])
+
+    def test_daily_1500_combined_threshold_includes_open_pnl_and_costs(self):
+        self.f.enter(qty=99)
+        self.assertEqual(self.m.max_daily_loss,1500)
+        self.f.broker.price=86  # 99 * -14 - 80 = -1466, below threshold magnitude
+        self.m.quotes=self.f.broker.quotes(['A'])
+        self.m._refresh();self.m._publish()
+        self.assertEqual(self.m.snapshot()['combined_net'],-1466)
+        self.assertNotIn('combined daily loss limit Rs1500',self.m.snapshot()['entry_blockers'])
+        self.f.broker.price=85
+        self.m.step()
+        self.assertTrue(self.m.state['flatten'])
+        self.assertIn('Rs1500',self.m.state['halt'])
+        self.assertFalse(self.m.snapshot()['entry_allowed'])
+        for _ in range(4):self.m.step()
+        self.assertTrue(self.m.snapshot()['flat'])
+        self.f.restart()
+        self.assertTrue(self.f.manager.state['flatten'])
+        self.assertIn('Rs1500',self.f.manager.state['halt'])
+
+    def test_daily_loss_exact_boundary_latches(self):
+        self.f.enter(qty=20)
+        self.f.broker.price=29  # -1420 gross unrealised -80 provisional = -1500
+        self.m.step()
+        self.assertTrue(self.m.state['flatten'])
+        self.assertEqual(self.m.state['trades']['A']['exit_reason'],'DAILY_LOSS')
+
+    def test_daily_limit_combines_multiple_open_positions(self):
+        self.f.enter(qty=99);self.f.enter(symbol='B',qty=99)
+        self.f.broker.price=93  # each position loses 693; total +160 costs = 1546
+        self.m.step()
+        self.assertTrue(self.m.state['flatten'])
+        self.assertEqual(self.m.snapshot()['combined_net'],-1546)
+        for _ in range(4):self.m.step()
+        self.assertTrue(self.m.snapshot()['flat'])
+
+    def test_engine_and_executor_share_1500_rule_without_streak_gate(self):
+        self.f.enter();self.close(price=99)
+        self.f.broker.price=100
+        self.f.enter(symbol='B');self.close('B',price=99)
+        self.f.broker.price=100
+        e=self.f._make_signal_engine()
+        # C is a fresh symbol; reuse A's fixture metadata for its signal path.
+        e.all_stocks['C']=dict(e.all_stocks['A'],symbol='C')
+        e.long_map['C']=e.all_stocks['C']
+        for name in ('today_open','prev_close','vwap','rvol_baseline','key_levels','gap_first_seen','gap_direction'):
+            getattr(e,name)['C']=copy.deepcopy(getattr(e,name)['A'])
+        self.assertEqual(e._check_signal.__globals__['MAX_DAILY_LOSS_INR'],1500)
+        e._check_signal('C',100,1000,self.f.now,'momentum')
+        self.assertFalse(self.m.inbox.empty())
+        self.assertEqual(e.risk.consecutive_losses,2)
+
+    def test_daily_loss_blocks_candidate_whose_planned_risk_exceeds_remainder(self):
+        self.f.enter(qty=20);self.close(price=90)  # realised -200, costs -80
+        self.f.broker.price=100
+        sig=self.f.signal('B',qty=99)
+        sig.update(stoploss=88,target=130)  # 99*12 + new cost80 leaves worse than -1500
+        self.m.offer(sig);self.m.step()
+        self.assertNotIn('B',self.m.state['trades'])
+        self.assertEqual(self.m.snapshot()['losses'],1)
+
+    def test_short_open_loss_is_in_combined_limit(self):
+        self.f.enter(qty=80,direction='SHORT')
+        self.f.broker.price=118  # -1440 -80
+        self.m.step()
+        self.assertTrue(self.m.state['flatten'])
+        self.assertIn('combined daily loss',self.m.state['halt'])
+
+    def test_stale_quote_is_not_reported_as_known_combined_pnl(self):
+        self.f.enter();self.f.broker.stale=True;self.m.step()
+        self.assertIsNone(self.m.snapshot()['combined_net'])
 
     def test_exit_request_or_cancel_pending_does_not_release_funds(self):
         self.f.enter()
@@ -248,7 +320,7 @@ class CapitalVisibilityTests(unittest.TestCase):
 
     def test_loss_block_defers_discovery_and_explains_why(self):
         e=self.f._make_signal_engine()
-        self.m.view['entry_blockers']=['consecutive-loss limit (2/2)']
+        self.m.view['entry_blockers']=['combined daily loss limit Rs1500']
         self.m.view['entry_allowed']=False
         now=self.f.now
         class Clock(datetime):
@@ -259,7 +331,7 @@ class CapitalVisibilityTests(unittest.TestCase):
             self.assertIsNone(e._scan_market('post-exit'))
             self.assertIsNone(e._scan_market('post-exit'))
         self.assertEqual(len(logs.output),1)
-        self.assertIn('consecutive-loss',logs.output[0])
+        self.assertIn('daily loss',logs.output[0])
 
     def test_pre_entry_window_still_observes_hold_without_submitting(self):
         e=self.f._make_signal_engine()

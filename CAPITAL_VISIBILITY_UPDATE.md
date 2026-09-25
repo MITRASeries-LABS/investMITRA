@@ -1,16 +1,20 @@
 # Capital reuse and terminal visibility update
 
 Prepared for installation after the market session. Build:
-`2026-09-25-capital-visibility1`. The existing laptop process is unaffected by
+`2026-09-25-capital-visibility2`. The existing laptop process is unaffected by
 preparing this branch. This update keeps `auto_paper`; it does not activate live orders.
 
 ## What changes
 
 - New sessions use a ₹35,000 reusable capital ceiling. Confirmed exit fills release
   entry-price exposure, with realised losses, costs and pending commitments retained.
-- Reports distinguish turnover from capital in use. ₹1,000–₹10,000 tickets, ₹1,500
-  planned risk, three simultaneous positions, the two-loss rule and daily-loss
-  threshold remain unchanged. Released capital does not override risk blocks.
+- Reports distinguish turnover from capital in use. ₹1,000–₹10,000 tickets and
+  three simultaneous positions remain. The user-approved **₹1,500 combined daily
+  loss threshold** replaces ₹6,000 and the two-loss restriction. Loss streaks are
+  diagnostic only; entries still require room for costs and all planned open risk.
+  The threshold triggers a persistent halt and square-off, not a guaranteed final
+  loss ceiling. Slippage/gaps can exceed it. The running laptop retains old settings
+  until this build is installed and started.
 - Entries, confirmed fills and exits appear in the terminal independently of Telegram.
   Closure messages include quantities, average prices, reason and provisional net.
 - SHORT routing and repeated priority checks no longer flood INFO logs. A queued

@@ -59,9 +59,8 @@ MAX_RISK_PER_TRADE_INR  = 1500   # proportional to Rs10k ticket
 MAX_CAPITAL_PER_TRADE   = 10000  # max per trade (3 trades of Rs10k)
 MAX_CONCURRENT_TRADES   = 3      # max simultaneous positions
 MIN_PRIORITY_SCORE      = 3.0    # RVOL x gap x score/100 minimum (raised for quality)
-MAX_DAILY_LOSS_INR      = 6000
+MAX_DAILY_LOSS_INR      = 1500   # combined realised + unrealised loss, including provisional costs
 MAX_POSITIONS           = 3
-MAX_CONSECUTIVE_LOSSES  = 2
 ATR_STOP_MULT           = 1.5   # stop at 1.5 ATR
 ATR_TARGET_MULT         = 3.0   # target at 3 ATR → 1:2 R:R
 BROKERAGE_PER_TRADE     = 80   # conservative fallback only
@@ -1013,8 +1012,6 @@ class DailyRiskManager:
             return False, f"Max trades ({self.trades_today})"
         if len(self.positions) >= MAX_POSITIONS:
             return False, f"Max positions ({len(self.positions)})"
-        if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-            return False, f"Consecutive losses: {self.consecutive_losses}"
         return True, "OK"
 
     def open_position(self, symbol, entry, stop, size, target, atr, estimated_costs=None):
@@ -1336,13 +1333,15 @@ class IntradayEngine:
             return f"{max(0, (now-value).total_seconds()):.0f}s"
         quote_status = ", ".join(f"{s}:{'fresh' if ok else 'STALE'}"
                                  for s, ok in sorted(view.get("quote_fresh", {}).items())) or "no open positions"
+        combined = view.get("combined_net")
         logger.info("HEARTBEAT: WS tick age=%s; executor cycle age=%s; successful cycle age=%s; "
                     "open exposure=Rs%.2f; available=Rs%.2f; entries=%s; %s; "
-                    "quotes at last cycle=%s",
+                    "quotes at last cycle=%s; combined net at last cycle=%s",
                     age(self._last_ws_tick_at), age(view.get("cycle_completed_at")),
                     age(view.get("cycle_success_at")), view.get("exposure", 0), view.get("remaining", 0),
                     "allowed" if view.get("entry_allowed") else "blocked",
-                    "; ".join(view.get("entry_blockers", [])), quote_status)
+                    "; ".join(view.get("entry_blockers", [])), quote_status,
+                    "unknown" if combined is None else f"Rs{combined:.2f}")
 
     def _maintenance_loop(self):
         """Observe closes without WebSocket ticks and serialize all scheduled scans."""
@@ -1832,9 +1831,6 @@ class IntradayEngine:
         # Risk checks - checked again after sizing below
         if self.risk.net_pnl <= -MAX_DAILY_LOSS_INR:
             logger.debug("Daily loss limit hit: Rs%.0f", self.risk.net_pnl)
-            return
-        if self.risk.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-            logger.debug("Consecutive losses: %d", self.risk.consecutive_losses)
             return
         # Position cap - explicit paper/live limits
         pos_limit = PAPER_MAX_POSITIONS if PAPER_TRADING else MAX_POSITIONS
@@ -2703,6 +2699,7 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
         "capital_model": execution.snapshot().get("capital_model") if execution else None,
         "daily_cap": MAX_DAILY_CAPITAL_INR, "max_ticket": MAX_CAPITAL_PER_TRADE,
         "max_risk": MAX_RISK_PER_TRADE_INR, "min_profit": MIN_NET_PROFIT,
+        "max_daily_loss": MAX_DAILY_LOSS_INR,
         "priority": MIN_PRIORITY_SCORE, "stop_atr": ATR_STOP_MULT, "target_atr": ATR_TARGET_MULT,
     }, sort_keys=True).encode()).hexdigest()[:12]
     engine.fo_eligible_symbols = load_fo_eligible_symbols()
@@ -2901,8 +2898,7 @@ def main():
     execution = build_executor(
         kite, instruments, EXECUTION_MODE, daily_cap=MAX_DAILY_CAPITAL_INR,
         min_ticket=MIN_TICKET_INR, max_ticket=MAX_CAPITAL_PER_TRADE, max_risk=MAX_RISK_PER_TRADE_INR,
-        max_daily_loss=MAX_DAILY_LOSS_INR, max_positions=MAX_POSITIONS,
-        max_losses=MAX_CONSECUTIVE_LOSSES)
+        max_daily_loss=MAX_DAILY_LOSS_INR, max_positions=MAX_POSITIONS)
     execution.step()
     worker = threading.Thread(target=execution.run, daemon=True)
     worker.start()

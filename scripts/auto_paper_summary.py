@@ -172,6 +172,12 @@ def summarise(db_path="data/execution_auto_paper.sqlite3", target_date=None,
         print(f"  Executor status as of {status['as_of']} (recorded snapshot, not a live health check):")
         print("  New entries: " + ("eligible subject to signal checks" if status['allowed'] else
                                   "BLOCKED — " + "; ".join(status['blockers'])))
+        if 'combined_net' in status:
+            mark = status['combined_net']
+            print("  Combined realised + unrealised P&L after provisional costs: " +
+                  (f"₹{mark:+,.2f}" if mark is not None else "unknown — open quotes stale/unavailable"))
+            print(f"  Daily loss threshold: ₹{state['limits']['max_daily_loss']:,.2f}; "
+                  f"consecutive losses: {status.get('consecutive_losses', 0)} (diagnostic only)")
     else:
         print("  Entry eligibility not recorded in this historical journal; Halt alone is insufficient.")
     print(f"  Halt: {state.get('halt') or 'none'}\n{'='*80}\n")
