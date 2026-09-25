@@ -32,8 +32,28 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: Resolve trade date once
+        env:
+          INPUT_DATE: ${{ github.event.inputs.date }}
+          INPUT_START: ${{ github.event.inputs.start }}
+          INPUT_END: ${{ github.event.inputs.end }}
+        run: |
+          trade_date=$(python scripts/pipeline_date.py --date "$INPUT_DATE" --start "$INPUT_START" --end "$INPUT_END")
+          echo "TRADE_DATE=$trade_date" >> "$GITHUB_ENV"
+          echo "RANGE_START=$INPUT_START" >> "$GITHUB_ENV"
+          echo "Resolved trade date: $trade_date"
+
       - name: Install dependencies
         run: pip install -r requirements-flow.txt duckdb pyarrow boto3 numpy yfinance psycopg2-binary beautifulsoup4 requests
+
+      - name: Validate dated prices input
+        env:
+          CC_ENV: prod
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CC_BUCKET_RAW: cc-raw
+        run: python scripts/verify_pipeline_data.py --date "$TRADE_DATE" --stage prices
 
       - name: Compute price features
         env:
@@ -43,13 +63,20 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           CC_BUCKET_RAW: cc-raw
         run: |
-          if [ -n "${{ github.event.inputs.start }}" ]; then
-            python scripts/compute_features.py --start ${{ github.event.inputs.start }} --end ${{ github.event.inputs.end || '' }}
-          elif [ -n "${{ github.event.inputs.date }}" ]; then
-            python scripts/compute_features.py --date ${{ github.event.inputs.date }}
+          if [ -n "$RANGE_START" ]; then
+            python scripts/compute_features.py --start "$RANGE_START" --end "$TRADE_DATE"
           else
-            python scripts/compute_features.py
+            python scripts/compute_features.py --date "$TRADE_DATE"
           fi
+
+      - name: Validate dated features input
+        env:
+          CC_ENV: prod
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CC_BUCKET_RAW: cc-raw
+        run: python scripts/verify_pipeline_data.py --date "$TRADE_DATE" --stage features
 
       - name: Compute momentum scores
         env:
@@ -60,13 +87,20 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           CC_BUCKET_RAW: cc-raw
         run: |
-          if [ -n "${{ github.event.inputs.start }}" ]; then
-            python scripts/compute_momentum_score.py --start ${{ github.event.inputs.start }} --end ${{ github.event.inputs.end || '' }}
-          elif [ -n "${{ github.event.inputs.date }}" ]; then
-            python scripts/compute_momentum_score.py --date ${{ github.event.inputs.date }}
+          if [ -n "$RANGE_START" ]; then
+            python scripts/compute_momentum_score.py --start "$RANGE_START" --end "$TRADE_DATE"
           else
-            python scripts/compute_momentum_score.py
+            python scripts/compute_momentum_score.py --date "$TRADE_DATE"
           fi
+
+      - name: Validate dated momentum input
+        env:
+          CC_ENV: prod
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CC_BUCKET_RAW: cc-raw
+        run: python scripts/verify_pipeline_data.py --date "$TRADE_DATE" --stage momentum
 
       - name: Compute financial stress scores
         env:
@@ -76,12 +110,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           CC_BUCKET_RAW: cc-raw
-        run: |
-          if [ -n "${{ github.event.inputs.date }}" ]; then
-            python scripts/compute_financial_stress_score.py --date ${{ github.event.inputs.date }}
-          else
-            python scripts/compute_financial_stress_score.py
-          fi
+        run: python scripts/compute_financial_stress_score.py --date "$TRADE_DATE"
 
       - name: Compute management quality scores
         env:
@@ -91,12 +120,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           CC_BUCKET_RAW: cc-raw
-        run: |
-          if [ -n "${{ github.event.inputs.date }}" ]; then
-            python scripts/compute_management_quality_score.py --date ${{ github.event.inputs.date }}
-          else
-            python scripts/compute_management_quality_score.py
-          fi
+        run: python scripts/compute_management_quality_score.py --date "$TRADE_DATE"
 
       - name: Compute composite investMITRA score
         env:
@@ -106,12 +130,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           CC_BUCKET_RAW: cc-raw
-        run: |
-          if [ -n "${{ github.event.inputs.date }}" ]; then
-            python scripts/compute_investmitra_score.py --date ${{ github.event.inputs.date }}
-          else
-            python scripts/compute_investmitra_score.py
-          fi
+        run: python scripts/compute_investmitra_score.py --date "$TRADE_DATE"
 
       - name: Load scores to Neon
         env:
@@ -121,12 +140,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           CC_BUCKET_RAW: cc-raw
-        run: |
-          if [ -n "${{ github.event.inputs.date }}" ]; then
-            python scripts/load_scores_to_neon.py --date ${{ github.event.inputs.date }}
-          else
-            python scripts/load_scores_to_neon.py
-          fi
+        run: python scripts/load_scores_to_neon.py --date "$TRADE_DATE"
 
       - name: Compute early signals
         env:
@@ -135,12 +149,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           CC_BUCKET_RAW: cc-raw
-        run: |
-          if [ -n "${{ github.event.inputs.date }}" ]; then
-            python scripts/compute_early_signals.py --date ${{ github.event.inputs.date }}
-          else
-            python scripts/compute_early_signals.py
-          fi
+        run: python scripts/compute_early_signals.py --date "$TRADE_DATE"
 
       - name: Fetch Screener signals
         env:
@@ -186,13 +195,8 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           CC_BUCKET_RAW: cc-raw
         run: |
-          if [ -n "${{ github.event.inputs.date }}" ]; then
-            python scripts/daily_top_picks.py --date ${{ github.event.inputs.date }} --top 10 --cap ALL --no-ta
-            python scripts/daily_top_picks.py --date ${{ github.event.inputs.date }} --top 10 --cap SMALLMICRO --no-ta
-          else
-            python scripts/daily_top_picks.py --top 10 --cap ALL --no-ta
-            python scripts/daily_top_picks.py --top 10 --cap SMALLMICRO --no-ta
-          fi
+          python scripts/daily_top_picks.py --date "$TRADE_DATE" --top 10 --cap ALL --no-ta
+          python scripts/daily_top_picks.py --date "$TRADE_DATE" --top 10 --cap SMALLMICRO --no-ta
 
       - name: Daily trade analysis (Sonnet)
         env:

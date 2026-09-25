@@ -180,6 +180,8 @@ def main():
 
     ensure_table()
     written = load_for_date(target)
+    if written <= 0:
+        raise RuntimeError(f"No scores written for {target}; pipeline is incomplete")
     print(f"Loaded {written} scores for {target}")
 
 

@@ -17,6 +17,7 @@ import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
 from dotenv import load_dotenv
+from pipeline_date import resolve_trade_date
 
 load_dotenv('.env.prod')
 
@@ -243,6 +244,8 @@ def main():
     parser.add_argument("--date",     type=date.fromisoformat)
     parser.add_argument("--backfill", action="store_true")
     parser.add_argument("--verify",   action="store_true")
+    parser.add_argument("--require-nse", action="store_true",
+                        help="Fail unless the requested date writes NSE prices")
     args = parser.parse_args()
 
     if args.verify:
@@ -257,17 +260,10 @@ def main():
             load_date(d)
         verify(); return
 
-    if args.date:
-        target = args.date
-    else:
-        # Pipeline runs late night IST ? use previous business day
-        now_ist = datetime.now(IST)
-        target = now_ist.date()
-        if now_ist.hour >= 23 or now_ist.hour < 6:
-            target = target - timedelta(days=1)
-        while target.weekday() >= 5:
-            target = target - timedelta(days=1)
-    load_date(target)
+    target = resolve_trade_date(args.date or os.getenv("TRADE_DATE"))
+    result = load_date(target)
+    if args.require_nse and result["nse_rows"] <= 0:
+        raise RuntimeError(f"No NSE prices written for {target}; pipeline is incomplete")
     verify()
 
 

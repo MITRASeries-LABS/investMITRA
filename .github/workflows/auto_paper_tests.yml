@@ -11,6 +11,14 @@ on:
       - 'test_auto_trading.py'
       - 'test_review_fixes.py'
       - '.github/workflows/auto_paper_tests.yml'
+      - 'scripts/pipeline_date.py'
+      - 'scripts/verify_pipeline_data.py'
+      - 'scripts/load_prices_to_neon.py'
+      - 'scripts/load_scores_to_neon.py'
+      - 'scripts/compute_investmitra_score.py'
+      - 'test_pipeline_dates.py'
+      - '.github/workflows/market_data.yml'
+      - '.github/workflows/feature_engineering.yml'
   workflow_dispatch:
 
 permissions:
@@ -33,4 +41,4 @@ jobs:
       - name: Check syntax
         run: python -m py_compile scripts/intraday_signals.py scripts/order_manager.py scripts/signal_runtime.py scripts/auto_paper_summary.py intraday_signals.py
       - name: Run offline lifecycle and review regressions
-        run: python -m unittest -v test_auto_trading test_review_fixes
+        run: python -m unittest -v test_auto_trading test_review_fixes test_pipeline_dates

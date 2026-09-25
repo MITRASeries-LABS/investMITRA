@@ -49,8 +49,8 @@ def get_duckdb_con():
 
 
 def load_score(con, score_type: str, score_date: date) -> pd.DataFrame | None:
-    """Load most recent score file on or before score_date."""
-    for days_back in range(8):
+    """Momentum must match the session; slower components may use recent data."""
+    for days_back in range(1 if score_type == "momentum" else 8):
         check_date = score_date - timedelta(days=days_back)
         path = (f"s3://{BUCKET}/{ENV}/scores/{score_type}"
                 f"/year={check_date.year}/month={check_date.month:02d}"
@@ -61,7 +61,7 @@ def load_score(con, score_type: str, score_date: date) -> pd.DataFrame | None:
             return df
         except:
             continue
-    logger.warning("Could not find %s within 7 days of %s", score_type, score_date)
+    logger.warning("Required %s unavailable for %s (momentum requires the exact date)", score_type, score_date)
     return None
 
 
@@ -219,8 +219,7 @@ def main():
 
     df = compute_investmitra_score(target)
     if df.empty:
-        logger.error("No scores computed")
-        return
+        raise RuntimeError(f"No composite scores computed for {target}")
 
     path = write_to_r2(df, target)
     print({"date": str(target), "isins": len(df), "path": path, "status": "ok"})

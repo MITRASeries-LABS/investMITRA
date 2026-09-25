@@ -193,8 +193,26 @@ Scheduled GitHub workflows:
 | 8:30 PM, weekdays | Market Data — NSE + BSE Daily Pipeline |
 | 10:30 PM, weekdays | Feature Engineering — Daily Price Features |
 
+Each workflow resolves one trade date and passes it explicitly to dependent jobs.
+Without an explicit date, runs before 6 PM IST use the previous weekday; evening
+runs use that day's weekday, including after 11 PM. This is a completed-day
+selection rule, not a holiday calendar. Missing exchange data must be investigated.
+The price-loader completion step requires nonzero NSE writes; scoring verifies
+nonempty, correctly dated price, feature and momentum files. Composite momentum
+must match the requested date rather than falling back to a previous session.
 Confirm successful completion and data dates. Scheduling does not guarantee an
 on-time run or fresh data; the startup checks are the final entry gate.
+
+### Recovering missing daily data
+
+In GitHub Actions, run **Market Data — NSE + BSE Daily Pipeline** on `main`,
+with an explicit `date` and `step=all` for each missing trading date. For the
+25 September incident, recover `2026-09-22`, `2026-09-23`, then `2026-09-24`.
+After the price jobs finish, run **Feature Engineering — Daily Price Features**
+with `date=2026-09-24` (leave range inputs blank). Rebuilding scores matters:
+an old successful scoring run may have used stale momentum under a current date.
+Check the loader's actual NSE row counts and the new scoring validation results
+before restarting the engine. Keep the stale-data entry block enabled.
 
 `fetch_nse_announcements.py --loop` is a **separate monitor**. Between 9 AM and
 4 PM it fetches every 30 minutes, saves to Neon and prints console alerts. Outside
@@ -263,11 +281,12 @@ Ctrl+C when finished.
 After code updates, with trading stopped:
 
 ```powershell
-python -m unittest -q test_auto_trading test_review_fixes
+python -m unittest -q test_auto_trading test_review_fixes test_pipeline_dates
 ```
 
-At code commit `96e5817`, all **94 offline tests** passed on Windows and Ubuntu,
-Python 3.12 and 3.13. Simulated failure messages can appear during successful tests;
+At code commit `96e5817`, all **94 trading tests** passed on Windows and Ubuntu,
+Python 3.12 and 3.13. The pipeline correction adds 16 offline date/readiness tests
+for a total of 110. Simulated failure messages can appear during successful tests;
 the final result must be `OK`. These tests use fake brokers and temporary journals,
 not live Telegram, broker orders or the production database.
 
