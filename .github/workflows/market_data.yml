@@ -2,7 +2,7 @@ name: Market Data — NSE + BSE Daily Pipeline
 
 on:
   schedule:
-    # NSE Bhavcopy: 8:00 PM IST = 14:30 UTC Mon-Fri
+    # Scheduled 8:30 PM IST; delayed runs share one resolved EOD date.
     - cron: "0 15 * * 1-5"
   workflow_dispatch:
     inputs:
@@ -24,11 +24,30 @@ on:
           - eod_processing
 
 jobs:
+  resolve-date:
+    name: Resolve trade date once
+    runs-on: ubuntu-latest
+    outputs:
+      trade_date: ${{ steps.date.outputs.trade_date }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - id: date
+        env:
+          INPUT_TRADE_DATE: ${{ github.event.inputs.date }}
+        run: |
+          trade_date=$(python scripts/pipeline_date.py --date "$INPUT_TRADE_DATE")
+          echo "trade_date=$trade_date" >> "$GITHUB_OUTPUT"
+          echo "Resolved trade date: $trade_date"
+
   # ─────────────────────────────────────────────
   # Step 1 — NSE Bhavcopy (8:00 PM IST)
   # ─────────────────────────────────────────────
   nse-bhavcopy:
     name: NSE Bhavcopy
+    needs: resolve-date
     runs-on: ubuntu-latest
     timeout-minutes: 15
     if: github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'bhavcopy'
@@ -47,7 +66,7 @@ jobs:
       - name: Run NSE Bhavcopy
         env:
           CC_ENV: prod
-          TRADE_DATE: ${{ github.event.inputs.date }}
+          TRADE_DATE: ${{ needs.resolve-date.outputs.trade_date }}
           CC_DB_SCHEMA: investmitra
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
           CC_TIMESCALE_URL: ${{ secrets.CC_TIMESCALE_URL }}
@@ -67,8 +86,8 @@ jobs:
     name: NSE Delivery %
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: nse-bhavcopy
-    if: always() && (github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'delivery')
+    needs: [resolve-date, nse-bhavcopy]
+    if: always() && needs.resolve-date.result == 'success' && (github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'delivery')
 
     steps:
       - uses: actions/checkout@v4
@@ -80,7 +99,7 @@ jobs:
       - name: Run NSE Delivery
         env:
           CC_ENV: prod
-          TRADE_DATE: ${{ github.event.inputs.date }}
+          TRADE_DATE: ${{ needs.resolve-date.outputs.trade_date }}
           CC_DB_SCHEMA: investmitra
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
           AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
@@ -99,8 +118,8 @@ jobs:
     name: BSE EOD
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: nse-bhavcopy
-    if: always() && (github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'bse_eod')
+    needs: [resolve-date, nse-bhavcopy]
+    if: always() && needs.resolve-date.result == 'success' && (github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'bse_eod')
 
     steps:
       - uses: actions/checkout@v4
@@ -112,7 +131,7 @@ jobs:
       - name: Run BSE EOD
         env:
           CC_ENV: prod
-          TRADE_DATE: ${{ github.event.inputs.date }}
+          TRADE_DATE: ${{ needs.resolve-date.outputs.trade_date }}
           CC_DB_SCHEMA: investmitra
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
           AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
@@ -131,8 +150,8 @@ jobs:
     name: NSE F&O Bhavcopy
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: nse-bhavcopy
-    if: always() && (github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'fo_bhavcopy')
+    needs: [resolve-date, nse-bhavcopy]
+    if: always() && needs.resolve-date.result == 'success' && (github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'fo_bhavcopy')
 
     steps:
       - uses: actions/checkout@v4
@@ -144,7 +163,7 @@ jobs:
       - name: Run NSE F&O
         env:
           CC_ENV: prod
-          TRADE_DATE: ${{ github.event.inputs.date }}
+          TRADE_DATE: ${{ needs.resolve-date.outputs.trade_date }}
           CC_DB_SCHEMA: investmitra
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
           AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
@@ -165,8 +184,8 @@ jobs:
     name: EOD Processing
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    needs: [nse-delivery, bse-eod, nse-fo]
-    if: always() && (github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'eod_processing')
+    needs: [resolve-date, nse-delivery, bse-eod, nse-fo]
+    if: always() && needs.resolve-date.result == 'success' && (github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'eod_processing')
 
     steps:
       - uses: actions/checkout@v4
@@ -178,7 +197,7 @@ jobs:
       - name: Run EOD Processing
         env:
           CC_ENV: prod
-          TRADE_DATE: ${{ github.event.inputs.date }}
+          TRADE_DATE: ${{ needs.resolve-date.outputs.trade_date }}
           CC_DB_SCHEMA: investmitra
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
           CC_TIMESCALE_URL: ${{ secrets.CC_TIMESCALE_URL }}
@@ -194,7 +213,7 @@ jobs:
       - name: Load prices to Neon
         env:
           CC_ENV: prod
-          TRADE_DATE: ${{ github.event.inputs.date }}
+          TRADE_DATE: ${{ needs.resolve-date.outputs.trade_date }}
           CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
           AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -202,4 +221,4 @@ jobs:
           CC_BUCKET_RAW: cc-raw
         run: |
           pip install duckdb --quiet
-          python scripts/load_prices_to_neon.py
+          python scripts/load_prices_to_neon.py --date "$TRADE_DATE" --require-nse
