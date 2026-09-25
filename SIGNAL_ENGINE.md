@@ -186,22 +186,49 @@ fetch attempt. Stale data or unavailable calendar validation blocks entries.
 Special trading sessions or missing prior-year calendar coverage need explicit
 support; the engine does not guess them.
 
-Scheduled GitHub workflows:
+The **Overnight recovery and morning readiness** workflow coordinates preparation.
+All times below are IST and are scheduled targets, not execution guarantees.
 
-| Scheduled IST time | Workflow |
+| Scheduled IST time | Action |
 |---|---|
-| 8:30 PM, weekdays | Market Data — NSE + BSE Daily Pipeline |
-| 10:30 PM, weekdays | Feature Engineering — Daily Price Features |
+| 8:37 PM, weekdays | Validate readiness; ingest missing recent sessions, then compute features/scores. |
+| 11:37 PM and 2:37 AM following each weekday | Retry preparation if it still fails readiness. |
+| 4:07 AM, Monday–Friday | Final scheduled recovery attempt. |
+| 7:07 AM, Monday–Friday | Independent check-only run and Telegram readiness report. |
 
-Each workflow resolves one trade date and passes it explicitly to dependent jobs.
-Without an explicit date, runs before 6 PM IST use the previous weekday; evening
-runs use that day's weekday, including after 11 PM. This is a completed-day
-selection rule, not a holiday calendar. Missing exchange data must be investigated.
-The price-loader completion step requires nonzero NSE writes; scoring verifies
-nonempty, correctly dated price, feature and momentum files. Composite momentum
-must match the requested date rather than falling back to a previous session.
-Confirm successful completion and data dates. Scheduling does not guarantee an
-on-time run or fresh data; the startup checks are the final entry gate.
+The overnight coordinator resolves the last completed regular NSE session using
+the official holiday calendar. Calendar failure blocks preparation rather than
+guessing a session. It checks NSE prices for the five most recent sessions and
+backfills missing dates oldest first, before scoring the target session. At most
+four scheduled preparation opportunities exist per night; there is no infinite
+retry loop. Automatic rebuild stages refuse to start from 6 AM until 6 PM IST.
+An already-running stage may finish later; the morning check has an independent
+concurrency group so it does not queue behind the recovery workflow.
+
+The former independent market-data and feature-engineering schedules are removed.
+Both workflows remain available for explicit manual recovery and are reusable by
+the coordinator. Data ingestion must finish successfully before scoring starts.
+Successful preparation records a receipt in R2 after exact-date validation of
+price, feature, momentum and composite outputs, plus Neon row checks. Later runs
+skip rebuilding only if the receipt, current output ETags and database counts
+still match. A current-looking score date alone is insufficient.
+
+Failures produce a GitHub Actions failure and an alert through the existing
+Telegram bot/chat secrets. The 7:07 AM check reports either **EOD DATA READY** or
+**EOD DATA NOT READY**. Missing secrets or delivery failure fail the report step;
+notification delivery is not guaranteed. Ready means EOD data preparation only:
+the laptop still needs Kite login, current market context and engine preflight.
+This automation never starts trading or accesses the broker.
+
+GitHub schedules can be delayed or dropped. Multiple overnight checks reduce the
+risk but cannot guarantee recovery or an alert by a fixed time during a GitHub
+outage. A separately hosted scheduler/monitor would be needed for independence
+from GitHub itself. Freshness checks at engine startup remain the final gate.
+
+Manual workflow dates remain explicit. Without a date, the legacy manual date
+resolver uses the previous weekday before 6 PM IST and the current weekday after
+6 PM; it is not a holiday override. Use the coordinator for calendar-aware checks.
+Do not launch manual data writers concurrently with automated recovery.
 
 ### Recovering missing daily data
 
@@ -281,12 +308,13 @@ Ctrl+C when finished.
 After code updates, with trading stopped:
 
 ```powershell
-python -m unittest -q test_auto_trading test_review_fixes test_pipeline_dates
+python -m pip install PyYAML
+python -m unittest -q test_auto_trading test_review_fixes test_pipeline_dates test_overnight_readiness
 ```
 
 At code commit `96e5817`, all **94 trading tests** passed on Windows and Ubuntu,
-Python 3.12 and 3.13. The pipeline correction adds 16 offline date/readiness tests
-for a total of 110. Simulated failure messages can appear during successful tests;
+Python 3.12 and 3.13. The pipeline correction adds 16 offline date/readiness tests.
+The overnight automation adds 19 regressions, for a total of 129. Simulated failure messages can appear during successful tests;
 the final result must be `OK`. These tests use fake brokers and temporary journals,
 not live Telegram, broker orders or the production database.
 

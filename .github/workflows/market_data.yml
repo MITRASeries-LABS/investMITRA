@@ -1,13 +1,21 @@
 name: Market Data — NSE + BSE Daily Pipeline
 
 on:
-  schedule:
-    # Scheduled 8:30 PM IST; delayed runs share one resolved EOD date.
-    - cron: "0 15 * * 1-5"
+  workflow_call:
+    inputs:
+      automatic:
+        type: boolean
+        default: false
+      date:
+        type: string
+        required: true
+      step:
+        type: string
+        default: all
   workflow_dispatch:
     inputs:
       date:
-        description: "Trade date (YYYY-MM-DD, default today)"
+        description: "Trade date (YYYY-MM-DD; default completed weekday)"
         required: false
         default: ""
       step:
@@ -23,9 +31,17 @@ on:
           - fo_bhavcopy
           - eod_processing
 
+permissions:
+  contents: read
+
+concurrency:
+  group: market_data-production
+  cancel-in-progress: false
+
 jobs:
   resolve-date:
     name: Resolve trade date once
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     outputs:
       trade_date: ${{ steps.date.outputs.trade_date }}
@@ -34,9 +50,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Refuse late automatic rebuild
+        if: inputs.automatic
+        run: python scripts/pipeline_readiness.py --check-cutoff
       - id: date
         env:
-          INPUT_TRADE_DATE: ${{ github.event.inputs.date }}
+          INPUT_TRADE_DATE: ${{ inputs.date }}
         run: |
           trade_date=$(python scripts/pipeline_date.py --date "$INPUT_TRADE_DATE")
           echo "trade_date=$trade_date" >> "$GITHUB_OUTPUT"
@@ -50,7 +69,7 @@ jobs:
     needs: resolve-date
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    if: github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'bhavcopy'
+    if: inputs.step == 'all' || inputs.step == 'bhavcopy'
 
     steps:
       - uses: actions/checkout@v4
@@ -87,7 +106,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [resolve-date, nse-bhavcopy]
-    if: always() && needs.resolve-date.result == 'success' && (github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'delivery')
+    if: always() && needs.resolve-date.result == 'success' && (inputs.step == 'all' || inputs.step == 'delivery')
 
     steps:
       - uses: actions/checkout@v4
@@ -119,7 +138,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [resolve-date, nse-bhavcopy]
-    if: always() && needs.resolve-date.result == 'success' && (github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'bse_eod')
+    if: always() && needs.resolve-date.result == 'success' && (inputs.step == 'all' || inputs.step == 'bse_eod')
 
     steps:
       - uses: actions/checkout@v4
@@ -151,7 +170,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [resolve-date, nse-bhavcopy]
-    if: always() && needs.resolve-date.result == 'success' && (github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'fo_bhavcopy')
+    if: always() && needs.resolve-date.result == 'success' && (inputs.step == 'all' || inputs.step == 'fo_bhavcopy')
 
     steps:
       - uses: actions/checkout@v4
@@ -183,9 +202,9 @@ jobs:
   eod-processing:
     name: EOD Processing
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 20
     needs: [resolve-date, nse-delivery, bse-eod, nse-fo]
-    if: always() && needs.resolve-date.result == 'success' && (github.event_name == 'schedule' || github.event.inputs.step == 'all' || github.event.inputs.step == 'eod_processing')
+    if: always() && needs.resolve-date.result == 'success' && (inputs.step == 'all' || inputs.step == 'eod_processing')
 
     steps:
       - uses: actions/checkout@v4

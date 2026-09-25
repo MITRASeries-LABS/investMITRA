@@ -1,0 +1,123 @@
+name: Overnight recovery and morning readiness
+
+on:
+  schedule:
+    # IST: 20:37 initial, 23:37 / 02:37 / 04:07 recovery, 07:07 check.
+    # Avoid the top of the hour. GitHub schedules are still best-effort.
+    - cron: '7 15 * * 1-5'
+    - cron: '7 18 * * 1-5'
+    - cron: '7 21 * * 1-5'
+    - cron: '37 22 * * 0-4'
+    - cron: '37 1 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Completed session override (YYYY-MM-DD); blank uses NSE calendar'
+        type: string
+        default: ''
+      check_only:
+        description: 'Validate without starting recovery'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: overnight-${{ github.event.schedule == '37 1 * * 1-5' && 'morning-check' || 'recovery' }}
+  cancel-in-progress: false
+
+env:
+  CC_ENV: prod
+  CC_BUCKET_RAW: cc-raw
+  CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+  AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+jobs:
+  readiness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      date: ${{ steps.check.outputs.date }}
+      ready: ${{ steps.check.outputs.ready }}
+      recover: ${{ steps.check.outputs.recover }}
+      dates: ${{ steps.check.outputs.dates }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements-flow.txt
+      - id: check
+        name: Verify calendar, lake outputs, Neon data and completion receipt
+        env:
+          INPUT_DATE: ${{ inputs.date }}
+          CHECK_ONLY: ${{ inputs.check_only || github.event.schedule == '37 1 * * 1-5' }}
+        run: |
+          args=()
+          if [ -n "$INPUT_DATE" ]; then args+=(--date "$INPUT_DATE"); fi
+          if [ "$CHECK_ONLY" = "true" ]; then args+=(--check-only); fi
+          python scripts/pipeline_readiness.py "${args[@]}"
+
+  prices:
+    needs: readiness
+    if: needs.readiness.outputs.recover == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        date: ${{ fromJSON(needs.readiness.outputs.dates) }}
+    uses: ./.github/workflows/market_data.yml
+    with:
+      date: ${{ matrix.date }}
+      step: all
+      automatic: true
+    secrets: inherit
+
+  scores:
+    needs: [readiness, prices]
+    if: needs.readiness.outputs.recover == 'true'
+    uses: ./.github/workflows/feature_engineering.yml
+    with:
+      date: ${{ needs.readiness.outputs.date }}
+      automatic: true
+    secrets: inherit
+
+  confirm:
+    needs: [readiness, scores]
+    if: needs.scores.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements-flow.txt
+      - name: Revalidate outputs and record successful recovery
+        env:
+          TRADE_DATE: ${{ needs.readiness.outputs.date }}
+        run: python scripts/pipeline_readiness.py --date "$TRADE_DATE" --mark-ready --check-only
+
+  report:
+    needs: [readiness, prices, scores, confirm]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Publish readiness result and alert on failure or morning check
+        env:
+          READY: ${{ needs.readiness.outputs.ready == 'true' || needs.confirm.result == 'success' }}
+          TRADE_DATE: ${{ needs.readiness.outputs.date }}
+          MORNING: ${{ github.event.schedule == '37 1 * * 1-5' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/pipeline_readiness_report.py

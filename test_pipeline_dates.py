@@ -76,7 +76,8 @@ class PipelineReadinessTests(unittest.TestCase):
     def test_verifier_reads_exact_partition_and_closes_on_error(self):
         for stage, filename, column in [('prices','day=24/nse_bhavcopy_*.parquet','trade_date'),
                                         ('features','price_features_20260924.parquet','feature_date'),
-                                        ('momentum','momentum_20260924.parquet','score_date')]:
+                                        ('momentum','momentum_20260924.parquet','score_date'),
+                                        ('composite','investmitra_score_20260924.parquet','score_date')]:
             con=Mock()
             con.execute.return_value.fetchone.return_value=(10,10)
             fake=SimpleNamespace(get_duckdb_con=lambda:con,BUCKET='test-bucket',ENV='prod')
