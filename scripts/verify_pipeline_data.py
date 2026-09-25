@@ -23,7 +23,7 @@ def verify(target, stage):
     elif stage == 'features':
         path = (f'{prefix}/features/price_features/year={target.year}/month={target.month:02d}'
                 f'/price_features_{target:%Y%m%d}.parquet')
-        column = 'trade_date'
+        column = 'feature_date'
     else:
         path = (f'{prefix}/scores/momentum/year={target.year}/month={target.month:02d}'
                 f'/momentum_{target:%Y%m%d}.parquet')
