@@ -1,7 +1,7 @@
 # investMITRA — Signal Engine Feature Reference
 
 Updated: 25 September 2026. Capital reuse and operational visibility revision.
-Engine build: `2026-09-25-capital-visibility2`. All times below are IST.
+Engine build: `2026-09-25-eod-mirror1`. All times below are IST.
 
 This document describes the implemented automatic-paper system. Changes to trading
 parameters require testing and explicit sign-off. Updating this reference does not
@@ -39,7 +39,7 @@ change parameters or enable live trading.
 | 15 | Fresh-mover score gate | Actual score metadata required; blended score ≥55 before an entry offer. Discovery itself may include lower scores. |
 | 16 | Neutral-day shorts | Falling, F&O-eligible stocks may qualify. Missing/failed eligibility lookup blocks short entries. |
 | 17 | Telegram signal box | Executor-owned entry message includes direction, symbol/cap, resized quantity, entry limit, target, stop, gap, RVOL and blended score. |
-| 18 | Neon mirror | Execution snapshot mirrored every 30 seconds and at shutdown, when the database is available. |
+| 18 | Neon mirror | One execution snapshot upload at session shutdown, after the worker stops; up to three bounded attempts. No periodic intraday uploads. |
 | 19 | Close detection | Polls executor snapshots independently of WebSocket ticks. |
 | 20 | Concurrency protection | A shared state lock protects tick/scan evaluation; one scan runs at a time. |
 | 21 | Weight caching | Opportunity weights loaded at startup; no database query for weights in tick callbacks. |
@@ -171,7 +171,8 @@ at most once per minute unless the reason changes. Execution quotes take priorit
 
 ## Execution, exits and recovery
 
-The signal engine starts the integrated executor and its mirror worker. The
+The signal engine starts the integrated executor. Reporting uploads run once at
+orderly shutdown, after the executor stops, without an intraday mirror worker. The
 executor owns order intent, fills, quantities, risk accounting and recovery.
 It journals intent before submission, reconciles uncertain responses and does
 not blindly resend orders after timeouts. Protective orders follow confirmed
@@ -227,12 +228,17 @@ allowed. Journal writes alone do not establish fresh prices or functioning stops
 | Store | Role |
 |---|---|
 | `data/execution_auto_paper.sqlite3` | Authoritative local paper execution journal. Keep it across restarts. |
-| `investmitra.execution_sessions` in Neon | Account/mode/day-scoped reporting snapshot, mirrored every 30 seconds and at shutdown. |
+| `investmitra.execution_sessions` in Neon | Account/mode/day-scoped reporting snapshot uploaded at session shutdown, with up to three attempts and explicit success/failure logs. |
 | Legacy `engine_positions` / `trade_log` | Older engine records; do not mix these with automatic-paper execution P&L. |
 
 `INVESTMITRA_EXECUTION_DB` can override the journal location. The summary reads
 persisted execution limits; older journals without limits require verification.
-The local journal remains authoritative if Neon mirroring is unavailable.
+The local journal remains authoritative if Neon mirroring is unavailable. The
+shutdown uploader retries failures twice, after 2 and 5 seconds, then reports an
+explicit failure. There is no automatic intraday retry loop. Abrupt process or
+power loss can prevent that shutdown upload; the local journal must be retained.
+Neon is an end-of-session reporting copy, not a live view of the running laptop.
+Shadow observations/comparisons remain local and are not part of this upload.
 
 ## Data readiness and separate announcement monitoring
 

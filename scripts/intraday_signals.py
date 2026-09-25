@@ -2944,8 +2944,6 @@ def main():
     execution.step()
     worker = threading.Thread(target=execution.run, daemon=True)
     worker.start()
-    mirror = threading.Thread(target=execution.mirror_loop, daemon=True)
-    mirror.start()
     try:
         return _run_signals(kite, instruments, execution, worker)
     finally:
@@ -2957,11 +2955,14 @@ def main():
             time.sleep(5)
         execution.stop_requested.set()
         worker.join(timeout=10)
-        mirror.join(timeout=10)
-        execution.mirror_to_neon()
         print(execution.report())
-        if not worker.is_alive() and not mirror.is_alive():
-            execution.journal.close()
+        if not worker.is_alive():
+            try:
+                execution.mirror_to_neon()
+            finally:
+                execution.journal.close()
+        else:
+            logger.error("Session upload deferred: executor still running; local journal remains open")
 
 
 if __name__ == "__main__":
