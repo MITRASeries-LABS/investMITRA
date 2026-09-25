@@ -14,6 +14,7 @@ import os
 import queue
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
@@ -24,7 +25,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 logger = logging.getLogger(__name__)
 TERMINAL = {"COMPLETE", "CANCELLED", "REJECTED"}
 PREFIX = "IM3"
-BUILD_ID = "2026-09-25-capital-visibility2"
+BUILD_ID = "2026-09-25-eod-mirror1"
 MIN_SIGNAL_GAP_PCT = 0.30
 MIN_FINAL_SCORE = 55.0
 
@@ -793,15 +794,33 @@ class AutoOrderManager:
             self.stop_requested.wait(2)
 
     def mirror_to_neon(self):
-        """Optional reporting mirror, separate from the execution-critical journal.
+        """One shutdown upload, with at most three attempts; never an intraday loop.
 
         This never adds P&L to the old paper summary. The dedicated table is
-        account/mode/day scoped and replaces a full snapshot idempotently.
+        account/mode/day scoped and replaces a full snapshot idempotently. The
+        same frozen snapshot is retried after a failed/uncertain commit.
         """
         url = os.getenv("CC_POSTGRES_URL")
-        if not url: return
+        if not url:
+            logger.warning("Neon session upload skipped: CC_POSTGRES_URL missing; local journal retained")
+            return False
         view = self.snapshot()
-        if "day" not in view: return
+        if not view.get("day"):
+            logger.info("Neon session upload skipped: no dated execution session")
+            return False
+        for attempt in range(1, 4):
+            if self._mirror_snapshot_to_neon(url, view):
+                logger.info("Neon session upload succeeded: date=%s mode=%s trades=%d attempt=%d",
+                            view["day"], view["mode"], len(view.get("trades", {})), attempt)
+                return True
+            logger.warning("Neon session upload failed: attempt %d/3; local journal retained", attempt)
+            if attempt < 3:
+                time.sleep((2, 5)[attempt - 1])
+        logger.error("Neon session upload incomplete for %s; local journal retained for retry", view["day"])
+        return False
+
+    @staticmethod
+    def _mirror_snapshot_to_neon(url, view):
         conn = None
         try:
             import psycopg2
@@ -823,17 +842,17 @@ class AutoOrderManager:
                         ON CONFLICT (account_id,execution_mode,trade_date)
                         DO UPDATE SET snapshot=EXCLUDED.snapshot,updated_at=NOW()
                     """, (view["account"], view["mode"], view["day"], json.dumps(view, allow_nan=False)))
-        except Exception:
-            if not getattr(self, '_mirror_warned', False):
-                logger.warning("Neon execution mirror unavailable; local durable journal remains authoritative")
-                self._mirror_warned = True  # suppress repeated warningsns authoritative")
+            return True  # transaction context has committed successfully
+        except Exception as exc:
+            # Connection errors can contain credentials; log the class only.
+            logger.warning("Neon upload error type: %s", type(exc).__name__)
+            return False
         finally:
-            if conn is not None: conn.close()
-
-    def mirror_loop(self):
-        while not self.stop_requested.is_set():
-            self.mirror_to_neon()
-            self.stop_requested.wait(30)
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    logger.warning("Neon connection close failed")
 
     def report(self):
         v = self.snapshot()
