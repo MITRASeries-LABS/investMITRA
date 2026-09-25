@@ -74,15 +74,16 @@ class PipelineReadinessTests(unittest.TestCase):
         validate_counts(date(2026,9,24),12,12,'prices')
 
     def test_verifier_reads_exact_partition_and_closes_on_error(self):
-        for stage, filename in [('prices','day=24/nse_bhavcopy_*.parquet'),
-                                ('features','price_features_20260924.parquet'),
-                                ('momentum','momentum_20260924.parquet')]:
+        for stage, filename, column in [('prices','day=24/nse_bhavcopy_*.parquet','trade_date'),
+                                        ('features','price_features_20260924.parquet','feature_date'),
+                                        ('momentum','momentum_20260924.parquet','score_date')]:
             con=Mock()
             con.execute.return_value.fetchone.return_value=(10,10)
             fake=SimpleNamespace(get_duckdb_con=lambda:con,BUCKET='test-bucket',ENV='prod')
             with patch.dict(sys.modules,{'compute_features':fake}), contextlib.redirect_stdout(io.StringIO()):
                 verify(date(2026,9,24),stage)
                 params=con.execute.call_args.args[1]
+                self.assertIn(f'CAST({column} AS DATE)',con.execute.call_args.args[0])
                 self.assertEqual(params[0],date(2026,9,24))
                 self.assertTrue(params[1].endswith(filename))
                 con.close.assert_called_once()
