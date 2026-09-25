@@ -8,7 +8,10 @@ def main():
     ready = os.getenv('READY') == 'true'
     status = 'EOD DATA READY' if ready else 'EOD DATA NOT READY - attention required'
     day = os.getenv('TRADE_DATE') or 'calendar/date unresolved'
-    url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+    if os.getenv('GITHUB_REPOSITORY') and os.getenv('GITHUB_RUN_ID'):
+        url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+    else:
+        url = os.getenv('PIPELINE_LOG_HINT', 'Server logs: journalctl -u investmitra-data.service')
     message = f'investMITRA: {status}\nSession: {day}\n{url}'
     if ready:
         message += '\nData preparation only; Kite login and engine preflight are still required.'

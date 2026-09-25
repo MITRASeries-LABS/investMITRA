@@ -1,0 +1,3 @@
+-r requirements-flow.txt
+yfinance
+PyYAML

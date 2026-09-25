@@ -179,6 +179,12 @@ The local journal remains authoritative if Neon mirroring is unavailable.
 
 ## Data readiness and separate announcement monitoring
 
+A direct server alternative is prepared in [deploy/PIPELINE_SERVER.md](deploy/PIPELINE_SERVER.md).
+It executes the pipeline on systemd timers with no GitHub runner or scheduling
+dependency. It is not active until a host is selected, credentials and external
+missed-run monitoring are configured, acceptance passes, and GitHub scheduling
+is disabled during cutover. Do not run both schedulers against production.
+
 Startup checks require prior regular NSE-session prices and scores, sufficient
 historical price rows, today's market-index records, credentials and a usable
 exchange holiday calendar. Missing current market context triggers an automatic

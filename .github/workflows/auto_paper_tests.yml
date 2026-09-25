@@ -18,6 +18,13 @@ on:
       - 'scripts/compute_investmitra_score.py'
       - 'test_pipeline_dates.py'
       - 'test_overnight_readiness.py'
+      - 'test_server_pipeline.py'
+      - 'scripts/run_server_pipeline.py'
+      - 'scripts/pipeline_heartbeat.py'
+      - 'scripts/server_pipeline_failure.py'
+      - 'deploy/systemd/**'
+      - 'deploy/install_pipeline_server.sh'
+      - 'requirements-pipeline-server.txt'
       - 'scripts/pipeline_readiness.py'
       - 'scripts/pipeline_readiness_report.py'
       - '.github/workflows/overnight_readiness.yml'
@@ -43,7 +50,10 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: pip install PyYAML
+      - name: Validate server installer shell
+        if: runner.os == 'Linux'
+        run: bash -n deploy/install_pipeline_server.sh
       - name: Check syntax
         run: python -m py_compile scripts/intraday_signals.py scripts/order_manager.py scripts/signal_runtime.py scripts/auto_paper_summary.py intraday_signals.py
       - name: Run offline lifecycle and review regressions
-        run: python -m unittest -v test_auto_trading test_review_fixes test_pipeline_dates test_overnight_readiness
+        run: python -m unittest -v test_auto_trading test_review_fixes test_pipeline_dates test_overnight_readiness test_server_pipeline

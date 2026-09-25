@@ -1,0 +1,18 @@
+[Unit]
+Description=investMITRA data job failure notification
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=investmitra-data
+Group=investmitra-data
+WorkingDirectory=/opt/investmitra-data/app
+EnvironmentFile=/etc/investmitra-data/pipeline.env
+Environment="PIPELINE_LOG_HINT=Server logs: journalctl -u investmitra-data.service -u investmitra-readiness.service"
+ExecStart=/opt/investmitra-data/venv/bin/python scripts/server_pipeline_failure.py
+TimeoutStartSec=60s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict

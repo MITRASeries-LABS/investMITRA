@@ -1,0 +1,15 @@
+[Unit]
+Description=investMITRA direct nightly preparation and bounded recovery
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 20:30:00 Asia/Kolkata
+OnCalendar=Mon..Fri *-*-* 23:30:00 Asia/Kolkata
+OnCalendar=Tue..Sat *-*-* 02:30:00 Asia/Kolkata
+OnCalendar=Mon..Fri *-*-* 04:30:00 Asia/Kolkata
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=investmitra-data.service
+
+[Install]
+WantedBy=timers.target
