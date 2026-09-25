@@ -1,0 +1,24 @@
+[Unit]
+Description=investMITRA EOD data preparation (no trading)
+Wants=network-online.target
+After=network-online.target
+OnFailure=investmitra-data-failure.service
+
+[Service]
+Type=oneshot
+User=investmitra-data
+Group=investmitra-data
+WorkingDirectory=/opt/investmitra-data/app
+EnvironmentFile=/etc/investmitra-data/pipeline.env
+Environment=PYTHONUNBUFFERED=1 TZ=Asia/Kolkata
+ExecStart=/opt/investmitra-data/venv/bin/python scripts/run_server_pipeline.py
+TimeoutStartSec=100min
+TimeoutStopSec=30s
+KillMode=control-group
+StateDirectory=investmitra-data
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/investmitra-data/app/data
