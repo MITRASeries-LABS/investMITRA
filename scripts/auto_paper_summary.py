@@ -12,6 +12,7 @@ import os
 import sqlite3
 from decimal import Decimal
 from pathlib import Path
+from execution_capital import capital_snapshot, REUSABLE
 
 TERMINAL = {"COMPLETE", "CANCELLED", "REJECTED"}
 ZERO = Decimal("0")
@@ -98,7 +99,7 @@ def calculate(state, daily_cap=None, cost_reserve=None):
         if costs < 0:
             raise ValueError(f"{symbol}: negative estimated costs")
         closed = bool(trade.get("closed_at")) and qty > 0
-        status = (trade.get("exit_reason") or "CLOSED") if closed else (
+        status = (trade.get("closed_reason") or trade.get("exit_reason") or "CLOSED") if closed else (
             "NOT FILLED" if not qty else "PARTIAL / OPEN" if exited else "OPEN")
         net = gross - costs
         if closed:
@@ -113,8 +114,7 @@ def calculate(state, daily_cap=None, cost_reserve=None):
                                    qty=qty, exited=exited, entry=average,
                                    exit=exit_value / exited if exited else ZERO,
                                    gross=gross, net=net, status=status))
-    totals["budget_used"] = totals["tickets"] + totals["pending"] + totals["allowances"]
-    totals["remaining"] = max(ZERO, cap - totals["budget_used"])
+    totals.update(capital_snapshot(state, cap, reserve))
     totals["net"] = totals["gross"] - totals["estimated_costs"]
     totals["executor_net"] = totals["gross"] - totals["executor_costs"]
     return totals
@@ -148,11 +148,17 @@ def summarise(db_path="data/execution_auto_paper.sqlite3", target_date=None,
         print(f"  Closed trades: {completed} | Wins: {result['wins']} | Losses: {result['losses']} | Breakeven: {result['breakeven']} | Win rate: {result['wins']/completed*100:.0f}%")
     else:
         print("  No completed trades.")
-    print(f"\n  Daily entry allocation (closed trades retained): ₹{result['tickets']:,.2f}")
+    print(f"\n  Capital model: {result['capital_model']}")
+    print(f"  Cumulative entry turnover (history): ₹{result['tickets']:,.2f}")
     print(f"  Pending entry reservation: ₹{result['pending']:,.2f}")
     print(f"  Executor cost allowances: ₹{result['allowances']:,.2f}")
-    print(f"  Budget used incl. reservations: ₹{result['budget_used']:,.2f} of ₹{number(daily_cap):,.2f}")
-    print(f"  Remaining daily allowance: ₹{result['remaining']:,.2f}")
+    print(f"  Capital used incl. reservations/reductions: ₹{result['budget_used']:,.2f} of ₹{number(daily_cap):,.2f}")
+    print(f"  Available capital: ₹{result['remaining']:,.2f}")
+    if result['capital_model'] == REUSABLE:
+        print(f"  Capital reduction for net realised losses/costs: ₹{result['capital_reduction']:,.2f}")
+        print("  Confirmed exits release capital; profits do not raise the configured ceiling.")
+    else:
+        print("  Legacy session: closed entry tickets remain charged to cumulative allowance.")
     print(f"  Open exposure at entry prices: ₹{result['exposure']:,.2f}")
     if result["budget_used"] > number(daily_cap):
         print("  WARNING: journal usage exceeds the configured report cap.")
@@ -161,6 +167,13 @@ def summarise(db_path="data/execution_auto_paper.sqlite3", target_date=None,
         print("  Legacy journal has no recorded limits; verify --daily-cap and --cost-reserve.")
     else:
         print("  Limits read from journal unless explicitly overridden.")
+    status = state.get("entry_status")
+    if status:
+        print(f"  Executor status as of {status['as_of']} (recorded snapshot, not a live health check):")
+        print("  New entries: " + ("eligible subject to signal checks" if status['allowed'] else
+                                  "BLOCKED — " + "; ".join(status['blockers'])))
+    else:
+        print("  Entry eligibility not recorded in this historical journal; Halt alone is insufficient.")
     print(f"  Halt: {state.get('halt') or 'none'}\n{'='*80}\n")
 
 

@@ -383,7 +383,8 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(self.f.manager.state['trades']['A']['exit_reason'],'REVERSAL')
         self.assertTrue(self.f.manager.snapshot()['flat'])
 
-    def test_closed_tickets_remain_spent_under_35000_cap(self):
+    def test_legacy_closed_tickets_remain_spent_under_35000_cap(self):
+        self.f.manager.state['capital_model']='cumulative_tickets_v1'
         self.f.manager.daily_cap=35000
         self.f.enter(qty=100)
         used=self.f.manager._budget_used()

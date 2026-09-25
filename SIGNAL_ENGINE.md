@@ -1,7 +1,7 @@
 # investMITRA — Signal Engine Feature Reference
 
-Updated: 25 September 2026. Verified against code commit `96e5817`.
-Engine build: `2026-09-24-feature-completion1`. All times below are IST.
+Updated: 25 September 2026. Capital reuse and operational visibility revision.
+Engine build: `2026-09-25-capital-visibility1`. All times below are IST.
 
 This document describes the implemented automatic-paper system. Changes to trading
 parameters require testing and explicit sign-off. Updating this reference does not
@@ -23,7 +23,7 @@ change parameters or enable live trading.
 | # | Feature | Implemented behaviour |
 |---|---|---|
 | 1 | Maximum ticket | ₹10,000; enforced independently by the executor after price/quantity adjustment. |
-| 2 | Daily allowance | ₹35,000 cumulative entry allocation, reservations and provisional costs. Closing a trade does not replenish it. |
+| 2 | Reusable capital | ₹35,000 equity/open-commitment ceiling; confirmed exit fills release capital, net of realised losses, provisional costs and pending reservations. |
 | 3 | Planned stop risk | Maximum ₹1,500 per trade for sizing; gaps, slippage and costs can make realised losses larger. |
 | 4 | ATR target | Target at 3×ATR; initial stop at 1.5×ATR. The initial target/stop geometry is 2:1. |
 | 5 | Minimum net screen | Estimated net must be at least ₹250 and twice estimated costs; executor rechecks after resizing. |
@@ -34,7 +34,7 @@ change parameters or enable live trading.
 | 10 | Market breadth | Computed from NIFTY 50 advances/declines, with support evaluated in the trade direction. |
 | 11 | Post-exit rescan | Completed filled trades request a rescan; simultaneous requests are combined. |
 | 12 | 10 AM scan | Scheduled discovery for stocks whose volume builds later; all entry checks still apply. |
-| 13 | All-day rescans | Event-driven scans during 9:35 AM–3 PM, subject to remaining budget and executor readiness. |
+| 13 | All-day rescans | Every five minutes during 9:35 AM–3 PM plus post-exit discovery, subject to capital/risk gates and executor readiness. |
 | 14 | Fresh NSE movers | `get_nse_gainers_losers()` plus the liquid-stock discovery universe; no nonexistent Kite gainers API. |
 | 15 | Fresh-mover score gate | Actual score metadata required; blended score ≥55 before an entry offer. Discovery itself may include lower scores. |
 | 16 | Neutral-day shorts | Falling, F&O-eligible stocks may qualify. Missing/failed eligibility lookup blocks short entries. |
@@ -52,7 +52,7 @@ change parameters or enable live trading.
 
 | Setting | Current value |
 |---|---|
-| Daily cumulative allowance | ₹35,000 |
+| Reusable capital ceiling | ₹35,000 |
 | Ticket size | ₹1,000 minimum; ₹10,000 maximum |
 | Maximum planned stop risk per trade | ₹1,500 |
 | Maximum simultaneous positions | 3 |
@@ -62,9 +62,33 @@ change parameters or enable live trading.
 
 **There is no separately protected ₹5,000 reserve.** The earlier description
 “₹30,000 deployable + ₹5,000 always reserved” did not match implementation.
-Three simultaneous ₹10,000 tickets do not imply a three-trade daily maximum:
-additional entries may fit only within the unspent cumulative daily allowance.
-Do not delete/reset the execution journal to reclaim that allowance.
+Three simultaneous ₹10,000 tickets do not imply a three-trade daily maximum.
+Confirmed exits release their entry-price exposure for another eligible symbol;
+the same symbol still cannot re-enter that day. Turnover is reported separately.
+Pending/unknown entry orders reserve their unfilled quantity at the order bound;
+pending exit requests or cancellation acknowledgments do not release capital.
+Confirmed partial exits release only the exited quantity. Costs are retained once
+per filled trade and provisionally reserved for unfilled entry orders.
+
+For new sessions (`reusable_equity_v1`):
+
+```text
+capital reduction = max(0, provisional costs on filled trades - realised gross P&L)
+available = max(0, 35000 - capital reduction - remaining entry-price exposure
+                   - pending entry reservations - unfilled-entry cost reserves)
+```
+
+Profits may offset realised losses/costs but never raise the ₹35,000 ceiling.
+No unrealised gains finance new entries. Daily loss/open-risk checks and the
+two-consecutive-loss limit remain enforced even when capital becomes available.
+Short entries retain upper-circuit reservation and per-ticket bounds.
+
+An existing session with trades but no capital-model field retains
+`cumulative_tickets_v1` on upgrade and prints a warning. Its closed tickets remain
+spent for that session; the next session switches to reusable capital after a
+flat-state check and archival. Historical summaries use their recorded model;
+absent metadata means legacy, never retrospective reusable accounting. Do not
+delete/reset the journal or edit its model to bypass session/risk safeguards.
 
 ## Scoring and qualification
 
@@ -121,7 +145,10 @@ Additional entry requirements include:
 
 The maintenance worker checks roughly every two seconds. Network delays and
 readiness checks mean scheduled times are earliest eligibility, not guaranteed
-completion times. All-day rescanning is event-driven, not continuous full-market polling.
+completion times. Periodic discovery runs five minutes after the previous scan
+attempt, alongside morning/10 AM and post-exit requests. Scans are coalesced,
+with at least 30 seconds between attempts; blocked scans explain their reason
+at most once per minute unless the reason changes. Execution quotes take priority.
 
 | Market direction | Entry routes |
 |---|---|
@@ -162,10 +189,27 @@ It reports the final resized quantity and distinguishes submitted-but-unfilled
 orders from unknown submission outcomes awaiting reconciliation. Separate fill,
 stop, partial-exit, closure, halt and session-completion alerts remain.
 
-Telegram credentials/connectivity are required. Alert attempts are durably
+Execution messages always go to the terminal, including when Telegram is configured
+or delivery fails. Telegram credentials/connectivity are required only for Telegram.
+Alert attempts are durably
 deduplicated across restarts; uncertain delivery is not automatically retried,
 so delivery is not guaranteed. The old manual “open Kite and place an order” box
 is not used in automatic-paper mode.
+
+Candidate diagnostics do not claim executor acceptance. Repeated candidates are
+logged once per symbol per process, without marking them as traded; a rejected
+candidate may qualify later. Actual submissions/fills remain executor-owned and
+durably deduplicated. Priority rejection logs are throttled; SHORT routing messages
+are debug-only. Closure reports distinguish recorded exit intent from confirmed
+stop fills; ambiguous mixed exit batches are labelled `MIXED_EXITS`.
+
+A terminal heartbeat every minute shows WebSocket tick age, executor completion
+and successful-cycle ages, open exposure, available capital, entry-block reasons,
+and quote freshness at the last executor cycle. REST scan quotes do not count as
+WebSocket ticks. A stale heartbeat/cycle must not be read as proof of live protection.
+WebSocket close/error/reconnect events are logged. The read-only summary prints the
+recorded entry status and timestamp: `Halt: none` alone does not mean entries are
+allowed. Journal writes alone do not establish fresh prices or functioning stops.
 
 | Store | Role |
 |---|---|
