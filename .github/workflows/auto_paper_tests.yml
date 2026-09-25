@@ -9,6 +9,9 @@ on:
       - 'scripts/auto_paper_summary.py'
       - 'scripts/execution_capital.py'
       - 'test_capital_visibility.py'
+      - 'test_shadow_validation.py'
+      - 'scripts/shadow_validation.py'
+      - 'scripts/shadow_validation_report.py'
       - 'intraday_signals.py'
       - 'test_auto_trading.py'
       - 'test_review_fixes.py'
@@ -56,6 +59,6 @@ jobs:
         if: runner.os == 'Linux'
         run: bash -n deploy/install_pipeline_server.sh
       - name: Check syntax
-        run: python -m py_compile scripts/intraday_signals.py scripts/order_manager.py scripts/execution_capital.py scripts/signal_runtime.py scripts/auto_paper_summary.py intraday_signals.py
+        run: python -m py_compile scripts/intraday_signals.py scripts/order_manager.py scripts/execution_capital.py scripts/signal_runtime.py scripts/auto_paper_summary.py scripts/shadow_validation.py scripts/shadow_validation_report.py intraday_signals.py
       - name: Run offline lifecycle and review regressions
-        run: python -m unittest -v test_auto_trading test_review_fixes test_capital_visibility test_pipeline_dates test_overnight_readiness test_server_pipeline
+        run: python -m unittest -v test_auto_trading test_review_fixes test_capital_visibility test_shadow_validation test_pipeline_dates test_overnight_readiness test_server_pipeline

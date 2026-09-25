@@ -389,12 +389,31 @@ conditions before a separate live activation decision.
 
 ## Key files and completed corrections
 
+### Forward filter research (prepared branch)
+
+The engine now optionally records immutable entry-time features for the first
+scored rejection and first queued candidate per symbol/direction/day, in a separate
+local shadow database. VWAP extension and opening-range confirmation are fixed
+experimental filters; they do not affect orders, scores, capital or risk checks.
+
+Run `python scripts/shadow_validation_report.py --date YYYY-MM-DD` for a paired
+comparison of 30-minute price outcomes, including winning candidates a filter
+would miss. This is **not execution P&L or a full-strategy win rate**: queued is not
+filled, missing inputs remain unknown, and pre-score rejects/entry-blocked periods
+are outside coverage. Fresh breadth is not claimed from startup data. Full rules,
+cost stress assumptions and coverage are in [SHADOW_VALIDATION.md](SHADOW_VALIDATION.md).
+
+Collection starts with the updated engine's next run; the previous session is not
+backfilled from its trade summary. No experimental filter is automatically enabled.
+
 | File | Responsibility |
 |---|---|
 | `scripts/intraday_signals.py` | Signals, scoring, watchlists, scans, startup and worker coordination. |
 | `scripts/order_manager.py` | Execution lifecycle, ticket/risk checks, recovery, alerts and Neon mirror. |
 | `scripts/signal_runtime.py` | Shared quote pacing and exchange-session/data freshness helpers. |
 | `scripts/auto_paper_summary.py` | Journal-based daily allocation and P&L summary. |
+| `scripts/shadow_validation.py` | Isolated bounded observer and immutable forward markouts; no broker access. |
+| `scripts/shadow_validation_report.py` | Read-only paired research report with coverage and cost scenarios. |
 | `scripts/fetch_nse_announcements.py` | Separate announcement ingestion and console monitoring. |
 | `intraday_signals.py` at repository root | Compatibility entry point delegating to the maintained scripts engine. |
 | `test_auto_trading.py`, `test_review_fixes.py` | Offline regression coverage. |

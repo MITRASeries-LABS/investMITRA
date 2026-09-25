@@ -1138,6 +1138,10 @@ class IntradayEngine:
         self._last_heartbeat_at = None
         self._last_scan_status = None
         self._candidate_logged = set()
+        self.shadow = None  # optional observer: never involved in trading decisions
+        self._shadow_scored = None
+        self._shadow_opening = {}
+        self._shadow_error_logged = False
 
 
     def on_tick(self, ws, ticks):
@@ -1204,8 +1208,31 @@ class IntradayEngine:
 
             if self.execution is None:
                 self._check_exits(symbol, ltp, session, now)
+            self._shadow_scored = None
             if session in ("momentum","choppy","afternoon"):
                 self._check_signal(symbol, ltp, volume, now, session)
+            if self.shadow is not None:
+                self._observe_shadow(symbol, ltp, now, session, tick)
+
+    def _observe_shadow(self, symbol, ltp, now, session, tick):
+        """Nonblocking research capture after the normal decision, including exits' ticks."""
+        try:
+            from shadow_validation import capture_features, timestamp
+            if session == "opening":
+                minute = now.hour * 60 + now.minute
+                span = self._shadow_opening.setdefault(symbol,
+                    dict(first=minute, last=minute, at=now.timestamp(), max_gap=0))
+                span["max_gap"] = max(span["max_gap"], now.timestamp() - span["at"])
+                span["last"], span["at"] = minute, now.timestamp()
+            if self._shadow_scored is not None:
+                queued = self.execution_offers.get(symbol) == now.timestamp()
+                self.shadow.candidate(capture_features(self, symbol, ltp, now, session,
+                                                       self._shadow_scored, tick, queued))
+            self.shadow.quote(symbol, ltp, now.timestamp(), timestamp(tick.get("last_trade_time")))
+        except Exception:
+            if not self._shadow_error_logged:
+                logger.exception("Shadow capture failed; research incomplete; trading decisions unchanged")
+                self._shadow_error_logged = True
 
     def _trigger_post_exit_scan(self, closed_symbol):
         # Coalesce closes; executor confirms fills before releasing capital.
@@ -1780,12 +1807,15 @@ class IntradayEngine:
         return round(opp, 2), details
 
     def _reject_signal(self, symbol, reason, now):
+        if self._shadow_scored is not None:
+            self._shadow_scored["reason"] = reason
         previous = self.signal_rejections.get(symbol)
         if previous is None or previous[0] != reason or (now-previous[1]).total_seconds() >= 60:
             logger.info("SIGNAL REJECT %s: %s", symbol, reason)
             self.signal_rejections[symbol] = (reason, now)
 
     def _check_signal(self, symbol, ltp, volume, now, session):
+        self._shadow_scored = None
         session = get_current_session(now)
         if session not in ("momentum", "choppy", "afternoon"):
             return
@@ -1905,6 +1935,9 @@ class IntradayEngine:
         opp, details = self._compute_opportunity_score(symbol, ltp, volume, true_gap_pct, session)
 
         final = quality * 0.40 + opp * 0.60
+        if self.shadow is not None:
+            self._shadow_scored = dict(gap=true_gap_pct, quality=quality,
+                opportunity=opp, blended=final, details=details)
         rejection = entry_policy_rejection(dict(true_gap=true_gap_pct,
             final_score=final, gap_threshold=gap_thresh, details=details,
             direction="SHORT" if true_gap_pct < 0 else "LONG",
@@ -2841,6 +2874,13 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
         engine.ticker = ticker
         engine.instrument_tokens = {i["tradingsymbol"]: i["instrument_token"] for i in instruments
                                     if i.get("segment") == "NSE"}
+        if os.getenv("INVESTMITRA_SHADOW_ENABLED", "1") == "1":
+            try:
+                from shadow_validation import ShadowObserver, VERSION
+                engine.shadow = ShadowObserver(os.getenv("INVESTMITRA_SHADOW_DB", "data/shadow_validation.sqlite3"))
+                logger.info("Shadow candidate observation enabled: %s; entry rules unchanged", VERSION)
+            except Exception:
+                logger.exception("Shadow observation unavailable; trading configuration unchanged")
         ticker.connect(threaded=True)
         maintenance = threading.Thread(target=engine._maintenance_loop, daemon=True)
         maintenance.start()
@@ -2882,6 +2922,8 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
         if "maintenance" in locals():
             maintenance.join(timeout=15)
         ticker.close()
+        if engine.shadow is not None:
+            engine.shadow.close()
 
 
 def main():

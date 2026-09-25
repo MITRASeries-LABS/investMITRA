@@ -23,6 +23,10 @@ preparing this branch. This update keeps `auto_paper`; it does not activate live
   every five minutes during the entry window. Blocked scans explain why.
 - A minute heartbeat shows stream/executor ages, capital and entry eligibility.
   WebSocket errors are visible. Quote freshness is labelled as of the last cycle.
+- An isolated shadow observer records scored rejections and queued candidates for
+  fixed 30-minute markout comparisons. It tests VWAP extension and opening-range
+  hypotheses without changing entry decisions. See [SHADOW_VALIDATION.md](SHADOW_VALIDATION.md)
+  for coverage, cost assumptions, limitations and the report command.
 
 ## After-market installation from the prepared branch
 
@@ -37,7 +41,7 @@ git fetch origin codex/capital-reuse-visibility
 if ($LASTEXITCODE -ne 0) { throw "Fetch failed" }
 git switch --track origin/codex/capital-reuse-visibility
 if ($LASTEXITCODE -ne 0) { throw "Switch needs review; keep local edits and journal" }
-python -X utf8 -m unittest -q test_auto_trading test_review_fixes test_capital_visibility test_pipeline_dates test_overnight_readiness test_server_pipeline
+python -X utf8 -m unittest -q test_auto_trading test_review_fixes test_capital_visibility test_shadow_validation test_pipeline_dates test_overnight_readiness test_server_pipeline
 if ($LASTEXITCODE -ne 0) { throw "Tests failed; do not start the engine" }
 git log -1 --oneline
 ```
