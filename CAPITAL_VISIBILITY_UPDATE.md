@@ -1,7 +1,7 @@
 # Capital reuse and terminal visibility update
 
 Prepared for installation after the market session. Build:
-`2026-09-25-eod-mirror1`. The existing laptop process is unaffected by
+`2026-09-26-auto-reports1`. The existing laptop process is unaffected by
 preparing this branch. This update keeps `auto_paper`; it does not activate live orders.
 
 ## What changes
@@ -29,6 +29,10 @@ preparing this branch. This update keeps `auto_paper`; it does not activate live
   the local execution journal remains intact. Missing connection configuration
   is reported rather than silently skipped. This changes execution reporting
   only; shadow research stays local.
+- The detailed trade summary and shadow comparison now print automatically at
+  orderly shutdown after confirmed square-off and worker stop. They use the
+  session's saved date and configured local paths. Upload/report failures cannot
+  skip the remaining report or journal cleanup; unavailable data is labelled.
 - An isolated shadow observer records scored rejections and queued candidates for
   fixed 30-minute markout comparisons. It tests VWAP extension and opening-range
   hypotheses without changing entry decisions. See [SHADOW_VALIDATION.md](SHADOW_VALIDATION.md)
@@ -43,11 +47,11 @@ and inspect the conflict rather than resetting or cleaning them away.
 
 ```powershell
 cd C:\MITRAseries\investMITRA
-git fetch origin codex/eod-neon-upload
+git fetch origin codex/automatic-session-reports
 if ($LASTEXITCODE -ne 0) { throw "Fetch failed" }
-git switch --track origin/codex/eod-neon-upload
+git switch --track origin/codex/automatic-session-reports
 if ($LASTEXITCODE -ne 0) { throw "Switch needs review; keep local edits and journal" }
-python -X utf8 -m unittest -q test_auto_trading test_review_fixes test_capital_visibility test_shadow_validation test_neon_session_upload test_pipeline_dates test_overnight_readiness test_server_pipeline
+python -X utf8 -m unittest -q test_auto_trading test_review_fixes test_capital_visibility test_shadow_validation test_neon_session_upload test_session_reports test_pipeline_dates test_overnight_readiness test_server_pipeline
 if ($LASTEXITCODE -ne 0) { throw "Tests failed; do not start the engine" }
 git log -1 --oneline
 ```

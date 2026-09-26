@@ -2878,6 +2878,7 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
             try:
                 from shadow_validation import ShadowObserver, VERSION
                 engine.shadow = ShadowObserver(os.getenv("INVESTMITRA_SHADOW_DB", "data/shadow_validation.sqlite3"))
+                execution.shadow_observer = engine.shadow
                 logger.info("Shadow candidate observation enabled: %s; entry rules unchanged", VERSION)
             except Exception:
                 logger.exception("Shadow observation unavailable; trading configuration unchanged")
@@ -2958,11 +2959,18 @@ def main():
         print(execution.report())
         if not worker.is_alive():
             try:
-                execution.mirror_to_neon()
+                try:
+                    execution.mirror_to_neon()
+                finally:
+                    try:
+                        from session_reports import run_session_reports
+                        run_session_reports(execution)
+                    except Exception:
+                        logger.exception("Automatic session reports unavailable; local journals retained")
             finally:
                 execution.journal.close()
         else:
-            logger.error("Session upload deferred: executor still running; local journal remains open")
+            logger.error("Session upload/reports deferred: executor still running; local journal remains open")
 
 
 if __name__ == "__main__":

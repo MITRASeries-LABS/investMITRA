@@ -25,7 +25,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 logger = logging.getLogger(__name__)
 TERMINAL = {"COMPLETE", "CANCELLED", "REJECTED"}
 PREFIX = "IM3"
-BUILD_ID = "2026-09-25-eod-mirror1"
+BUILD_ID = "2026-09-26-auto-reports1"
 MIN_SIGNAL_GAP_PCT = 0.30
 MIN_FINAL_SCORE = 55.0
 
@@ -96,6 +96,7 @@ class Journal:
     """
     def __init__(self, path, account, mode):
         path = Path(path).resolve()
+        self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         self.lockfile = open(str(path) + ".lock", "a+b")
         self.lockfile.seek(0)
@@ -262,6 +263,7 @@ class AutoOrderManager:
         self._last_error = None
         self._cycle_completed_at = None
         self._cycle_success_at = None
+        self.shadow_observer = None  # reporting lifecycle only; never used by order decisions
         today = self.clock().date().isoformat()
         if self.state["day"] not in (None, today):
             if any(self._remaining(t) or self._active(t) for t in self.state["trades"].values()):

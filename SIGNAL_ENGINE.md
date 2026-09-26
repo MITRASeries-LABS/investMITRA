@@ -1,7 +1,7 @@
 # investMITRA — Signal Engine Feature Reference
 
 Updated: 25 September 2026. Capital reuse and operational visibility revision.
-Engine build: `2026-09-25-eod-mirror1`. All times below are IST.
+Engine build: `2026-09-26-auto-reports1`. All times below are IST.
 
 This document describes the implemented automatic-paper system. Changes to trading
 parameters require testing and explicit sign-off. Updating this reference does not
@@ -240,6 +240,16 @@ power loss can prevent that shutdown upload; the local journal must be retained.
 Neon is an end-of-session reporting copy, not a live view of the running laptop.
 Shadow observations/comparisons remain local and are not part of this upload.
 
+After confirmed square-off and execution worker shutdown, the main engine
+automatically prints the detailed trade summary and the shadow comparison.
+It uses the saved execution session date and the actual configured SQLite paths;
+it does not substitute the date after midnight or an unrelated default database.
+The shadow writer is stopped before reporting; if it is still draining, that
+report is explicitly deferred. A disabled/not-started observer is skipped.
+Reports still run after a failed Neon upload. A failed report does not prevent
+the other report or journal cleanup. These are local console reports, not emails
+or additional Neon uploads. Abrupt process termination can prevent this sequence.
+
 ## Data readiness and separate announcement monitoring
 
 A direct server alternative is prepared in [deploy/PIPELINE_SERVER.md](deploy/PIPELINE_SERVER.md).
@@ -362,10 +372,13 @@ never starts the engine itself; the next command above starts it. Check for a
 successful preflight and the expected build/mode. Do not bypass a failed check.
 No money needs to be loaded for this trial.
 
-After the engine confirms flat and finishes, run:
+After the engine confirms flat, it automatically uploads the execution snapshot
+and prints both reports before finishing. No manual report commands are needed
+for a normal session. To rerun a report later, use:
 
 ```powershell
 python scripts\auto_paper_summary.py --date (Get-Date -Format 'yyyy-MM-dd')
+python scripts\shadow_validation_report.py --date (Get-Date -Format 'yyyy-MM-dd')
 ```
 
 The date command assumes the laptop is on India local time. Supply an explicit
@@ -420,6 +433,7 @@ backfilled from its trade summary. No experimental filter is automatically enabl
 | `scripts/auto_paper_summary.py` | Journal-based daily allocation and P&L summary. |
 | `scripts/shadow_validation.py` | Isolated bounded observer and immutable forward markouts; no broker access. |
 | `scripts/shadow_validation_report.py` | Read-only paired research report with coverage and cost scenarios. |
+| `scripts/session_reports.py` | Automatic post-close trade/shadow reports using saved session dates and actual local paths. |
 | `scripts/fetch_nse_announcements.py` | Separate announcement ingestion and console monitoring. |
 | `intraday_signals.py` at repository root | Compatibility entry point delegating to the maintained scripts engine. |
 | `test_auto_trading.py`, `test_review_fixes.py` | Offline regression coverage. |

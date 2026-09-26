@@ -84,7 +84,7 @@ class SessionUploadTests(unittest.TestCase):
         conn.__exit__.assert_called_once_with(None, None, None)
         conn.close.assert_called_once()
 
-    def run_main(self, alive=False):
+    def run_main(self, alive=False, upload_error=False, report_error=False):
         source = Path('scripts/intraday_signals.py').read_text(encoding='utf-8')
         node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name=='main')
         timeline = []
@@ -93,7 +93,13 @@ class SessionUploadTests(unittest.TestCase):
         execution.report.return_value = 'Execution flat=True'
         execution.request_flatten.side_effect = lambda: timeline.append('flatten')
         execution.stop_requested.set.side_effect = lambda: timeline.append('stop')
-        execution.mirror_to_neon.side_effect = lambda: timeline.append('upload')
+        def upload():
+            timeline.append('upload')
+            if upload_error: raise OSError('upload failed unexpectedly')
+        execution.mirror_to_neon.side_effect = upload
+        def reports(_):
+            timeline.append('reports')
+            if report_error: raise ValueError('bad report')
         execution.journal.close.side_effect = lambda: timeline.append('close')
         worker = Mock()
         worker.join.side_effect = lambda **kw: timeline.append('join')
@@ -108,15 +114,27 @@ class SessionUploadTests(unittest.TestCase):
         exec(compile(ast.Module(body=[node], type_ignores=[]), 'main-under-test', 'exec'), ns)
         with patch('order_manager.build_executor', return_value=execution):
             with patch('threading.Thread', return_value=worker) as thread:
-                ns['main']()
+                with patch('session_reports.run_session_reports', side_effect=reports):
+                    if upload_error:
+                        with self.assertRaises(OSError): ns['main']()
+                    else:
+                        ns['main']()
         self.assertEqual(thread.call_count, 1)  # execution worker only; no uploader thread
         return timeline
 
     def test_main_uploads_only_after_session_and_worker_stop(self):
-        self.assertEqual(self.run_main(), ['session', 'flatten', 'stop', 'join', 'upload', 'close'])
+        self.assertEqual(self.run_main(), ['session', 'flatten', 'stop', 'join', 'upload', 'reports', 'close'])
 
     def test_still_running_worker_cannot_upload_final_snapshot_or_close_journal(self):
         self.assertEqual(self.run_main(alive=True), ['session', 'flatten', 'stop', 'join'])
+
+    def test_upload_exception_cannot_skip_reports_or_journal_cleanup(self):
+        self.assertEqual(self.run_main(upload_error=True),
+                         ['session', 'flatten', 'stop', 'join', 'upload', 'reports', 'close'])
+
+    def test_report_exception_cannot_skip_journal_cleanup(self):
+        self.assertEqual(self.run_main(report_error=True),
+                         ['session', 'flatten', 'stop', 'join', 'upload', 'reports', 'close'])
 
 
 if __name__ == '__main__':
