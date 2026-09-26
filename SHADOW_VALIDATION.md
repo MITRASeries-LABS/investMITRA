@@ -13,6 +13,13 @@ No extra terminal, database service, subscription or server is required. The
 separate local file is `data/shadow_validation.sqlite3`; retain it across sessions.
 Do not delete or replace the execution journal. Keep running `auto_paper`.
 
+At orderly session shutdown the main engine automatically prints both the trade
+summary and this shadow comparison, after confirmed square-off and writer
+shutdown. No manual end-of-day report command is needed. Missing/failed data is
+reported explicitly; a still-draining writer defers its report. Neither report is
+emailed or uploaded to Neon by this integration. Use the commands below only to
+rerun a report or aggregate several sessions.
+
 ```powershell
 # From the repository root, after the session or while the engine runs:
 python scripts\shadow_validation_report.py --date 2026-09-28
