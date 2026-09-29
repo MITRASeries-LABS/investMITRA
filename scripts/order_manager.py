@@ -25,7 +25,9 @@ IST = timezone(timedelta(hours=5, minutes=30))
 logger = logging.getLogger(__name__)
 TERMINAL = {"COMPLETE", "CANCELLED", "REJECTED"}
 PREFIX = "IM3"
-BUILD_ID = "2026-09-26-auto-reports1"
+BUILD_ID = "2026-09-29-candidate-queue1"
+MAX_PENDING_CANDIDATES = 100
+CANDIDATE_TTL_SECONDS = 10
 MIN_SIGNAL_GAP_PCT = 0.30
 MIN_FINAL_SCORE = 55.0
 
@@ -253,6 +255,8 @@ class AutoOrderManager:
         self.clock, self._deliver_alert = clock, alerts
         self.state.setdefault("alert_events", [])
         self.inbox = queue.Queue(maxsize=100)
+        self.pending_candidates = {}  # worker-owned; only unsubmitted signals
+        self._candidate_messages = {}
         self.lock = threading.Lock()
         self.view = {"ready": False, "reason": "Broker recovery pending", "trades": {}, "remaining": 0}
         self.orders, self.broker_positions, self.quotes = [], {}, {}
@@ -317,6 +321,58 @@ class AutoOrderManager:
         except queue.Full: return False
 
     def request_flatten(self): self.flatten_requested.set()
+
+    def _candidate_result(self, symbol, status, reason):
+        """Visible, throttled decisions; never send per-tick Telegram alerts."""
+        now = self.clock().timestamp()
+        event = (status, reason)
+        previous = self._candidate_messages.get(symbol)
+        if previous is None or previous[0] != event or now - previous[1] >= 60:
+            logger.info("EXECUTION %s %s: %s", status.upper(), symbol, reason)
+            if len(self._candidate_messages) >= 1000:
+                self._candidate_messages.pop(next(iter(self._candidate_messages)))
+            self._candidate_messages[symbol] = (event, now)
+        return status
+
+    def _collect_candidates(self):
+        """Keep the newest observation per symbol without renewing its lifetime."""
+        now = self.clock().timestamp()
+        # Drain a bounded snapshot; producers cannot keep this cycle busy forever.
+        for _ in range(self.inbox.qsize()):
+            try:
+                sig = self.inbox.get_nowait()
+            except queue.Empty:
+                break
+            symbol = sig.get("symbol")
+            try:
+                offered = float(sig["offered_at"])
+                priority = float(sig.get("priority_score", 0))
+                if not isinstance(symbol, str) or not symbol or not all(map(math.isfinite, (offered, priority))):
+                    raise ValueError
+            except (KeyError, TypeError, ValueError):
+                self._candidate_result(str(symbol), "rejected", "invalid candidate timestamp/priority/symbol")
+                continue
+            old = self.pending_candidates.get(symbol)
+            if old is None or offered >= float(old["offered_at"]):
+                self.pending_candidates[symbol] = sig
+        for symbol, sig in list(self.pending_candidates.items()):
+            age = now - float(sig["offered_at"])
+            reason = None
+            if symbol in self.state["trades"]:
+                reason = "symbol already has a durable execution intent; no same-day retry"
+            elif age < 0 or age > CANDIDATE_TTL_SECONDS:
+                reason = "candidate expired or timestamp is in the future; fresh signal required"
+            elif self.state["halt"] or self.state["flatten"]:
+                reason = self.state["halt"] or "session flatten requested"
+            if reason:
+                self._candidate_result(symbol, "rejected", reason)
+                self.pending_candidates.pop(symbol)
+        ranked = sorted(self.pending_candidates.values(),
+                        key=lambda s: (-float(s.get("priority_score", 0)), float(s["offered_at"]), s["symbol"]))
+        for sig in ranked[MAX_PENDING_CANDIDATES:]:
+            self.pending_candidates.pop(sig["symbol"])
+            self._candidate_result(sig["symbol"], "rejected", "pending candidate capacity reached")
+        return ranked[:MAX_PENDING_CANDIDATES]
 
     def _actions(self, trade): return trade["orders"]
     def _active(self, trade): return [o for o in trade["orders"] if o["status"] not in TERMINAL]
@@ -540,53 +596,66 @@ class AutoOrderManager:
 
     def _accept(self, sig):
         now = self.clock()
-        if not self.ready or self.state["halt"] or self.state["flatten"] or not (575 <= now.hour*60+now.minute < 900): return
-        if self._protection_pending(): return
+        symbol = sig.get("symbol", "?")
+        def reject(reason): return self._candidate_result(symbol, "rejected", reason)
+        def defer(reason): return self._candidate_result(symbol, "deferred", reason)
+        # Check age again after broker/network work, not just when collecting.
+        age = now.timestamp() - float(sig["offered_at"])
+        if age < 0 or age > CANDIDATE_TTL_SECONDS:
+            return reject("candidate expired or timestamp is in the future; fresh signal required")
+        if self.state["halt"] or self.state["flatten"]:
+            return reject(self.state["halt"] or "session flatten requested")
+        if not (575 <= now.hour*60+now.minute < 900):
+            return reject("outside entry window")
+        if not self.ready: return defer("awaiting broker reconciliation")
+        if self._protection_pending(): return defer("position protection pending")
         rejection = entry_policy_rejection(sig)
         if rejection:
-            logger.info("EXECUTION REJECT %s: %s", sig.get("symbol", "?"), rejection)
-            return
+            return reject(rejection)
         symbol = sig["symbol"]
-        if symbol in self.state["trades"] or symbol not in self.meta: return
-        if (now.timestamp() - float(sig["offered_at"])) > 10: return
+        if symbol in self.state["trades"]: return reject("symbol already has a durable execution intent; no same-day retry")
+        if symbol not in self.meta: return reject("instrument metadata unavailable")
         quote = self.quotes.get("NSE:" + symbol, {})
-        if not self._fresh(quote): return
-        if self.broker_positions.get(key(symbol), 0): return
+        if not self._fresh(quote): return defer("candidate quote stale/unavailable")
+        if self.broker_positions.get(key(symbol), 0): return reject("existing broker position")
         if any(key(o["tradingsymbol"], o["exchange"], o["product"]) == key(symbol)
-               and o["status"] not in TERMINAL for o in self.orders): return
+               and o["status"] not in TERMINAL for o in self.orders): return reject("existing active broker order")
         view = self.snapshot()
-        if not view.get("entry_allowed", False): return
+        if not view.get("entry_allowed", False):
+            return defer("; ".join(view.get("entry_blockers", [])) or "entries temporarily blocked")
         count = sum(bool(self._remaining(t) or self._active(t)) for t in self.state["trades"].values())
-        if count >= self.max_positions: return
+        if count >= self.max_positions: return defer("concurrent-position limit")
         if sig.get("direction") not in ("LONG", "SHORT"):
-            return
+            return reject("invalid direction")
         sign = 1 if sig["direction"] == "LONG" else -1
         ltp, tick = float(quote["last_price"]), float(self.meta[symbol]["tick_size"])
-        if abs(ltp / float(sig["entry"]) - 1) > 0.003: return  # no chasing stale signals
+        if abs(ltp / float(sig["entry"]) - 1) > 0.003: return reject("price moved beyond 0.3% entry tolerance")
         limit = tick_round(ltp * (1.001 if sign > 0 else .999), tick, sign > 0)
         # BUY limit bounds entry spend. A SHORT can fill above its sell limit:
         # reserve the exchange upper circuit instead to bound gross ticket value.
         reserve_price = limit if sign > 0 else float(quote.get("upper_circuit_limit") or 0)
-        if reserve_price < limit: return
+        if reserve_price < limit: return reject("valid short reservation bound unavailable")
         stop = tick_round(float(sig["stoploss"]), tick, sign > 0)
         target = float(sig.get("target") or 0)
         if not math.isfinite(target) or target <= 0 or sign * (target - limit) <= 0:
-            return
-        if sign * (limit - stop) <= 0: return
+            return reject("target invalid for current entry limit")
+        if sign * (limit - stop) <= 0: return reject("stop invalid for current entry limit")
         risk_per_share = abs(reserve_price - stop) if sign > 0 else abs(stop - limit)
         remaining = self.daily_cap - self._budget_used() - self.cost_reserve
         qty = min(int(sig["position_size"]), int(remaining / reserve_price),
                   int(Decimal(str(self.max_ticket)) / Decimal(str(reserve_price))),
                   int(self.max_risk / risk_per_share))
-        if qty <= 0 or qty * limit < self.min_ticket: return
+        if qty <= 0 or qty * limit < self.min_ticket: return reject("size below minimum ticket after capital/risk limits")
         if sig.get("minimum_net_screen") is not None:
             screened_net = (target - limit) * sign * qty * float(sig.get("profit_screen_fraction", .5)) - float(sig["estimated_costs"])
             if screened_net < float(sig["minimum_net_screen"]):
-                return
+                return reject("profit screen failed after execution resizing")
         open_risk = sum(max(0, (self._entry_price(t)-t["stop"])*t["sign"]) * self._remaining(t)
                         for t in self.state["trades"].values())
-        if view.get("net", 0) - open_risk - qty*risk_per_share - self.cost_reserve <= -self.max_daily_loss: return
-        if sign > 0 and qty*limit + self.cost_reserve > self.daily_cap + min(0,view.get("net",0))-view.get("exposure",0): return
+        if view.get("net", 0) - open_risk - qty*risk_per_share - self.cost_reserve <= -self.max_daily_loss:
+            return reject("candidate stop risk plus existing risk/costs exceeds daily loss allowance")
+        if sign > 0 and qty*limit + self.cost_reserve > self.daily_cap + min(0,view.get("net",0))-view.get("exposure",0):
+            return reject("insufficient capital after current commitments and costs")
         trade = dict(symbol=symbol, sign=sign, signal=copy.deepcopy(sig), target=target, orders=[],
                      reservation_price=reserve_price, stop=stop, initial_risk=None,
                      partial_done=False, exit_goal=0, exit_reason="", exit_attempts=0,
@@ -609,6 +678,7 @@ class AutoOrderManager:
         )
         # Do not accept another candidate against the same broker snapshot.
         self.ready = False
+        return "submitted"
 
     def _goal(self, t, goal, reason):
         if goal > t["exit_goal"]:
@@ -737,11 +807,7 @@ class AutoOrderManager:
                         self.alerts(f"{self.broker.mode}: 3PM — session complete, flat")
                 self.state["flatten"] = True
                 self.journal.save()
-            pending = []
-            while not self.inbox.empty():
-                try: pending.append(self.inbox.get_nowait())
-                except queue.Empty: break
-            pending = list({s["symbol"]: s for s in pending}.values())
+            pending = self._collect_candidates()
             symbols = set(self.state["trades"]) | {s["symbol"] for s in pending}
             if symbols:
                 try: self.quotes = self.broker.quotes(sorted(symbols))
@@ -765,7 +831,9 @@ class AutoOrderManager:
             # Refresh after any stop/exit action before considering another entry.
             self._refresh(); self._publish()
             for sig in pending:
-                if self.ready: self._accept(sig)
+                outcome = self._accept(sig)
+                if outcome != "deferred":
+                    self.pending_candidates.pop(sig["symbol"], None)
             self._last_error = None
             self._cycle_success_at = self.clock().isoformat()
         except Exception as exc:

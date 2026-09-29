@@ -1,7 +1,7 @@
 # investMITRA — Signal Engine Feature Reference
 
-Updated: 25 September 2026. Capital reuse and operational visibility revision.
-Engine build: `2026-09-26-auto-reports1`. All times below are IST.
+Updated: 29 September 2026. Candidate queue retention and decision visibility revision.
+Engine build: `2026-09-29-candidate-queue1`. All times below are IST.
 
 This document describes the implemented automatic-paper system. Changes to trading
 parameters require testing and explicit sign-off. Updating this reference does not
@@ -27,7 +27,7 @@ change parameters or enable live trading.
 | 3 | Planned stop risk | Per-trade sizing ceiling ₹1,500, further restricted by the remaining ₹1,500 combined daily loss allowance including costs and open risk. |
 | 4 | ATR target | Target at 3×ATR; initial stop at 1.5×ATR. The initial target/stop geometry is 2:1. |
 | 5 | Minimum net screen | Estimated net must be at least ₹250 and twice estimated costs; executor rechecks after resizing. |
-| 6 | Priority score | RVOL × absolute gap percentage × blended score / 100; minimum 3, or 5 during lunch. |
+| 6 | Priority score | RVOL × absolute gap percentage × blended score / 100; minimum 3, or 5 during lunch. Queued candidates are considered in descending priority order. |
 | 7 | Concurrent positions | Maximum three; executor includes outstanding entry orders in its admission checks. |
 | 8 | RVOL floor | At least 5×; at least 8× during lunch. Discovery rules cannot bypass final entry checks. |
 | 9 | Neutral-day short score | Underlying stock score ≥65 for every neutral-day short route, enforced in engine and executor. |
@@ -448,3 +448,25 @@ backfilled from its trade summary. No experimental filter is automatically enabl
 Earlier feature descriptions and changes remain available in Git history. This
 reference supersedes the obsolete three-terminal startup, tick-dependent close
 detection, separately protected ₹5,000 reserve and ₹300 minimum-net descriptions.
+
+## Candidate queue and decision visibility — 29 September
+
+- Submitting one entry pauses further submissions until the next broker
+  reconciliation. Other unsubmitted candidates remain queued instead of being lost.
+- The worker keeps at most 100 pending symbols, ranked by descending priority;
+  ties use observation time then symbol. Newer observations replace older ones for
+  the same symbol. The separate incoming queue is also limited to 100 items.
+- A candidate expires 10 seconds after its original observation. Retention never
+  renews that timestamp. Every submission rechecks quote freshness, price tolerance,
+  policy, available capital, planned risk, protection and position limits.
+- Expired/rejected candidates require a fresh engine evaluation. Pending candidates
+  are transient and are not restored after restart. Durable submitted or uncertain
+  order intents remain journal-owned and are never blindly resubmitted.
+- `EXECUTION DEFERRED` explains temporary waits; `EXECUTION REJECTED` explains expiry
+  or failed admission. Repeated identical symbol/reason messages are throttled to
+  once per minute. Profit, RVOL, direction and planned-risk rejections are visible
+  in normal engine logs. These diagnostics do not send Telegram messages.
+- This change does not alter trading thresholds, the Rs35,000 reusable ceiling,
+  Rs10,000 maximum ticket, three-position limit or Rs1,500 combined daily loss rule.
+- Three eligible signals can fill across successive execution cycles without new
+  WebSocket ticks. Three positions are a maximum, not a required allocation.

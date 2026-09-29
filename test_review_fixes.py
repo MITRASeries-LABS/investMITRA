@@ -69,6 +69,46 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(self.f.manager.inbox.qsize(), 2)
         self.assertFalse(self.engine.signals)
 
+    def test_scan_batch_reaches_three_fills_without_more_ticks(self):
+        self.add_b()
+        e = self.engine
+        e.all_stocks['C'] = e.long_map['C'] = dict(e.all_stocks['A'],symbol='C')
+        e.token_map['C'] = 3; e.rev_tokens[3] = 'C'
+        e.rvol_baseline['C'] = 1000; e.key_levels['C'] = {'atr14':2}
+        e.gap_first_seen['C'] = self.f.now-timedelta(minutes=6); e.gap_direction['C']='LONG'
+        m = self.f.manager
+        m.daily_cap=35000; m.max_risk=1500
+        m.state['limits'].update(daily_cap=35000,max_risk=1500); m.step()
+        self.assertEqual(e._process_scan_quotes({'NSE:'+s:self.quote() for s in ('A','B','C')}),3)
+        for _ in range(4):
+            m.step(); self.f.now+=timedelta(seconds=2)
+        self.assertEqual(m.snapshot()['active_count'],3)
+        self.assertTrue(all(t['orders'][0]['filled']==99 for t in m.state['trades'].values()))
+        self.assertFalse(m.pending_candidates)
+
+    def test_profit_and_planned_risk_rejections_are_visible_and_throttled(self):
+        e=self.engine
+        e.key_levels['A']['atr14']=.1
+        with self.assertLogs('integration',level='INFO') as logs:
+            for _ in range(10):e._check_signal('A',100,1000,self.f.now,'momentum')
+        self.assertEqual(len(logs.output),1)
+        self.assertIn('target-profit screen',logs.output[0])
+        e.key_levels['A']['atr14']=9
+        self.f.enter(symbol='B',qty=99)
+        with self.assertLogs('integration',level='INFO') as logs:
+            e._check_signal('A',100,1000,self.f.now,'momentum')
+        self.assertIn('daily loss allowance','\n'.join(logs.output))
+        self.assertNotIn('A',self.f.manager.state['trades'])
+
+    def test_global_executor_deferral_does_not_spam_every_symbol(self):
+        self.f.manager.view.update(ready=False,entry_allowed=False,entry_blockers=['position protection pending'])
+        with self.assertLogs('integration',level='INFO') as logs:
+            for _ in range(10):
+                for symbol in ('A','B','C'):
+                    self.engine._check_signal(symbol,100,1000,self.f.now,'momentum')
+        self.assertEqual(len(logs.output),1)
+        self.assertIn('position protection pending',logs.output[0])
+
     def test_real_scoring_rescan_reaches_fill_and_target_exit(self):
         del self.engine._compute_opportunity_score
         self.assertEqual(self.engine._process_scan_quotes({'NSE:A':self.quote(1000)}),1)
