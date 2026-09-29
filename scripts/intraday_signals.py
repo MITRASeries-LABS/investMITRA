@@ -1825,10 +1825,13 @@ class IntradayEngine:
             return
         if self.execution is not None:
             view = self.execution.snapshot()
-            if not view.get("ready"):
-                return
-            if view.get("entry_allowed") is False and any(
-                    b != "outside entry window" for b in view.get("entry_blockers", [])):
+            blockers = [b for b in view.get("entry_blockers", []) if b != "outside entry window"]
+            if not view.get("ready") or (view.get("entry_allowed") is False and blockers):
+                reason = "; ".join(blockers) or "reconciliation pending"
+                previous = getattr(self, "_entry_defer_status", None)
+                if previous is None or previous[0] != reason or (now-previous[1]).total_seconds() >= 60:
+                    logger.info("SIGNAL EVALUATION DEFERRED: %s", reason)
+                    self._entry_defer_status = (reason, now)
                 return
             if now.timestamp() - self.execution_offers.get(symbol, 0) < 5:
                 return
@@ -1964,12 +1967,15 @@ class IntradayEngine:
 
         # Calculate time-adjusted RVOL (matches _compute_opportunity_score)
         avg_vol_check = self.rvol_baseline.get(symbol, 0)
-        if avg_vol_check == 0: return  # No history - skip
+        if avg_vol_check == 0:
+            self._reject_signal(symbol, "RVOL baseline unavailable", now)
+            return
         _mkt_min   = now.hour*60+now.minute-(9*60+15)
         _frac      = max(_mkt_min/375, 0.05)
         _exp_vol   = avg_vol_check * _frac
         rvol_check = min(volume / _exp_vol, 200.0) if _exp_vol > 0 else 1.0
         if rvol_check < min_rvol:
+            self._reject_signal(symbol, f"RVOL below session minimum {min_rvol:.1f}x", now)
             return  # Skip weak volume signals
 
         # LONG: quality stock gapping up in neutral/bullish market
@@ -2011,8 +2017,11 @@ class IntradayEngine:
             direction = "SHORT"
             logger.debug("Bearish SHORT candidate: %s gap %.2f%% (F&O eligible)", symbol, true_gap_pct)
 
-        if not direction: return
+        if not direction:
+            self._reject_signal(symbol, "direction/market/score/VWAP conditions not met", now)
+            return
         if direction == "SHORT" and not self._is_fo_eligible(symbol):
+            self._reject_signal(symbol, "short requires confirmed F&O eligibility", now)
             return
 
         # Stops require an observed ATR; do not fabricate volatility from price.
@@ -2037,7 +2046,7 @@ class IntradayEngine:
             self.risk.daily_budget_remaining - candidate_cost))
 
         if available_capital < MIN_TICKET_INR:
-            logger.debug("Insufficient capital: Rs%.0f available", available_capital)
+            self._reject_signal(symbol, "insufficient available capital for minimum ticket", now)
             return
 
         # Size constrained by: risk budget, available capital, and per-trade cap
@@ -2045,7 +2054,7 @@ class IntradayEngine:
         capital_size = int(min(available_capital, MAX_CAPITAL_PER_TRADE) / ltp)
         size = min(risk_size, capital_size)
         if size <= 0:
-            logger.debug("Skip %s — zero size after risk/capital constraints", symbol)
+            self._reject_signal(symbol, "zero size after risk/capital constraints", now)
             return
 
         # Post-sizing validations — none may override the limits above
@@ -2053,26 +2062,26 @@ class IntradayEngine:
         actual_risk   = size * stop_dist
 
         if ticket_value < MIN_TICKET_INR:
-            logger.debug("Skip %s — ticket Rs%.0f below Rs1000 minimum", symbol, ticket_value)
+            self._reject_signal(symbol, "ticket below minimum size", now)
             return
         if ticket_value > MAX_CAPITAL_PER_TRADE:
-            logger.debug("Skip %s — ticket Rs%.0f exceeds cap Rs%d", symbol, ticket_value, MAX_CAPITAL_PER_TRADE)
+            self._reject_signal(symbol, "ticket exceeds per-trade cap", now)
             return
         if actual_risk > MAX_RISK_PER_TRADE_INR:
-            logger.debug("Skip %s — stop risk Rs%.0f exceeds limit Rs%d", symbol, actual_risk, MAX_RISK_PER_TRADE_INR)
+            self._reject_signal(symbol, "stop risk exceeds per-trade ceiling", now)
             return
 
         # Realistic cost estimate
         trade_cost   = estimate_costs(ltp, size, target)
         if round(ticket_value + trade_cost, 2) > self.risk.daily_budget_remaining:
+            self._reject_signal(symbol, "ticket plus costs exceeds available capital", now)
             return
         # A conservative target-profit screen, not an estimated probability of winning.
         expected_net = (abs(target - ltp) * size * 0.5) - trade_cost
         # Minimum: expected net must exceed MIN_NET_PROFIT and 2x trade costs
         _min_net = max(MIN_NET_PROFIT, trade_cost * 2)
         if expected_net < _min_net:
-            logger.debug("Skip %s — expected net Rs%.0f below Rs%.0f",
-                         symbol, expected_net, _min_net)
+            self._reject_signal(symbol, "target-profit screen below required net after costs", now)
             return
 
         # Risk check AFTER sizing - includes candidate stop risk and costs
@@ -2090,13 +2099,13 @@ class IntradayEngine:
             open_risk += min(0, worst)  # only count actual losses, not locked profits
         effective_pnl = self.risk.net_pnl + open_risk - candidate_stop_risk - candidate_costs
         if effective_pnl <= -MAX_DAILY_LOSS_INR:
-            logger.debug("Risk limit after candidate: Rs%.0f", effective_pnl)
+            self._reject_signal(symbol, "candidate stop risk plus existing risk/costs exceeds daily loss allowance", now)
             return
         # Capital check
         committed = sum(p["entry"] * p["size"] for p in self.risk.positions.values())
         # DESK_CAPITAL_INR set at top of file
         if committed + ltp * size > DESK_CAPITAL_INR:
-            logger.debug("Capital limit: Rs%.0f committed", committed)
+            self._reject_signal(symbol, "capital ceiling exceeded by candidate", now)
             return
 
         _entry_at = datetime.now(IST)
@@ -2151,6 +2160,8 @@ class IntradayEngine:
                     logger.info("Execution candidate queued (not accepted/filled): %s (%s) priority=%.2f",
                                 symbol, EXECUTION_MODE, _priority)
                     self._candidate_logged.add(symbol)  # diagnostic dedup only; eligibility remains unchanged
+            else:
+                self._reject_signal(symbol, "executor inbox full; awaiting fresh evaluation", now)
             return
         self.traded_today.add(symbol)
         self.signals[symbol] = candidate

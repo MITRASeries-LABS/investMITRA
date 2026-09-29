@@ -73,6 +73,147 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(self.manager.snapshot()['trades']['A']['orders'][0]['filled'],0)
         self.manager.step();t=self.manager.state['trades']['A']
         self.assertEqual(t['orders'][0]['filled'],20);self.assertEqual(t['orders'][1]['qty'],20)
+
+    def candidate_cycles(self, count):
+        for _ in range(count):
+            self.manager.step()
+            self.now += timedelta(seconds=2)
+
+    def test_batch_candidates_survive_reconciliation_and_fill_three(self):
+        class QuoteOnly:
+            def quote(inner, symbols): return self.broker.quotes([s[4:] for s in symbols])
+        self.manager = AutoOrderManager(PaperBroker(QuoteOnly(), self.journal), self.journal,
+            self.meta, daily_cap=35000, max_risk=1500, clock=self.clock, alerts=self.alerts.append)
+        self.manager.step()
+        for symbol in ('A', 'B', 'C'): self.manager.offer(self.signal(symbol, qty=90))
+        self.candidate_cycles(4)
+        view = self.manager.snapshot()
+        self.assertEqual(view['active_count'], 3)
+        self.assertEqual(set(view['trades']), {'A', 'B', 'C'})
+        self.assertEqual(self.manager.pending_candidates, {})
+        self.assertLessEqual(view['capital_used'], 35000)
+        self.assertTrue(all(t['orders'][0]['filled'] == 90 for t in view['trades'].values()))
+
+    def test_candidates_execute_by_priority_not_arrival(self):
+        for symbol, priority in [('A', 3), ('B', 12), ('C', 6)]:
+            self.manager.offer(dict(self.signal(symbol), priority_score=priority))
+        self.candidate_cycles(4)
+        entries = [o['tradingsymbol'] for o in self.broker.book if o['order_type'] == 'LIMIT']
+        self.assertEqual(entries, ['B', 'C', 'A'])
+
+    def test_latest_observation_replaces_pending_without_duplicate_orders(self):
+        self.manager.offer(self.signal('A')); self.manager.offer(self.signal('B'))
+        self.candidate_cycles(1)
+        self.manager.offer(dict(self.signal('B', qty=15), priority_score=9))
+        self.candidate_cycles(3)
+        self.assertEqual(self.manager._filled(self.manager.state['trades']['B']), 15)
+        self.assertEqual(len([o for o in self.broker.book if o['tradingsymbol']=='B' and o['order_type']=='LIMIT']),1)
+
+    def test_deferred_expiry_does_not_renew_timestamp(self):
+        self.manager.offer(self.signal('A')); self.manager.offer(self.signal('B'))
+        self.candidate_cycles(1)
+        offered = self.manager.pending_candidates['B']['offered_at']
+        self.now += timedelta(seconds=11)
+        with self.assertLogs('order_manager', level='INFO') as logs: self.manager.step()
+        self.assertNotIn('B', self.manager.state['trades'])
+        self.assertFalse(self.manager.pending_candidates)
+        self.assertIn('expired', '\n'.join(logs.output))
+        self.assertLess(offered, self.now.timestamp()-10)
+
+    def test_deferred_candidate_rechecks_price_before_order(self):
+        self.manager.offer(self.signal('A')); self.manager.offer(self.signal('B'))
+        self.candidate_cycles(1); self.broker.price = 100.5
+        with self.assertLogs('order_manager', level='INFO') as logs: self.manager.step()
+        self.assertNotIn('B', self.manager.state['trades'])
+        self.assertIn('entry tolerance', '\n'.join(logs.output))
+
+    def test_quote_failure_defers_then_recovers_candidate(self):
+        self.broker.fail_quotes = True; self.manager.offer(self.signal())
+        self.candidate_cycles(1)
+        self.assertIn('A', self.manager.pending_candidates)
+        self.assertFalse(self.broker.book)
+        self.broker.fail_quotes = False; self.candidate_cycles(2)
+        self.assertEqual(self.manager._filled(self.manager.state['trades']['A']),20)
+
+    def test_broker_failure_retains_only_unsubmitted_candidates(self):
+        self.broker.fail_orders = True; self.manager.offer(self.signal())
+        self.candidate_cycles(1)
+        self.assertIn('A',self.manager.pending_candidates)
+        self.broker.fail_orders = False; self.candidate_cycles(2)
+        self.assertEqual(self.manager._filled(self.manager.state['trades']['A']),20)
+
+    def test_unknown_submission_never_retried_from_pending_queue(self):
+        self.broker.throw_before = True
+        self.manager.offer(self.signal('A')); self.manager.offer(self.signal('B'))
+        self.candidate_cycles(4)
+        self.assertEqual(len(self.broker.actions),1)
+        self.assertNotIn('A',self.manager.pending_candidates)
+        self.assertIn('B',self.manager.pending_candidates)
+        self.now += timedelta(seconds=11); self.manager.step()
+        self.assertFalse(self.manager.pending_candidates)
+        self.assertEqual(len(self.broker.actions),1)
+
+    def test_deferred_candidate_obeys_position_limit_and_freed_slot(self):
+        self.manager.max_positions = 1
+        self.manager.offer(self.signal('A')); self.manager.offer(self.signal('B'))
+        self.candidate_cycles(2)
+        self.assertIn('B',self.manager.pending_candidates)
+        self.assertNotIn('B',self.manager.state['trades'])
+        self.manager._goal(self.manager.state['trades']['A'],20,'DEAD_TRADE')
+        self.candidate_cycles(3)
+        self.assertIsNotNone(self.manager.state['trades']['A']['closed_at'])
+        self.assertEqual(self.manager.snapshot()['active_count'],1)
+        self.assertEqual(self.manager._filled(self.manager.state['trades']['B']),20)
+
+    def test_deferred_candidate_rechecks_combined_planned_risk(self):
+        self.manager.max_daily_loss = 150
+        self.manager.offer(self.signal('A')); self.manager.offer(self.signal('B'))
+        with self.assertLogs('order_manager', level='INFO') as logs: self.candidate_cycles(3)
+        self.assertIn('A',self.manager.state['trades'])
+        self.assertNotIn('B',self.manager.state['trades'])
+        self.assertIn('daily loss allowance','\n'.join(logs.output))
+
+    def test_deferred_candidate_rechecks_profit_after_resizing(self):
+        self.manager.offer(self.signal('A'))
+        self.manager.offer(dict(self.signal('B'), minimum_net_screen=250, estimated_costs=10))
+        with self.assertLogs('order_manager', level='INFO') as logs: self.candidate_cycles(3)
+        self.assertNotIn('B',self.manager.state['trades'])
+        self.assertIn('profit screen','\n'.join(logs.output))
+
+    def test_flatten_clears_pending_without_new_entries(self):
+        self.manager.offer(self.signal('A')); self.manager.offer(self.signal('B'))
+        self.candidate_cycles(1); self.manager.request_flatten(); self.candidate_cycles(4)
+        self.assertNotIn('B',self.manager.state['trades'])
+        self.assertFalse(self.manager.pending_candidates)
+        self.assertTrue(self.manager.snapshot()['flat'])
+
+    def test_slow_broker_cycle_expires_candidate_before_submission(self):
+        quotes = self.broker.quotes
+        def delayed(symbols):
+            self.now += timedelta(seconds=11)
+            return quotes(symbols)
+        self.broker.quotes = delayed
+        self.manager.offer(self.signal()); self.manager.step()
+        self.assertFalse(self.broker.book)
+        self.assertFalse(self.manager.pending_candidates)
+
+    def test_pending_queue_is_bounded_and_retains_highest_priority(self):
+        for index in range(100):
+            self.manager.offer(dict(self.signal(f'S{index}'),priority_score=index))
+        self.manager._collect_candidates()
+        self.manager.offer(dict(self.signal('TOP'),priority_score=1000))
+        ranked = self.manager._collect_candidates()
+        self.assertEqual(len(ranked),100)
+        self.assertEqual(ranked[0]['symbol'],'TOP')
+        self.assertNotIn('S0',self.manager.pending_candidates)
+
+    def test_future_candidate_rejected_and_deferral_logs_throttled(self):
+        self.manager.offer(dict(self.signal(), offered_at=self.now.timestamp()+30))
+        self.manager.step(); self.assertFalse(self.broker.book)
+        self.broker.stale = True
+        with self.assertLogs('order_manager',level='INFO') as logs:
+            self.manager.offer(self.signal()); self.candidate_cycles(3)
+        self.assertEqual(sum('candidate quote stale' in line for line in logs.output),1)
     def test_partial_entry_only_protects_fills(self):
         self.broker.entry_fill=7;self.enter()
         self.assertEqual(self.manager.state['trades']['A']['orders'][1]['qty'],7)
