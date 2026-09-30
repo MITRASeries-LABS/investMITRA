@@ -353,20 +353,115 @@ class ReviewFixTests(unittest.TestCase):
         e = self.engine
         del e._compute_opportunity_score
         self.ns['psycopg2'] = SimpleNamespace(connect=Mock(side_effect=AssertionError('DB in tick callback')))
+        self.ns['SECTOR_INDEX_MAP'] = {'Technology': 'NSE:NIFTY IT'}
+        e.all_stocks['A']['sector'] = 'Technology'
+        def index(change):
+            return dict(last_price=100+change, ohlc={'close':100}, timestamp=self.f.now)
         e.market_direction='BULLISH'
         e.breadth={'NIFTY 50':{'pct_change':.5,'advances':35,'declines':15}}
-        e.sector_quotes={'NSE:NIFTY 50':1}
+        e.sector_quotes={'NSE:NIFTY IT':index(1), 'NSE:NIFTY 50':index(.5)}
+        e.prev_close['A']=100/1.02
         e.sentiment={'A':.5}
         long_score, long_details = e._compute_opportunity_score('A',100,1000,2,'momentum')
         e.market_direction='BEARISH'
         e.vwap['A']=101
         e.breadth={'NIFTY 50':{'pct_change':-.5,'advances':15,'declines':35}}
-        e.sector_quotes={'NSE:NIFTY 50':-1}
+        e.sector_quotes={'NSE:NIFTY IT':index(-1), 'NSE:NIFTY 50':index(-.5)}
+        e.prev_close['A']=100/.98
         e.sentiment={'A':-.5}
         short_score, short_details = e._compute_opportunity_score('A',100,1000,-2,'momentum')
         self.assertEqual(long_score, short_score)
+        self.assertEqual(long_details['sector_rs'],90)
+        self.assertEqual(short_details['sector_rs'],90)
         self.assertEqual(long_details['vwap_score'],short_details['vwap_score'])
         self.ns['psycopg2'].connect.assert_not_called()
+
+    def test_scoring_uses_live_stock_return_not_opening_gap(self):
+        e=self.engine
+        del e._compute_opportunity_score
+        self.ns['SECTOR_INDEX_MAP']={'Technology':'NSE:NIFTY IT'}
+        e.all_stocks['A']['sector']='Technology'
+        e.prev_close['A']=100
+        e.sector_quotes={key:dict(last_price=price,ohlc={'close':100},timestamp=self.f.now)
+                         for key,price in [('NSE:NIFTY IT',102),('NSE:NIFTY 50',101)]}
+        _,d=e._compute_opportunity_score('A',100.5,1000,5,'momentum')
+        self.assertEqual(d['sector_rs'],35)  # opening gap of 5% must not produce 90
+        self.assertAlmostEqual(d['stock_change_pct'],.5)
+        self.assertEqual(d['sector_return_basis'],'previous_close_to_current')
+        self.assertEqual(d['opening_range_status'],'unavailable')
+        self.assertIsNone(d['opening_breakout'])
+        e.all_stocks['A']['sector']='Unknown'
+        _,d=e._compute_opportunity_score('A',105,1000,5,'momentum')
+        self.assertEqual(d['sector_rs'],0)
+        self.assertEqual(d['sector_status'],'unmapped_sector')
+
+    def test_sector_refresh_is_paced_and_replaces_failed_snapshot(self):
+        e=self.engine
+        e.kite=object()
+        quotes={'NSE:NIFTY 50':dict(last_price=101,ohlc={'close':100},timestamp=self.f.now)}
+        fetch=Mock(side_effect=[quotes,ConnectionError('offline'),quotes])
+        self.ns.update(get_sector_quotes=fetch,time=SimpleNamespace(monotonic=Mock(side_effect=[100,110,161,222])))
+        e._refresh_sector_context()
+        self.assertEqual(e.sector_quotes,quotes)
+        e._refresh_sector_context();self.assertEqual(fetch.call_count,1)
+        with self.assertLogs('integration',level='WARNING'):
+            e._refresh_sector_context()
+        self.assertEqual(e.sector_quotes,{})
+        e._refresh_sector_context();self.assertEqual(e.sector_quotes,quotes)
+
+    def test_sector_fetch_includes_nifty_and_retains_exchange_timestamp(self):
+        tree=ast.parse((Path(__file__).parent/'scripts/intraday_signals.py').read_text(encoding='utf-8'))
+        node=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='get_sector_quotes')
+        ns=dict(KiteConnect=object,SECTOR_INDEX_MAP={'Technology':'NSE:NIFTY IT'})
+        exec(compile(ast.Module(body=[node],type_ignores=[]),'quote-test','exec'),ns)
+        q={'NSE:NIFTY IT':dict(timestamp=self.f.now,last_price=102,ohlc={'close':100})}
+        kite=SimpleNamespace(quote=Mock(return_value=q))
+        self.assertIs(ns['get_sector_quotes'](kite),q)
+        self.assertEqual(set(kite.quote.call_args.args[0]),{'NSE:NIFTY IT','NSE:NIFTY 50'})
+
+    def test_context_survives_signal_offer_fill_and_journal_serialization(self):
+        import json
+        e=self.engine
+        del e._compute_opportunity_score
+        self.assertEqual(e._process_scan_quotes({'NSE:A':self.quote(1000)}),1)
+        self.f.manager.step();self.f.manager.step()
+        saved=self.f.manager.snapshot()['trades']['A']['signal']['details']
+        self.assertEqual(saved['sector_status'],'unmapped_sector')
+        self.assertEqual(saved['sector_rs'],0)
+        self.assertIsNone(saved['sector_chg'])
+        self.assertEqual(saved['opening_range_status'],'unavailable')
+        self.assertIn('entry_extension_from_open_atr',saved)
+        self.assertIn('previous_close_to_current',json.dumps(saved,allow_nan=False))
+        self.f.manager.journal.save()
+
+    def test_sector_fetch_does_not_hold_engine_lock(self):
+        e=self.engine;e.kite=object()
+        def fetch(kite):
+            acquired=[]
+            def probe():
+                got=e._state_lock.acquire(timeout=.2);acquired.append(got)
+                if got:e._state_lock.release()
+            t=threading.Thread(target=probe);t.start();t.join()
+            self.assertEqual(acquired,[True])
+            return {}
+        self.ns.update(get_sector_quotes=fetch)
+        e._refresh_sector_context()
+
+    def test_opening_coverage_recorded_without_shadow_observer(self):
+        e=self.engine
+        self.assertIsNone(e.shadow)
+        self.f.now=self.f.now.replace(hour=9,minute=15,second=0)
+        for minute in range(15,30):
+            self.f.now=self.f.now.replace(minute=minute)
+            e.on_tick(None,[dict(instrument_token=1,last_price=100+minute/100,
+                               volume_traded=1000,ohlc={'open':100,'close':98})])
+        self.f.now=self.f.now.replace(minute=35)
+        del e._compute_opportunity_score
+        e.or_set['A']=True
+        _,d=e._compute_opportunity_score('A',100.2,1000,2,'momentum')
+        self.assertEqual(d['opening_range_status'],'complete_no_breakout')
+        self.assertFalse(d['opening_breakout'])
+        self.assertEqual(d['orb_score'],0)
 
     def test_ticket_cap_uses_actual_order_bound(self):
         self.f.manager.daily_cap = 35000
@@ -544,3 +639,64 @@ class CalendarAndQuoteTests(unittest.TestCase):
 
 if __name__=='__main__':
     unittest.main()
+
+
+class MarketContextTests(unittest.TestCase):
+    def setUp(self):
+        from signal_runtime import index_quote_context, relative_strength_context, opening_range_context
+        self.index=index_quote_context;self.rs=relative_strength_context;self.orb=opening_range_context
+        self.now=datetime(2026,9,30,10,0,tzinfo=IST)
+
+    def q(self, change=1, **kwargs):
+        return dict(last_price=100+change,ohlc={'close':100},timestamp=self.now,**kwargs)
+
+    def test_invalid_index_quotes_never_become_flat_market(self):
+        cases=[None,0,{},dict(last_price=100,ohlc={'close':100}),
+               dict(self.q(),timestamp='bad'),dict(self.q(),last_price=float('nan')),
+               dict(self.q(),ohlc={'close':0}),dict(self.q(),timestamp=self.now+timedelta(seconds=1)),
+               dict(self.q(),timestamp=self.now-timedelta(seconds=121))]
+        for q in cases:
+            with self.subTest(quote=q):
+                d=self.rs(105,100,1,q,self.q(),self.now)
+                self.assertEqual(d['sector_rs'],0)
+                self.assertFalse(d['sector_rs_available'])
+                self.assertIsNone(d['sector_chg'])
+
+    def test_valid_flat_index_is_distinguished_from_missing(self):
+        d=self.rs(102,100,1,self.q(0),self.q(-1),self.now)
+        self.assertEqual(d['sector_rs'],90)
+        self.assertEqual(d['sector_chg'],0)
+        self.assertTrue(d['sector_rs_available'])
+
+    def test_valid_naive_ist_and_aware_utc_timestamps(self):
+        from datetime import timezone
+        for at in [self.now.replace(tzinfo=None),self.now.isoformat(),self.now.astimezone(timezone.utc)]:
+            self.assertEqual(self.index(dict(self.q(),timestamp=at),self.now)['status'],'fresh')
+
+    def test_cached_quotes_expire_without_new_fetch(self):
+        self.assertTrue(self.rs(103,100,1,self.q(),self.q(0),self.now)['sector_rs_available'])
+        self.assertFalse(self.rs(103,100,1,self.q(),self.q(0),self.now+timedelta(seconds=121))['sector_rs_available'])
+
+    def test_missing_nifty_or_stock_previous_close_awards_no_points(self):
+        for prev,nifty in [(100,{}),(None,self.q()),(float('nan'),self.q())]:
+            d=self.rs(103,prev,1,self.q(),nifty,self.now)
+            self.assertEqual(d['sector_rs'],0)
+            self.assertFalse(d['sector_rs_available'])
+
+    def test_complete_opening_ranges_distinguish_breakout_from_no_breakout(self):
+        span=dict(first=555,last=569,max_gap=60)
+        for sign,px,expected in [(1,103,True),(1,100,False),(-1,97,True),(-1,100,False)]:
+            d=self.orb(102,98,True,span,px,sign)
+            self.assertTrue(d['opening_range_complete'])
+            self.assertEqual(d['opening_breakout'],expected)
+            self.assertEqual(d['orb_score'],25 if expected else 0)
+
+    def test_partial_late_and_missing_opening_ranges_remain_unknown(self):
+        for span in [{},dict(first=560,last=569,max_gap=30),dict(first=555,last=568,max_gap=30),
+                     dict(first=555,last=569,max_gap=61)]:
+            d=self.orb(102,98,True,span,103,1)
+            self.assertEqual(d['opening_range_status'],'incomplete')
+            self.assertIsNone(d['opening_breakout'])
+            self.assertEqual(d['orb_score'],0)
+        d=self.orb(0,float('inf'),True,{},103,1)
+        self.assertEqual(d['opening_range_status'],'unavailable')

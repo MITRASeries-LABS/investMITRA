@@ -21,7 +21,9 @@ from __future__ import annotations
 import os, sys, time, logging, requests, threading, math, hashlib, json
 from datetime import datetime, date, timedelta, timezone
 from collections import defaultdict
-from signal_runtime import RateLimitedKite, load_nse_holidays, previous_session, freshness_errors
+from signal_runtime import (RateLimitedKite, load_nse_holidays, previous_session, freshness_errors,
+                            index_quote_context, relative_strength_context, opening_range_context,
+                            SECTOR_REFRESH_SECONDS)
 import psycopg2
 from dotenv import load_dotenv
 load_dotenv('.env.prod')
@@ -505,19 +507,11 @@ def get_market_direction(kite: KiteConnect, ctx: dict) -> tuple[str, float]:
     return direction, change_pct
 
 
-def get_sector_quotes(kite: KiteConnect) -> dict[str, float]:
-    try:
-        unique = list(set(SECTOR_INDEX_MAP.values()))
-        quotes = kite.quote(unique)
-        result = {}
-        for key, data in quotes.items():
-            prev = data.get("ohlc", {}).get("close", 0)
-            last = data.get("last_price", 0)
-            if prev and last:
-                result[key] = (last - prev) / prev * 100
-        return result
-    except Exception as e:
-        logger.warning("Sector quotes: %s", e); return {}
+def get_sector_quotes(kite: KiteConnect) -> dict:
+    # Keep exchange timestamps and prices; never turn missing quotes into 0%.
+    # Uses the shared rate limiter, with execution requests retaining priority.
+    unique = sorted(set(SECTOR_INDEX_MAP.values()) | {"NSE:NIFTY 50"})
+    return kite.quote(unique)
 
 
 def get_nse_gainers_losers() -> tuple[list[str], list[str]]:
@@ -1099,6 +1093,7 @@ class IntradayEngine:
         self.rvol_baseline    = rvol_baseline
         self.key_levels       = key_levels
         self.sector_quotes    = sector_quotes
+        self._last_sector_refresh = None
         self.sentiment        = sentiment
         self.breadth          = ctx.get("breadth", {})
 
@@ -1199,6 +1194,13 @@ class IntradayEngine:
                     self.cum_tp_vol[symbol] += ltp * new_vol
                     self.vwap[symbol] = self.cum_tp_vol[symbol] / volume
 
+            # Coverage is tracked even when the optional shadow observer is off.
+            if session == "opening":
+                minute = now.hour * 60 + now.minute
+                span = self._shadow_opening.setdefault(symbol,
+                    dict(first=minute, last=minute, at=now.timestamp(), max_gap=0))
+                span["max_gap"] = max(span["max_gap"], now.timestamp() - span["at"])
+                span["last"], span["at"] = minute, now.timestamp()
             # Opening range
             if session == "opening":
                 self.or_high[symbol] = max(self.or_high.get(symbol, 0), ltp)
@@ -1218,12 +1220,6 @@ class IntradayEngine:
         """Nonblocking research capture after the normal decision, including exits' ticks."""
         try:
             from shadow_validation import capture_features, timestamp
-            if session == "opening":
-                minute = now.hour * 60 + now.minute
-                span = self._shadow_opening.setdefault(symbol,
-                    dict(first=minute, last=minute, at=now.timestamp(), max_gap=0))
-                span["max_gap"] = max(span["max_gap"], now.timestamp() - span["at"])
-                span["last"], span["at"] = minute, now.timestamp()
             if self._shadow_scored is not None:
                 queued = self.execution_offers.get(symbol) == now.timestamp()
                 self.shadow.candidate(capture_features(self, symbol, ltp, now, session,
@@ -1370,6 +1366,27 @@ class IntradayEngine:
                     "; ".join(view.get("entry_blockers", [])), quote_status,
                     "unknown" if combined is None else f"Rs{combined:.2f}")
 
+    def _refresh_sector_context(self):
+        now = datetime.now(IST)
+        minute = now.hour * 60 + now.minute
+        if not 555 <= minute < 900:
+            return
+        monotonic_now = time.monotonic()
+        if self._last_sector_refresh is not None and monotonic_now-self._last_sector_refresh < SECTOR_REFRESH_SECONDS:
+            return
+        self._last_sector_refresh = monotonic_now
+        try:
+            quotes = get_sector_quotes(self.kite)  # network outside state lock
+            if not isinstance(quotes, dict):
+                raise ValueError("Index quote response is not a mapping")
+        except Exception:
+            quotes = {}
+            logger.warning("Sector context refresh failed; relative-strength points unavailable", exc_info=True)
+        with self._state_lock:
+            self.sector_quotes = quotes  # replace, never retain omitted/stale fields
+        fresh = sum(index_quote_context(q, datetime.now(IST))["status"] == "fresh" for q in quotes.values())
+        logger.info("Sector context refreshed: %d/%d fresh index quotes", fresh, len(quotes))
+
     def _maintenance_loop(self):
         """Observe closes without WebSocket ticks and serialize all scheduled scans."""
         done = set()
@@ -1379,6 +1396,7 @@ class IntradayEngine:
         while not self._scan_stop.is_set():
             try:
                 self._poll_closed_trades()
+                self._refresh_sector_context()
                 now = datetime.now(IST)
                 reason = self._scan_reason(now, done, last_scan, time.monotonic())
                 if reason:
@@ -1710,18 +1728,18 @@ class IntradayEngine:
         # Gap classification - use time-adjusted expected volume
         gap_type, gap_mult = classify_gap(true_gap_pct, volume, expected_vol_now)
 
-        # Sector RS
-        sector_key = SECTOR_INDEX_MAP.get(sector, "NSE:NIFTY 50")
-        sector_chg = self.sector_quotes.get(sector_key, 0)
-        nifty_data = self.breadth.get("NIFTY 50", {})
-        nifty_chg  = nifty_data.get("pct_change", 0)
-        stock_chg  = true_gap_pct
+        # Compare live returns over the same interval; gaps remain a separate input.
+        sector_key = SECTOR_INDEX_MAP.get(sector)
         sign = 1 if true_gap_pct > 0 else -1
-        stock_chg, sector_chg, nifty_chg = (value * sign for value in (stock_chg, sector_chg, nifty_chg))
-        if stock_chg > sector_chg > nifty_chg: sector_rs = 90
-        elif stock_chg > sector_chg:                                  sector_rs = 70
-        elif stock_chg > nifty_chg:                                   sector_rs = 55
-        else:                                                          sector_rs = 35
+        sector_context = relative_strength_context(ltp, self.prev_close.get(symbol), sign,
+            self.sector_quotes.get(sector_key), self.sector_quotes.get("NSE:NIFTY 50"), now)
+        sector_context["sector_index"] = sector_key
+        sector_context["stock_sector"] = sector
+        sector_context["sector_quote_source"] = "kite_quote"
+        if sector_key is None:
+            sector_context["sector_status"] = "unmapped_sector"
+        sector_rs = sector_context["sector_rs"]
+        nifty_data = self.breadth.get("NIFTY 50", {})
 
         # Key levels
         ma20 = kl.get("ma20", 0); ma50 = kl.get("ma50", 0)
@@ -1744,13 +1762,10 @@ class IntradayEngine:
         ad_ratio = favourable / max(opposing, 1) if favourable + opposing else 1.0
         breadth_score = min(ad_ratio / 3.0 * 100, 100) if ad_ratio > 1 else 30
 
-        # ORB
-        orb_score = 0
-        if self.or_set.get(symbol):
-            or_range = or_h - or_l
-            if or_range > 0 and or_l < float('inf'):
-                if sign > 0 and ltp > or_h:   orb_score = min((ltp-or_h)/or_range*100, 100)
-                elif sign < 0 and ltp < or_l: orb_score = min((or_l-ltp)/or_range*100, 100)
+        # Preserve missing/partial opening-range provenance instead of calling it no breakout.
+        orb_context = opening_range_context(or_h, or_l, self.or_set.get(symbol),
+                                            self._shadow_opening.get(symbol), ltp, sign)
+        orb_score = orb_context["orb_score"]
 
         # Sentiment
         sent = self.sentiment.get(symbol, 0)
@@ -1799,8 +1814,12 @@ class IntradayEngine:
             "vwap_score": vwap_score, "orb_score": round(orb_score,1),
             "holding_score": holding_score, "preopen_score": preopen_score,
             "sector_rs": round(sector_rs,1), "breadth": round(breadth_score,1),
-            "kl_score": kl_score, "sector_chg": round(sector_chg*sign,2),
-            "stock_vs_sector": round((stock_chg-sector_chg)*sign,2),
+            "kl_score": kl_score,
+            **sector_context, **orb_context,
+            "entry_extension_from_open_pct": (ltp/today_open-1)*100 if today_open > 0 else None,
+            "entry_extension_from_open_atr": (ltp-today_open)*sign/kl["atr14"] if kl.get("atr14", 0) > 0 else None,
+            "breadth_source": "startup_snapshot",
+            "rvol_method": "linear_elapsed_session_fraction",
             "sentiment": round(sent,2), "bulk_deal": stock.get("in_bulk_deal",False),
             "today_open": round(today_open,2), "52w_high": round(high_52w,2),
         }
@@ -2159,6 +2178,10 @@ class IntradayEngine:
                 if symbol not in self._candidate_logged:
                     logger.info("Execution candidate queued (not accepted/filled): %s (%s) priority=%.2f",
                                 symbol, EXECUTION_MODE, _priority)
+                    logger.info("Candidate context %s: sector=%s nifty=%s ORB=%s; open extension pct=%s ATR=%s",
+                                symbol, details.get("sector_status", "unknown"), details.get("nifty_status", "unknown"),
+                                details.get("opening_range_status", "unknown"),
+                                details.get("entry_extension_from_open_pct"), details.get("entry_extension_from_open_atr"))
                     self._candidate_logged.add(symbol)  # diagnostic dedup only; eligibility remains unchanged
             else:
                 self._reject_signal(symbol, "executor inbox full; awaiting fresh evaluation", now)
@@ -2249,7 +2272,11 @@ class IntradayEngine:
         print(f"  Gap held:     {GAP_HOLD_MINUTES} min confirmed")
         print(f"  VWAP:         ₹{sig['vwap']:,.2f}")
         print(f"  RVOL:         {d['rvol']:.1f}x | ORB: {d['orb_score']:.0f} | Hold: {d['holding_score']:.0f}")
-        print(f"  Sector RS:    {d['stock_vs_sector']:+.2f}% vs sector | Sector: {d['sector_chg']:+.2f}%")
+        print(f"  Opening range: {d.get('opening_range_status', 'unavailable')}")
+        if d.get("sector_rs_available"):
+            print(f"  Sector RS:    {d['stock_vs_sector']:+.2f}% vs sector | Sector: {d['sector_chg']:+.2f}%")
+        else:
+            print(f"  Sector RS:    unavailable ({d.get('sector_status', 'missing')}; Nifty: {d.get('nifty_status', 'missing')})")
         print(f"  Sentiment:    {d['sentiment']:+.2f} | Bulk: {'YES' if d['bulk_deal'] else 'no'}")
         print(f"  Score:        {sig['final_score']:.1f} (Q:{sig['quality_score']:.0f} | O:{sig['opp_score']:.0f})")
         print(f"  F-Score: {sig['piotroski']} | Screens: {sig['screens']} | {sig['session']}")
@@ -2696,7 +2723,11 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
     prev_close    = {s.replace("NSE:",""): d["ohlc"]["close"]
                      for s,d in kite.quote([f"NSE:{s}" for s in token_map]).items()}
     key_levels    = get_key_levels(symbols)
-    sector_quotes = get_sector_quotes(kite)
+    try:
+        sector_quotes = get_sector_quotes(kite)
+    except Exception:
+        sector_quotes = {}
+        logger.warning("Initial sector quotes unavailable; background refresh will retry", exc_info=True)
     sentiment     = get_stock_sentiment(symbols)
 
     logger.info("Universe: %d stocks | key_levels:%d sector:%d sentiment:%d",

@@ -313,6 +313,7 @@ class CapitalVisibilityTests(unittest.TestCase):
             def now(cls,tz=None):return now
         ns.update(datetime=Clock,time=SimpleNamespace(monotonic=Mock(side_effect=[100,100,131,131,432,432])))
         e._scan_market=Mock(return_value=0)
+        e._refresh_sector_context=Mock()  # tested separately; isolate scan scheduling clock
         e._scan_stop=Mock()
         e._scan_stop.is_set.side_effect=[False,False,False,True]
         e._maintenance_loop()

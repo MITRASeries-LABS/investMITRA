@@ -1,7 +1,7 @@
 # investMITRA — Signal Engine Feature Reference
 
-Updated: 29 September 2026. Candidate queue retention and decision visibility revision.
-Engine build: `2026-09-29-candidate-queue1`. All times below are IST.
+Updated: 30 September 2026. Sector freshness and signal provenance revision.
+Engine build: `2026-09-30-sector-context1`. All times below are IST.
 
 This document describes the implemented automatic-paper system. Changes to trading
 parameters require testing and explicit sign-off. Updating this reference does not
@@ -470,3 +470,43 @@ detection, separately protected ₹5,000 reserve and ₹300 minimum-net descript
   Rs10,000 maximum ticket, three-position limit or Rs1,500 combined daily loss rule.
 - Three eligible signals can fill across successive execution cycles without new
   WebSocket ticks. Three positions are a maximum, not a required allocation.
+
+
+## Sector freshness and entry evidence — 30 September
+
+- The maintenance worker refreshes the mapped sector indices and Nifty 50 at most
+  once per minute during 09:15–15:00. Requests use the existing quote limiter;
+  execution requests have priority. No network or database calls are added to
+  WebSocket scoring, and the engine state lock is not held during the request.
+- Relative strength compares the stock's current return from previous close with
+  sector and Nifty returns over that same interval. The opening gap is still the
+  separate gap input; it is no longer substituted for the current stock return.
+- Index exchange timestamps must be from today and no more than 120 seconds old.
+  Missing, invalid, future, stale or unmapped inputs receive **zero sector-strength
+  points**, rather than an invented flat return. Genuine fresh 0% returns remain
+  valid. Failed refreshes clear the cache and retry on the next scheduled attempt;
+  exits and capital/risk checks remain executor-owned. Slow maintenance scans can
+  delay refresh; age checks still prevent expired quotes earning points.
+- Signal `details` retain sector mapping, quote times, availability reasons,
+  current stock/sector/Nifty returns, and the return calculation basis. These
+  fields flow into the existing execution journal and end-of-session Neon upload.
+  This change does not introduce periodic Neon writes.
+- Opening-range data is labelled `unavailable`, `incomplete`,
+  `complete_no_breakout` or `complete_breakout`. A complete observed range needs
+  coverage from by 09:16 through at least 09:29, no observed gap over 60 seconds,
+  and valid high/low values. Only a complete range can earn breakout points.
+  These are sampled tick ranges, not independently verified exchange candles.
+  Late-discovered symbols are labelled incomplete/unavailable, not non-breakouts.
+- Coverage tracking also works with shadow observation disabled. Entry distance
+  from open, in percent and ATR, is recorded for research, not used as a new gate.
+  RVOL is explicitly labelled as a linear elapsed-session approximation, and
+  breadth as a startup snapshot; neither is silently presented as refreshed data.
+- Freshness/availability corrections can lower candidate scores. The 40/60 blend,
+  score/RVOL/priority thresholds, ATR target/stop multiples, dead-trade rule,
+  Rs35,000 reusable capital, Rs10,000 ticket ceiling, three-position limit and
+  Rs1,500 combined daily-loss threshold remain unchanged. Live mode remains blocked.
+- Regression coverage includes stale/malformed/missing/flat index data, current
+  stock return versus opening gap, mirrored shorts, refresh failure/recovery,
+  lock-free fetching, unknown opening ranges and journal metadata preservation.
+  Strategy improvement still requires forward paper results and intraday paths;
+  this patch does not claim that the September 30 trades would have become winners.
