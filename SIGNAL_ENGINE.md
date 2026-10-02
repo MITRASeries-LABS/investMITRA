@@ -1,7 +1,7 @@
 # investMITRA — Signal Engine Feature Reference
 
-Updated: 30 September 2026. Sector freshness and signal provenance revision.
-Engine build: `2026-09-30-sector-context1`. All times below are IST.
+Updated: 2 October 2026. Sector admission, NSE volume baseline and trade-path research revision.
+Engine build: `2026-10-02-entry-evidence1`. All times below are IST.
 
 This document describes the implemented automatic-paper system. Changes to trading
 parameters require testing and explicit sign-off. Updating this reference does not
@@ -510,3 +510,70 @@ detection, separately protected ₹5,000 reserve and ₹300 minimum-net descript
   lock-free fetching, unknown opening ranges and journal metadata preservation.
   Strategy improvement still requires forward paper results and intraday paths;
   this patch does not claim that the September 30 trades would have become winners.
+
+
+## Sector admission and RVOL correction — 2 October
+
+- Both the engine and executor enforce the frozen `min_sector_chg_long` and
+  `max_sector_chg_short` settings against close-to-current sector returns. Defaults
+  are -0.3% for longs and +0.3% for shorts; loaded configuration can override them.
+  A long sector below its minimum or a short sector above its maximum is rejected.
+  Boundary equality is allowed. Configured gates require a mapped sector and a
+  finite return from a same-day quote no older than 120 seconds. Missing/unmapped,
+  stale or malformed sector evidence blocks entry; executor admission rechecks age.
+  Nifty-relative strength remains a separate scoring component.
+- Weight-loading failure retains the default sector gates. Legacy candidates without
+  sector settings retain compatibility; all newly generated production candidates
+  carry the frozen defaults/overrides. These gates can reduce the candidate count,
+  especially where the stock's sector is unknown; this is visible in rejection logs.
+- Historical RVOL uses **NSE volume only**, one unambiguous positive daily observation
+  per symbol/date in the 30 calendar days preceding the current IST date. BSE volume,
+  today/future rows, nonpositive volume and conflicting duplicate symbol/date rows are
+  excluded. No company `avg_volume` or synthetic value substitutes for a missing baseline.
+- Signal details record NSE source, first/last historical dates, sample count, window,
+  average daily volume, live cumulative volume, elapsed fraction, expected volume,
+  uncapped RVOL and the capped RVOL used for scoring. Display RVOL remains rounded to
+  two decimals. The linear elapsed-session approximation and existing 5x/8x gates
+  remain; this is **not** a same-time historical volume profile. Corporate-action
+  volume adjustment is not implemented. Sparse history is exposed, not filled with
+  assumed observations or treated as a new quality threshold.
+- Read-only audit of the Oct 1 lookback found 17 NSE and 17 BSE rows for both ENRIN
+  and KOTAKBANK. Mixing exchanges understated average volume by factors of about
+  1.83 and 1.86 respectively. Correcting only that denominator would reduce their
+  recorded RVOL from 31.97 to roughly 17.45 and 65.36 to 35.08. These are reconstructions
+  from currently stored history, **not** a replay or a claim the trades would disappear.
+
+## Trade-path research — `trade-path-v1`
+
+- The executor reuses its existing quotes, with no extra quote requests or intraday
+  Neon uploads. Research cannot submit orders or alter protection/exit rules. An
+  observation failure is recorded and logged without interrupting order management.
+- Reconciled filled trades accumulate sampled high/low, MFE/MAE per share and in initial
+  risk units, first/last quote time, count and maximum observation gap. MFE is nonnegative;
+  MAE is nonpositive. Long/short direction is respected. These price excursions are
+  relative to entry VWAP, **not position P&L**; partial fills/exits are not extrapolated
+  into a fictitious full-position profit. Intratrade price moves between polls can be missed.
+- After confirmed closure, the first fresh quote at or after +15/+30/+60 minutes is
+  retained within a 60-second grace window, including its timestamp and delay. Prices
+  require finite positive values and exchange timestamps no older than 10 seconds.
+  Results show price and direction-aware movement per share from entry and exit VWAP,
+  without costs or hypothetical execution. Closure time is executor fill recognition.
+- Completed marks are immutable across restart. Hibernate/network gaps yield explicit
+  `MISSING_FRESH_QUOTE` results, never interpolated prices. Horizons after the scheduled
+  15:05 observation end are `CENSORED_SESSION_END`. Early shutdown marks pending work
+  `CAPTURE_STOPPED`; a same-day restart can still observe future horizons. Existing
+  historical trades have no reconstructed excursions from before capture started.
+- Research is bounded to extrema/coverage and three horizon records per trade. It is
+  persisted in the existing SQLite journal and included in the existing shutdown
+  `execution_sessions.snapshot` upload. No Neon schema migration is required. The
+  automatic paper summary also prints the research; rerun it with `--date` as usual.
+- Shadow candidate markouts and filled-trade research are separate cohorts. Neither
+  proves that extending the 40-minute dead-trade rule improves realised returns.
+  Blended weights, ATR exits, three-position ceiling, Rs35,000 reusable capital,
+  Rs10,000 maximum ticket and Rs1,500 combined daily loss limit are unchanged.
+
+Offline verification now also includes `test_entry_evidence`:
+
+```powershell
+python -X utf8 -m unittest -q test_auto_trading test_review_fixes test_capital_visibility test_shadow_validation test_neon_session_upload test_session_reports test_pipeline_dates test_overnight_readiness test_server_pipeline test_entry_evidence
+```

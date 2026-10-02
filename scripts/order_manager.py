@@ -19,20 +19,22 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
+from signal_evidence import sector_policy_rejection
+from trade_research import observe_trade, finish_observation
 from execution_capital import capital_snapshot, REUSABLE, LEGACY
 
 IST = timezone(timedelta(hours=5, minutes=30))
 logger = logging.getLogger(__name__)
 TERMINAL = {"COMPLETE", "CANCELLED", "REJECTED"}
 PREFIX = "IM3"
-BUILD_ID = "2026-09-30-sector-context1"
+BUILD_ID = "2026-10-02-entry-evidence1"
 MAX_PENDING_CANDIDATES = 100
 CANDIDATE_TTL_SECONDS = 10
 MIN_SIGNAL_GAP_PCT = 0.30
 MIN_FINAL_SCORE = 55.0
 
 
-def entry_policy_rejection(signal):
+def entry_policy_rejection(signal, now=None):
     """Hard gates shared by the signal engine and executor; reject missing data."""
     try:
         gap = float(signal["true_gap"])
@@ -57,7 +59,7 @@ def entry_policy_rejection(signal):
                     return "neutral-day short requires stock score >=65"
     except (KeyError, ValueError, TypeError):
         return "missing or invalid signal gate metadata"
-    return None
+    return sector_policy_rejection(signal, now or datetime.now(IST))
 
 
 def notify(message: str, silent: bool = False):
@@ -513,6 +515,8 @@ class AutoOrderManager:
                 action.update(order_id=o["order_id"], status=o["status"], filled=filled, average=avg,
                               message=o.get("status_message", ""))
                 if filled > previous_filled:
+                    if action["kind"] == "ENTRY":
+                        t.setdefault("first_fill_observed_at", self.clock().isoformat())
                     if action["kind"] in {"STOP", "EXIT"}:
                         exit_kinds_now.add(action["kind"])
                         # Persist alongside fills before sending the alert, so a
@@ -609,7 +613,7 @@ class AutoOrderManager:
             return reject("outside entry window")
         if not self.ready: return defer("awaiting broker reconciliation")
         if self._protection_pending(): return defer("position protection pending")
-        rejection = entry_policy_rejection(sig)
+        rejection = entry_policy_rejection(sig, now=now)
         if rejection:
             return reject(rejection)
         symbol = sig["symbol"]
@@ -813,6 +817,7 @@ class AutoOrderManager:
                 try: self.quotes = self.broker.quotes(sorted(symbols))
                 except Exception: self.quotes = {}  # broker-side protection remains; timed exits still run
             self._refresh()
+            self._observe_trade_paths()
             self._publish()
             view = self.snapshot()
             combined = view["combined_net"]
@@ -829,7 +834,9 @@ class AutoOrderManager:
                 self._halt("Actual entry fill exceeds per-ticket cap; no further entries")
             for t in list(self.state["trades"].values()): self._manage(t)
             # Refresh after any stop/exit action before considering another entry.
-            self._refresh(); self._publish()
+            self._refresh()
+            self._observe_trade_paths()
+            self._publish()
             for sig in pending:
                 outcome = self._accept(sig)
                 if outcome != "deferred":
@@ -858,10 +865,25 @@ class AutoOrderManager:
                 self._publish()
                 logger.exception("Execution status could not be persisted; entries blocked")
 
+    def _observe_trade_paths(self):
+        # Existing quotes only. Research never submits, cancels or delays orders.
+        for trade in self.state["trades"].values():
+            try:
+                observe_trade(trade, self.quotes.get("NSE:" + trade["symbol"], {}), self.clock())
+            except Exception as exc:
+                if not trade.get("research_error"):
+                    logger.warning("Trade research unavailable for %s (%s)", trade["symbol"], type(exc).__name__)
+                trade["research_error"] = type(exc).__name__
+
     def run(self):
         while not self.stop_requested.is_set():
             self.step()
             self.stop_requested.wait(2)
+
+    def finish_research(self):
+        finish_observation(self.state["trades"], self.clock())
+        self.journal.save()
+        self._publish()
 
     def mirror_to_neon(self):
         """One shutdown upload, with at most three attempts; never an intraday loop.
