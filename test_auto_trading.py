@@ -295,6 +295,7 @@ class ExecutionTests(unittest.TestCase):
     def test_lost_journal_blocks_against_tagged_broker_orders(self):
         self.enter();self.manager.state['trades']={};self.manager.step();self.assertFalse(self.manager.snapshot()['ready'])
     def _make_signal_engine(self):
+        from signal_evidence import volume_evidence
         from collections import defaultdict
         from signal_runtime import index_quote_context, relative_strength_context, opening_range_context, SECTOR_REFRESH_SECONDS
         import logging, threading, math
@@ -302,7 +303,7 @@ class ExecutionTests(unittest.TestCase):
         tree=ast.parse((Path(__file__).parent / 'scripts' / 'intraday_signals.py').read_text(encoding='utf-8'))
         ns=dict(datetime=datetime,date=date,IST=IST,defaultdict=defaultdict,threading=threading,math=math,BUILD_ID="test",logger=logging.getLogger('integration'),
                 EXECUTION_MODE='auto_paper',PAPER_TRADING=True, entry_policy_rejection=entry_policy_rejection, MIN_SIGNAL_GAP_PCT=MIN_SIGNAL_GAP_PCT, MIN_FINAL_SCORE=MIN_FINAL_SCORE)
-        ns.update(index_quote_context=index_quote_context, relative_strength_context=relative_strength_context,
+        ns.update(volume_evidence=volume_evidence, index_quote_context=index_quote_context, relative_strength_context=relative_strength_context,
                   opening_range_context=opening_range_context, SECTOR_REFRESH_SECONDS=SECTOR_REFRESH_SECONDS)
         # Import only literals, arithmetic assignments and the actual pure
         # classes/functions; exclude all production imports and startup calls.

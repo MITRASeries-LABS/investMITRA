@@ -24,6 +24,7 @@ from collections import defaultdict
 from signal_runtime import (RateLimitedKite, load_nse_holidays, previous_session, freshness_errors,
                             index_quote_context, relative_strength_context, opening_range_context,
                             SECTOR_REFRESH_SECONDS)
+from signal_evidence import load_volume_baselines, volume_evidence, SECTOR_POLICY_DEFAULTS
 import psycopg2
 from dotenv import load_dotenv
 load_dotenv('.env.prod')
@@ -187,10 +188,10 @@ def load_signal_weights() -> dict:
                     if not isinstance(value, (float, int)) or not math.isfinite(value) or value < 0:
                         raise ValueError('Invalid signal weight: ' + key)
             logger.info("Loaded signal weights effective %s", w.get("effective_date","?"))
-            return w
+            return {**SECTOR_POLICY_DEFAULTS, **w}
     except Exception as e:
         logger.warning("Load weights failed: %s ? using defaults", e)
-    return {}
+    return dict(SECTOR_POLICY_DEFAULTS)
 
 
 def load_fo_eligible_symbols():
@@ -707,24 +708,17 @@ def get_dynamic_gappers(kite, existing_symbols: set, ctx: dict) -> list[dict]:
 
 
 def get_rvol_baseline() -> dict[str, float]:
+    conn = None
     try:
-        conn = psycopg2.connect(NEON_URL, connect_timeout=10)
-        cur  = conn.cursor()
-        cur.execute("""
-            SELECT cm.nse_symbol, AVG(ep.volume)
-            FROM investmitra.equity_prices ep
-            JOIN investmitra.company_master cm ON ep.isin=cm.isin
-            WHERE ep.trade_date>=CURRENT_DATE-INTERVAL '30 days'
-              AND ep.trade_date<CURRENT_DATE
-              AND cm.nse_symbol IS NOT NULL
-            GROUP BY cm.nse_symbol
-            HAVING AVG(ep.volume)>0
-        """)
-        result = {r[0]: float(r[1]) for r in cur.fetchall()}
-        cur.close(); conn.close()
-        return result
+        conn = psycopg2.connect(NEON_URL, connect_timeout=10,
+                                options="-c statement_timeout=10000")
+        return load_volume_baselines(conn, datetime.now(IST).date())
     except Exception as e:
-        logger.warning("RVOL: %s", e); return {}
+        logger.warning("RVOL baseline unavailable (%s)", type(e).__name__)
+        return {}
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def load_signal_thresholds() -> dict:
@@ -1091,6 +1085,7 @@ class IntradayEngine:
         self.ctx              = ctx
         self.vix_signal       = ctx["vix_signal"]
         self.rvol_baseline    = rvol_baseline
+        self.rvol_provenance  = dict(getattr(rvol_baseline, "metadata", {}))
         self.key_levels       = key_levels
         self.sector_quotes    = sector_quotes
         self._last_sector_refresh = None
@@ -1274,6 +1269,7 @@ class IntradayEngine:
             with self._state_lock:
                 self.key_levels.update(levels)
                 self.rvol_baseline.update(baselines)
+                self.rvol_provenance.update(getattr(baselines, "metadata", {}))
                 for stock in new_stocks:
                     symbol = stock["symbol"]
                     token = self.instrument_tokens.get(symbol)
@@ -1713,17 +1709,10 @@ class IntradayEngine:
         sector     = stock.get("sector", "")
         kl         = self.key_levels.get(symbol, {})
 
-        # RVOL - time-adjusted, symbol-keyed baseline
-        # Use symbol key (fixed) not ISIN key (broken)
-        avg_daily  = max(self.rvol_baseline.get(symbol, 
-                         self.rvol_baseline.get(isin, 
-                         stock.get("avg_volume", 0))), 1)
-        now        = datetime.now(IST)
-        mkt_min    = now.hour*60+now.minute-(9*60+15)
-        # Time-adjusted: compare today's volume to historical volume at same time
-        frac       = max(mkt_min/375, 0.05)
-        expected_vol_now = avg_daily * frac
-        rvol       = min(volume / expected_vol_now, 200.0) if expected_vol_now > 0 else 1
+        now = datetime.now(IST)
+        volume_context = volume_evidence(self.rvol_baseline, self.rvol_provenance, symbol, volume, now)
+        expected_vol_now = volume_context["rvol_expected_volume"] or 0
+        rvol = volume_context["rvol"]
 
         # Gap classification - use time-adjusted expected volume
         gap_type, gap_mult = classify_gap(true_gap_pct, volume, expected_vol_now)
@@ -1809,6 +1798,7 @@ class IntradayEngine:
         ) * sess_mult
 
         details = {
+            **volume_context,
             "gap_type": gap_type, "gap_score": round(gap_score,1),
             "rvol": round(rvol,2), "rvol_score": round(rvol_score,1),
             "vwap_score": vwap_score, "orb_score": round(orb_score,1),
@@ -1819,7 +1809,6 @@ class IntradayEngine:
             "entry_extension_from_open_pct": (ltp/today_open-1)*100 if today_open > 0 else None,
             "entry_extension_from_open_atr": (ltp-today_open)*sign/kl["atr14"] if kl.get("atr14", 0) > 0 else None,
             "breadth_source": "startup_snapshot",
-            "rvol_method": "linear_elapsed_session_fraction",
             "sentiment": round(sent,2), "bulk_deal": stock.get("in_bulk_deal",False),
             "today_open": round(today_open,2), "52w_high": round(high_52w,2),
         }
@@ -1963,7 +1952,8 @@ class IntradayEngine:
         rejection = entry_policy_rejection(dict(true_gap=true_gap_pct,
             final_score=final, gap_threshold=gap_thresh, details=details,
             direction="SHORT" if true_gap_pct < 0 else "LONG",
-            market_direction=self.market_direction, stock_score=score))
+            market_direction=self.market_direction, stock_score=score,
+            signal_weights=self.signal_weights), now=now)
         if rejection:
             self._reject_signal(symbol, rejection, now)
             return
@@ -1984,15 +1974,11 @@ class IntradayEngine:
 
         min_rvol = 8.0 if session == "choppy" else 5.0
 
-        # Calculate time-adjusted RVOL (matches _compute_opportunity_score)
-        avg_vol_check = self.rvol_baseline.get(symbol, 0)
-        if avg_vol_check == 0:
+        volume_context = volume_evidence(self.rvol_baseline, self.rvol_provenance, symbol, volume, now)
+        if volume_context["rvol_expected_volume"] is None:
             self._reject_signal(symbol, "RVOL baseline unavailable", now)
             return
-        _mkt_min   = now.hour*60+now.minute-(9*60+15)
-        _frac      = max(_mkt_min/375, 0.05)
-        _exp_vol   = avg_vol_check * _frac
-        rvol_check = min(volume / _exp_vol, 200.0) if _exp_vol > 0 else 1.0
+        rvol_check = volume_context["rvol"]
         if rvol_check < min_rvol:
             self._reject_signal(symbol, f"RVOL below session minimum {min_rvol:.1f}x", now)
             return  # Skip weak volume signals
@@ -3002,6 +2988,10 @@ def main():
         if not worker.is_alive():
             try:
                 try:
+                    try:
+                        execution.finish_research()
+                    except Exception:
+                        logger.exception("Trade research finalization failed; capture may be incomplete")
                     execution.mirror_to_neon()
                 finally:
                     try:

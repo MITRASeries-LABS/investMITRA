@@ -182,6 +182,9 @@ def summarise(db_path="data/execution_auto_paper.sqlite3", target_date=None,
         print("  Entry eligibility not recorded in this historical journal; Halt alone is insufficient.")
     print(f"  Halt: {state.get('halt') or 'none'}\n{'='*80}\n")
 
+    from trade_research import print_research
+    print_research(state)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
