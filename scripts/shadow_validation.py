@@ -79,6 +79,11 @@ class StudyStore:
             entry REAL NOT NULL, qty INTEGER NOT NULL, features TEXT NOT NULL,
             filters TEXT NOT NULL, status TEXT NOT NULL,
             exit_at REAL, exit_price REAL, gross REAL, net REAL, stress_net REAL);
+          CREATE TABLE IF NOT EXISTS decisions(
+            id TEXT PRIMARY KEY, day TEXT NOT NULL, strategy_id TEXT NOT NULL,
+            symbol TEXT NOT NULL, session TEXT NOT NULL, observed_at REAL NOT NULL,
+            body TEXT NOT NULL);
+          CREATE INDEX IF NOT EXISTS decision_day ON decisions(day,strategy_id);
           CREATE TABLE IF NOT EXISTS observer_health(
             run_id TEXT PRIMARY KEY, updated_at REAL NOT NULL,
             dropped_events INTEGER NOT NULL, error TEXT);
@@ -118,6 +123,13 @@ class StudyStore:
            json.dumps(features, sort_keys=True, allow_nan=False),
            json.dumps(filters(features)), status))
 
+    def decision(self, record):
+        key = '|'.join(str(record[k]) for k in ('version','day','strategy_id','symbol','session'))
+        key += '|' + str(int(record['observed_at']//60))
+        self.db.execute('INSERT OR IGNORE INTO decisions VALUES (?,?,?,?,?,?,?)',
+            (key,record['day'],record['strategy_id'],record['symbol'],record['session'],
+             record['observed_at'],json.dumps(record,sort_keys=True,allow_nan=False)))
+
     def quote(self, symbol, price, at, price_at):
         price = finite(price)
         if not price or price <= 0 or not price_fresh(at, price_at):
@@ -156,6 +168,7 @@ class ShadowObserver:
         self.failed = None
         self.dropped = 0
         self.seen = set()
+        self.decision_minutes = {}
         self.run_id = datetime.now(IST).isoformat()
         self.worker = threading.Thread(target=self._run, name="shadow-observer", daemon=True)
         self.worker.start()
@@ -181,6 +194,13 @@ class ShadowObserver:
         if key not in self.seen and self._put(("candidate", json.loads(json.dumps(features, allow_nan=False)))):
             self.seen.add(key)
 
+    def decision(self, record):
+        key = (record['day'],record['strategy_id'],record['symbol'],record['session'])
+        minute = int(record['observed_at']//60)
+        if self.decision_minutes.get(key) != minute:
+            event = ('decision', json.loads(json.dumps(record, allow_nan=False)))
+            if self._put(event): self.decision_minutes[key] = minute
+
     def quote(self, symbol, price, at, price_at):
         self._put(("quote", symbol, price, at, price_at))
 
@@ -199,6 +219,8 @@ class ShadowObserver:
                 if event:
                     if event[0] == "candidate":
                         store.candidate(event[1])
+                    elif event[0] == "decision":
+                        store.decision(event[1])
                     else:
                         store.quote(*event[1:])
                 now = datetime.now(IST).timestamp()
@@ -256,5 +278,7 @@ def capture_features(engine, symbol, price, now, session, scored, tick, queued):
         "or_high": hi, "or_low": lo, "opening_range_complete": complete,
         "today_open": engine.today_open.get(symbol), "previous_close": engine.prev_close.get(symbol),
         "volume": tick.get("volume_traded"), "cap": stock.get("cap", stock.get("market_cap_category", "?")),
-        "sector": stock.get("sector"), "breadth_startup_only": dict(engine.breadth.get("NIFTY 50", {})),
-        "breadth_at_entry_verified": False}
+        "sector": stock.get("sector"), "breadth_snapshot": dict(engine.breadth.get("NIFTY 50", {})),
+        "breadth_at_entry_verified": scored.get('details',{}).get('breadth_status') == 'fresh',
+        "gate_diagnostics": getattr(engine, '_last_decision', {}).get('gates', {}),
+        "policy": getattr(engine, '_last_decision', {}).get('policy', {})}

@@ -193,7 +193,7 @@ def compute_momentum_score(df: pd.DataFrame, target_date: date) -> pd.DataFrame:
         "ret_1d_pct", "ret_5d_pct", "ret_20d_pct", "ret_60d_pct", "ret_252d_pct",
         "pos_52w", "vol_ratio_20d", "vol_20d_pct",
         "price_vs_ma50", "price_vs_ma200", "ma_cross_signal",
-        "score_version",
+        "score_version", "price_contract_version",
     ]
 
     result = df[[c for c in keep if c in df.columns]].copy()
@@ -234,10 +234,7 @@ def score_exists(target_date: date) -> bool:
 
 
 def run_for_date(target_date: date) -> dict:
-    if score_exists(target_date):
-        logger.info("%s already scored — skipping", target_date)
-        return {"date": str(target_date), "status": "skipped"}
-
+    # Recompute from the validated features; old same-date files may predate source repair.
     features = load_features(target_date)
     if features is None:
         return {"date": str(target_date), "status": "no_features"}

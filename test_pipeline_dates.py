@@ -83,8 +83,8 @@ class PipelineReadinessTests(unittest.TestCase):
             fake=SimpleNamespace(get_duckdb_con=lambda:con,BUCKET='test-bucket',ENV='prod')
             with patch.dict(sys.modules,{'compute_features':fake}), contextlib.redirect_stdout(io.StringIO()):
                 verify(date(2026,9,24),stage)
-                params=con.execute.call_args.args[1]
-                self.assertIn(f'CAST({column} AS DATE)',con.execute.call_args.args[0])
+                params=con.execute.call_args_list[0].args[1]
+                self.assertIn(f'CAST({column} AS DATE)',con.execute.call_args_list[0].args[0])
                 self.assertEqual(params[0],date(2026,9,24))
                 self.assertTrue(params[1].endswith(filename))
                 con.close.assert_called_once()
@@ -114,7 +114,7 @@ class PipelineReadinessTests(unittest.TestCase):
         fn=load_function('compute_investmitra_score.py','load_score',BUCKET='test',ENV='prod')
         self.assertIsNone(fn(con,'momentum',date(2026,9,24)))
         self.assertEqual(con.execute.call_count,1)
-        self.assertIn('momentum_20260924.parquet',con.execute.call_args.args[0])
+        self.assertIn('momentum_20260924.parquet',con.execute.call_args_list[0].args[0])
 
     def test_slower_component_fallback_is_retained(self):
         con=Mock()

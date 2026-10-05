@@ -6,6 +6,21 @@ IST = timezone(timedelta(hours=5, minutes=30))
 SECTOR_POLICY_DEFAULTS = {"min_sector_chg_long": -0.3, "max_sector_chg_short": 0.3}
 
 
+def market_policy_rejection(signal, now):
+    if not signal.get('signal_weights', {}).get('require_fresh_market_context'):
+        return None
+    try:
+        context = signal['details']['market_context']
+        at = datetime.fromisoformat(context['quote_at'])
+        if (context['status'] != 'fresh' or at.tzinfo is None or
+                at.astimezone(IST).date() != now.astimezone(IST).date() or
+                not 0 <= (now-at).total_seconds() <= 120):
+            return 'market context missing or stale'
+    except (KeyError, TypeError, ValueError):
+        return 'market context missing or stale'
+    return None
+
+
 class VolumeBaselines(dict):
     """Numeric mapping retained for callers, with independently persisted provenance."""
     def __init__(self, values=(), metadata=None):

@@ -128,12 +128,12 @@ def write_to_neon(df: pd.DataFrame, trade_date: date, source_id: str) -> int:
         logger.warning("  No valid rows after ISIN filter")
         return 0
 
-    # Deduplicate — keep last occurrence per ISIN
-    if "isin" in df.columns:
-        before = len(df)
-        df = df.drop_duplicates(subset=["isin"], keep="last")
-        if len(df) < before:
-            logger.info("  Deduped: %d -> %d rows", before, len(df))
+    # Exact reruns are harmless; conflicting revisions require explicit resolution.
+    compared = ['isin'] + required + [c for c in ('turnover_cr', 'delivery_pct') if c in df.columns]
+    unique = df.drop_duplicates(subset=compared)
+    if unique.duplicated(subset=['isin'], keep=False).any():
+        raise ValueError('Conflicting same-venue rows for ISIN/date; load aborted')
+    df = unique
 
     def sf(val):
         try:

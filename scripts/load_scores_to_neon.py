@@ -12,6 +12,7 @@ import argparse, logging, math, os
 from datetime import date, datetime, timedelta, timezone
 import duckdb, psycopg2
 from psycopg2.extras import execute_values
+from market_data_contract import VERSION as PRICE_CONTRACT_VERSION
 from dotenv import load_dotenv
 load_dotenv('.env.prod')
 
@@ -76,6 +77,7 @@ def ensure_table():
         ALTER TABLE investmitra.daily_scores
         ADD COLUMN IF NOT EXISTS company_name VARCHAR(200)
     """)
+    cur.execute("ALTER TABLE investmitra.daily_scores ADD COLUMN IF NOT EXISTS price_contract_version TEXT")
     cur.close(); conn.close()
 
 
@@ -97,6 +99,9 @@ def load_for_date(target_date: date) -> int:
     if df.empty:
         return 0
 
+    if 'price_contract_version' not in df or not df['price_contract_version'].eq(PRICE_CONTRACT_VERSION).all():
+        raise ValueError('Composite scores require rebuilt exchange-specific features and momentum')
+
     def sf(v):
         try:
             f = float(v)
@@ -112,7 +117,7 @@ def load_for_date(target_date: date) -> int:
          sf(r.get("management_quality_score")), sf(r.get("financial_stress_score")),
          sf(r.get("ret_252d_pct")), sf(r.get("vol_20d_pct")), sf(r.get("pos_52w")),
          sf(r.get("debt_equity")), sf(r.get("pat_margin")),
-         sf(r.get("insider_pct")), sf(r.get("institution_pct")))
+         sf(r.get("insider_pct")), sf(r.get("institution_pct")), r["price_contract_version"])
         for _, r in df.iterrows()
         if r.get("isin")
     ]
@@ -126,9 +131,14 @@ def load_for_date(target_date: date) -> int:
             (isin, score_date, sector, price, investmitra_score, signal,
              momentum_score, financial_health_score, management_quality_score,
              financial_stress_score, ret_252d_pct, vol_20d_pct, pos_52w,
-             debt_equity, pat_margin, insider_pct, institution_pct)
+             debt_equity, pat_margin, insider_pct, institution_pct, price_contract_version)
         VALUES %s
         ON CONFLICT (isin, score_date) DO UPDATE SET
+            price_contract_version   = EXCLUDED.price_contract_version,
+            sector                   = EXCLUDED.sector,
+            vol_20d_pct               = EXCLUDED.vol_20d_pct,
+            pos_52w                  = EXCLUDED.pos_52w,
+            institution_pct          = EXCLUDED.institution_pct,
             investmitra_score        = EXCLUDED.investmitra_score,
             signal                   = EXCLUDED.signal,
             momentum_score           = EXCLUDED.momentum_score,

@@ -40,6 +40,12 @@ def verify(target, stage):
             f'SELECT COUNT(*), COUNT(*) FILTER (WHERE CAST({column} AS DATE) = ?) '
             'FROM read_parquet(?, union_by_name=true)', [target, path]).fetchone()
         validate_counts(target, total, matching, stage)
+        if stage in ('features', 'momentum', 'composite'):
+            from market_data_contract import VERSION
+            valid = con.execute('SELECT COUNT(*) FROM read_parquet(?) WHERE price_contract_version=?',
+                                [path, VERSION]).fetchone()[0]
+            if valid != total:
+                raise RuntimeError('Features require the current exchange-specific price contract; rebuild')
         print(f'VALIDATED {stage}: {total} rows dated {target}')
     finally:
         con.close()

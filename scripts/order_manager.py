@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
-from signal_evidence import sector_policy_rejection
+from signal_evidence import sector_policy_rejection, market_policy_rejection
 from trade_research import observe_trade, finish_observation
 from execution_capital import capital_snapshot, REUSABLE, LEGACY
 
@@ -27,7 +27,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 logger = logging.getLogger(__name__)
 TERMINAL = {"COMPLETE", "CANCELLED", "REJECTED"}
 PREFIX = "IM3"
-BUILD_ID = "2026-10-02-entry-evidence1"
+BUILD_ID = "2026-10-05-canonical-evidence1"
 MAX_PENDING_CANDIDATES = 100
 CANDIDATE_TTL_SECONDS = 10
 MIN_SIGNAL_GAP_PCT = 0.30
@@ -59,7 +59,8 @@ def entry_policy_rejection(signal, now=None):
                     return "neutral-day short requires stock score >=65"
     except (KeyError, ValueError, TypeError):
         return "missing or invalid signal gate metadata"
-    return sector_policy_rejection(signal, now or datetime.now(IST))
+    at = now or datetime.now(IST)
+    return sector_policy_rejection(signal, at) or market_policy_rejection(signal, at)
 
 
 def notify(message: str, silent: bool = False):

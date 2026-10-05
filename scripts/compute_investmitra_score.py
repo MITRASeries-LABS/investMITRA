@@ -103,6 +103,8 @@ def compute_investmitra_score(score_date: date) -> pd.DataFrame:
     df = momentum[["isin", "sector", "momentum_score", "price",
                    "ret_252d_pct", "vol_20d_pct", "pos_52w"]].copy()
 
+    df["price_contract_version"] = momentum.get("price_contract_version", "unverified")
+
     # Join financial health (inverse of stress)
     if stress is not None:
         stress_cols = stress[["isin", "financial_stress_score",

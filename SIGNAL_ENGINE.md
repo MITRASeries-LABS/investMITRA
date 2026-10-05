@@ -1,3 +1,5 @@
+> Pending release: see [SIGNAL_RELEASE_REVIEW.md](SIGNAL_RELEASE_REVIEW.md) for the canonical data/scoring repair, changed behaviour, pipeline prerequisites, preserved controls and research limitations. Build `2026-10-05-canonical-evidence1` requires rebuilt scores marked `daily-venue-v1`.
+
 # investMITRA — Signal Engine Feature Reference
 
 Updated: 2 October 2026. Sector admission, NSE volume baseline and trade-path research revision.
