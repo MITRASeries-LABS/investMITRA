@@ -52,6 +52,13 @@ def run_session_reports(execution):
         from shadow_validation_report import summarise
         summarise(observer.path, day, day)
         result["shadow"] = "ok"
+        try:
+            from signal_decision_report import summarise as decision_summary
+            decision_summary(observer.path, day)
+            from strategy_gate_study import summarise as gate_study
+            gate_study(observer.path, day, day)
+        except Exception as exc:
+            LOG.warning("Decision coverage report unavailable (%s)", type(exc).__name__)
     except Exception as exc:
         result["shadow"] = "failed"
         LOG.error("Automatic shadow report unavailable (%s); research database retained. "

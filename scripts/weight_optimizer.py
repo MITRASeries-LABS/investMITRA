@@ -386,20 +386,11 @@ def save_new_weights(opus_result: dict, stats: dict):
             suggestions = opus_result.get("key_findings", [])
             notes = opus_result.get("notes", "")
             notify(
-                f"OPUS WEEKLY SUGGESTIONS (not auto-applied)
-"
-                f"Trades: {stats['total']} (need 20+ to auto-apply)
-
-"
-                f"Findings:
-" + "
-".join([f"- {f}" for f in suggestions[:5]]) +
-                f"
-
-Notes: {notes[:200]}
-
-"
-                f"Review manually and apply if agree."
+                "OPUS WEEKLY SUGGESTIONS (not auto-applied)\n"
+                f"Trades: {stats['total']} (need 20+ to auto-apply)\n\n"
+                "Findings:\n" + "\n".join(f"- {finding}" for finding in suggestions[:5]) +
+                f"\n\nNotes: {notes[:200]}\n\n"
+                "Review manually and apply if agree."
             )
         except: pass
         print(f"  Only {stats['total']} trades ? suggestions sent to Telegram, NOT auto-applied")

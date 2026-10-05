@@ -296,6 +296,8 @@ class ExecutionTests(unittest.TestCase):
         self.enter();self.manager.state['trades']={};self.manager.step();self.assertFalse(self.manager.snapshot()['ready'])
     def _make_signal_engine(self):
         from signal_evidence import volume_evidence
+        from signal_recovery import opening_candles, breadth_evidence
+        from signal_diagnostics import reason_code, session_policy, decision_record, direction_for
         from collections import defaultdict
         from signal_runtime import index_quote_context, relative_strength_context, opening_range_context, SECTOR_REFRESH_SECONDS
         import logging, threading, math
@@ -303,8 +305,9 @@ class ExecutionTests(unittest.TestCase):
         tree=ast.parse((Path(__file__).parent / 'scripts' / 'intraday_signals.py').read_text(encoding='utf-8'))
         ns=dict(datetime=datetime,date=date,IST=IST,defaultdict=defaultdict,threading=threading,math=math,BUILD_ID="test",logger=logging.getLogger('integration'),
                 EXECUTION_MODE='auto_paper',PAPER_TRADING=True, entry_policy_rejection=entry_policy_rejection, MIN_SIGNAL_GAP_PCT=MIN_SIGNAL_GAP_PCT, MIN_FINAL_SCORE=MIN_FINAL_SCORE)
-        ns.update(volume_evidence=volume_evidence, index_quote_context=index_quote_context, relative_strength_context=relative_strength_context,
+        ns.update(direction_for=direction_for, opening_candles=opening_candles, breadth_evidence=breadth_evidence, reason_code=reason_code, session_policy=session_policy, decision_record=decision_record, volume_evidence=volume_evidence, index_quote_context=index_quote_context, relative_strength_context=relative_strength_context,
                   opening_range_context=opening_range_context, SECTOR_REFRESH_SECONDS=SECTOR_REFRESH_SECONDS)
+        ns['get_nse_market_breadth'] = lambda: {}
         # Import only literals, arithmetic assignments and the actual pure
         # classes/functions; exclude all production imports and startup calls.
         for node in tree.body:
@@ -395,7 +398,7 @@ class ExecutionTests(unittest.TestCase):
     def test_engine_candidate_routed_before_paper_mutation(self):
         tree=ast.parse((Path(__file__).parent / 'scripts' / 'intraday_signals.py').read_text(encoding='utf-8'))
         cls=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='IntradayEngine')
-        method=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='_check_signal')
+        method=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='_evaluate_signal')
         src=ast.unparse(method)
         self.assertLess(src.index('self.execution.offer(candidate)'),src.index('self.risk.open_position('))
     def test_unprotected_partial_entry_blocks_other_candidates(self):

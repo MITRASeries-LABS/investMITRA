@@ -95,7 +95,7 @@ def summarise(path, start, end):
                       f"sequential sample drawdown {ref['sample_drawdown']:.2f} -> {kept['sample_drawdown']:.2f}")
         print("  Drawdown is of hypothetical candidate outcomes in exit-time order, NOT portfolio drawdown.")
     print("\nExploratory evidence only. Samples overlap and share market days; do not infer significance from trade count alone.")
-    print("Unknown inputs/outcomes are excluded, not counted as losses. Breadth is startup-only and is NOT tested as fresh entry breadth.")
+    print("Unknown inputs/outcomes are excluded, not counted as losses. Breadth provenance is recorded per observation; this report does not test a breadth policy.")
     print("Keep parameters fixed during forward observation; validate promising filters on a later untouched period.")
 
 

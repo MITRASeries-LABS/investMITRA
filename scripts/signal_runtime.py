@@ -174,4 +174,4 @@ def opening_range_context(high, low, is_set, span, price, sign):
             "opening_range_complete": complete, "opening_breakout": breakout,
             "opening_range_high": high if valid else None,
             "opening_range_low": low if valid else None,
-            "opening_range_source": "observed_ticks"}
+            "opening_range_source": (span or {}).get("source", "observed_ticks")}

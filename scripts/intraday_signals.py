@@ -25,6 +25,9 @@ from signal_runtime import (RateLimitedKite, load_nse_holidays, previous_session
                             index_quote_context, relative_strength_context, opening_range_context,
                             SECTOR_REFRESH_SECONDS)
 from signal_evidence import load_volume_baselines, volume_evidence, SECTOR_POLICY_DEFAULTS
+from signal_recovery import opening_candles, breadth_evidence
+from signal_diagnostics import reason_code, session_policy, decision_record, direction_for
+from market_data_contract import canonical_stock, coverage, VERSION as PRICE_CONTRACT_VERSION
 import psycopg2
 from dotenv import load_dotenv
 load_dotenv('.env.prod')
@@ -174,7 +177,7 @@ def load_signal_weights() -> dict:
         cur  = conn.cursor()
         cur.execute("""
             SELECT weights FROM investmitra.signal_weights
-            WHERE effective_date <= CURRENT_DATE
+            WHERE effective_date <= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
             ORDER BY effective_date DESC LIMIT 1
         """)
         row = cur.fetchone()
@@ -274,13 +277,20 @@ def get_nse_market_breadth() -> dict:
         nse.get("https://www.nseindia.com", timeout=10)
         r = nse.get("https://www.nseindia.com/api/allIndices", timeout=10)
         if r.status_code != 200: return {}
+        payload = r.json()
+        stamp = payload.get('timestamp')
+        try:
+            stamp = datetime.strptime(stamp, '%d-%b-%Y %H:%M:%S').replace(tzinfo=IST).isoformat()
+        except (ValueError, TypeError):
+            stamp = None
         breadth = {}
-        for idx in r.json().get("data", []):
+        for idx in payload.get("data", []):
             name = idx.get("index", "")
             if name in ("NIFTY 50", "NIFTY BANK", "NIFTY MIDCAP SELECT", "INDIA VIX"):
                 breadth[name] = {
                     "last":       float(idx.get("last", 0)),
                     "pct_change": float(idx.get("percentChange", 0)),
+                    "quote_at": stamp,
                     "advances":   int(idx.get("advances", 0)),
                     "declines":   int(idx.get("declines", 0)),
                 }
@@ -303,8 +313,9 @@ def get_key_levels(symbols: list[str]) -> dict[str, dict]:
                 FROM investmitra.equity_prices ep
                 JOIN investmitra.company_master cm ON ep.isin = cm.isin
                 WHERE cm.nse_symbol = ANY(%s)
-                  AND ep.trade_date >= CURRENT_DATE - INTERVAL '500 days'
-                  AND ep.trade_date < CURRENT_DATE  -- exclude today's incomplete session
+                  AND ep.source = 'NSE'
+                  AND ep.trade_date >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date - INTERVAL '500 days'
+                  AND ep.trade_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date  -- exclude today's incomplete session
             ),
             tr_calc AS (
                 -- Step 2: true range using prev close
@@ -325,8 +336,8 @@ def get_key_levels(symbols: list[str]) -> dict[str, dict]:
                            ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS ma20,
                        AVG(close) OVER (PARTITION BY isin ORDER BY trade_date
                            ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS ma50,
-                       AVG(tr) OVER (PARTITION BY isin ORDER BY trade_date
-                           ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS atr14,
+                       CASE WHEN COUNT(prev_close) OVER (PARTITION BY isin ORDER BY trade_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW)=14 THEN AVG(tr) OVER (PARTITION BY isin ORDER BY trade_date
+                           ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) END AS atr14,
                        MAX(high) OVER (PARTITION BY isin ORDER BY trade_date
                            ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS high_52w,  -- needs 252 sessions
                        MIN(low) OVER (PARTITION BY isin ORDER BY trade_date
@@ -337,7 +348,9 @@ def get_key_levels(symbols: list[str]) -> dict[str, dict]:
             )
             SELECT nse_symbol, open, high, low, close, ma20, ma50,
                    atr14, daily_range, high_52w, low_52w, prev_day_chg_pct
-            FROM recent WHERE rn = 1
+            FROM recent WHERE rn = 1 AND trade_date = (
+                SELECT MAX(trade_date) FROM investmitra.equity_prices
+                WHERE source='NSE' AND trade_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date)
         """, (symbols,))
         result = {}
         for r in cur.fetchall():
@@ -395,17 +408,17 @@ def get_premarket_context() -> dict:
     try:
         conn = psycopg2.connect(NEON_URL, connect_timeout=10)
         cur  = conn.cursor()
-        cur.execute("SELECT last_price FROM investmitra.market_indices WHERE index_name='INDIA VIX' AND fetch_date=CURRENT_DATE ORDER BY fetched_at DESC LIMIT 1")
+        cur.execute("SELECT last_price FROM investmitra.market_indices WHERE index_name='INDIA VIX' AND fetch_date=(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date ORDER BY fetched_at DESC LIMIT 1")
         r = cur.fetchone()
         if r: ctx["india_vix"] = float(r[0])
 
-        cur.execute("SELECT change_str FROM investmitra.global_indices WHERE index_name ILIKE '%SGX%NIFTY%' AND fetch_date=CURRENT_DATE ORDER BY fetched_at DESC LIMIT 1")
+        cur.execute("SELECT change_str FROM investmitra.global_indices WHERE index_name ILIKE '%SGX%NIFTY%' AND fetch_date=(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date ORDER BY fetched_at DESC LIMIT 1")
         r = cur.fetchone()
         if r:
             try: ctx["sgx_change"] = float(str(r[0]).replace('+','').replace('%',''))
             except: pass
 
-        cur.execute("SELECT change_str FROM investmitra.global_indices WHERE index_name ILIKE '%DOW JONES%' AND fetch_date=CURRENT_DATE ORDER BY fetched_at DESC LIMIT 1")
+        cur.execute("SELECT change_str FROM investmitra.global_indices WHERE index_name ILIKE '%DOW JONES%' AND fetch_date=(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date ORDER BY fetched_at DESC LIMIT 1")
         r = cur.fetchone()
         if r:
             try:
@@ -414,10 +427,10 @@ def get_premarket_context() -> dict:
             except: pass
 
         # Results today AND next 3 days
-        cur.execute("SELECT UPPER(symbol) FROM investmitra.corporate_events WHERE event_date=CURRENT_DATE AND category='RESULTS'")
+        cur.execute("SELECT UPPER(symbol) FROM investmitra.corporate_events WHERE event_date=(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date AND category='RESULTS'")
         ctx["results_today"] = {r[0] for r in cur.fetchall()}
 
-        cur.execute("SELECT UPPER(symbol) FROM investmitra.corporate_events WHERE event_date BETWEEN CURRENT_DATE AND CURRENT_DATE+INTERVAL '3 days' AND category='RESULTS'")
+        cur.execute("SELECT UPPER(symbol) FROM investmitra.corporate_events WHERE event_date BETWEEN (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date AND (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date+INTERVAL '3 days' AND category='RESULTS'")
         ctx["results_3days"] = {r[0] for r in cur.fetchall()}
 
         cur.execute("SELECT symbol, ann_type FROM investmitra.nse_announcements WHERE ann_datetime>=NOW()-INTERVAL '12 hours' AND is_important=TRUE ORDER BY ann_datetime DESC LIMIT 10")
@@ -574,76 +587,13 @@ def get_dynamic_gappers(kite, existing_symbols: set, ctx: dict) -> list[dict]:
     Adds any gapping stock not already in watchlist.
     """
     try:
-        conn = psycopg2.connect(NEON_URL, connect_timeout=15)
-        cur  = conn.cursor()
-
-        # Get NSE real-time gainers/losers
+        catalog = get_signal_catalog(ctx)
         nse_gainers, nse_losers = get_nse_gainers_losers()
-        nse_universe = list(set(nse_gainers + nse_losers))
-        logger.info("NSE universe: %d stocks (gainers+losers)", len(nse_universe))
-
-        cur.execute("""
-            SELECT cm.nse_symbol, cm.market_cap_category,
-                   ds.investmitra_score, ds.sector,
-                   ep.close AS prev_close,
-                   AVG(ep.volume) OVER (PARTITION BY ep.isin) AS avg_vol,
-                   AVG(ep.close * ep.volume) OVER (PARTITION BY ep.isin) AS avg_traded
-            FROM investmitra.equity_prices ep
-            JOIN investmitra.company_master cm ON ep.isin = cm.isin
-            LEFT JOIN investmitra.daily_scores ds ON ep.isin = ds.isin
-                AND ds.score_date = (SELECT MAX(score_date) FROM investmitra.daily_scores WHERE score_date < CURRENT_DATE)
-            WHERE ep.trade_date = (SELECT MAX(trade_date) FROM investmitra.equity_prices WHERE trade_date < CURRENT_DATE)
-              AND cm.nse_symbol IS NOT NULL
-              AND ep.close BETWEEN 50 AND 20000
-              AND ep.close * ep.volume >= 2000000
-            ORDER BY ep.close * ep.volume DESC
-            LIMIT 200
-        """)
-        top200 = [row[0] for row in cur.fetchall() if row[0]]
-
-        # Combine: NSE real-time gainers/losers + top 200 by value
-        all_candidates = list(set(nse_universe + top200))
-        logger.info("Combined universe: %d stocks", len(all_candidates))
-
-        # Re-fetch with combined list
-        cur.execute("""
-            SELECT cm.nse_symbol, cm.market_cap_category,
-                   ds.investmitra_score, ds.sector,
-                   ep.close AS prev_close,
-                   AVG(ep.volume) OVER (PARTITION BY ep.isin) AS avg_vol,
-                   AVG(ep.close * ep.volume) OVER (PARTITION BY ep.isin) AS avg_traded
-            FROM investmitra.equity_prices ep
-            JOIN investmitra.company_master cm ON ep.isin = cm.isin
-            LEFT JOIN investmitra.daily_scores ds ON ep.isin = ds.isin
-                AND ds.score_date = (SELECT MAX(score_date) FROM investmitra.daily_scores WHERE score_date < CURRENT_DATE)
-            WHERE ep.trade_date = (SELECT MAX(trade_date) FROM investmitra.equity_prices WHERE trade_date < CURRENT_DATE)
-              AND cm.nse_symbol IS NOT NULL
-              AND ep.close BETWEEN 50 AND 20000
-        """)
-        rows = cur.fetchall()
-        cur.close(); conn.close()
-
-        candidates = []
-        for row in rows:
-            sym = row[0]
-            if sym in existing_symbols or not sym or sym not in all_candidates: continue
-            if row[2] is None: continue  # never invent a score for a fresh mover
-            candidates.append({
-                'symbol':              sym,
-                'market_cap_category': row[1] or 'MID',
-                'investmitra_score':   float(row[2] or 50),
-                'sector':              row[3] or '',
-                'prev_close':          float(row[4] or 0),
-                'avg_vol':             float(row[5] or 0),
-                'avg_traded':          float(row[6] or 0),
-                'quality_score':       float(row[2] or 50),
-                'screen_count':        0,
-                'piotroski_score':     0,
-                'bulk_deal':           False,
-                'prev_day_chg':        0,
-                'company_name':        sym,
-            })
-
+        top200 = sorted(catalog, key=lambda c: c['avg_traded'], reverse=True)[:200]
+        universe = set(nse_gainers + nse_losers + [c['symbol'] for c in top200])
+        candidates = [dict(c) for c in catalog
+                      if c['symbol'] in universe and c['symbol'] not in existing_symbols]
+        logger.info("Combined universe: %d canonical stocks", len(universe))
         if not candidates:
             return []
 
@@ -665,7 +615,7 @@ def get_dynamic_gappers(kite, existing_symbols: set, ctx: dict) -> list[dict]:
                 q      = quotes.get(f"NSE:{sym}", {})
                 ohlc   = q.get("ohlc", {})
                 open_p = float(ohlc.get("open", 0))
-                prev   = float(ohlc.get("close", 0)) or c['prev_close']
+                prev   = float(ohlc.get("close", 0)) or c.get('prev_close', 0)
                 ltp    = float(q.get("last_price", 0))
                 vol    = int(q.get("volume", 0))
                 if not open_p or not prev or not ltp: continue
@@ -729,7 +679,7 @@ def load_signal_thresholds() -> dict:
             SELECT tier1_score_min, tier1_gap_min, tier1_rvol_min,
                    tier2_gap_min, tier2_rvol_min, tier2_traded_min
             FROM investmitra.signal_thresholds
-            WHERE effective_date <= CURRENT_DATE
+            WHERE effective_date <= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
             ORDER BY effective_date DESC LIMIT 1
         """)
         row = cur.fetchone()
@@ -748,17 +698,13 @@ def load_signal_thresholds() -> dict:
 
 
 
-def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
+def get_signal_catalog(ctx: dict) -> list[dict]:
     """
     Universe: MID/LARGE/SMALL/MICRO
     Filter by TRADED VALUE (not just volume) — catches high-price stocks
     Exclude: results next 3 days, sensitive announcements,
              stocks up/down >5% yesterday
     """
-    # Load thresholds once
-    _thresh = load_signal_thresholds()
-    long_thresh  = int(_thresh.get('tier1_score_min', 55))
-
     conn = psycopg2.connect(NEON_URL, connect_timeout=15)
     cur  = conn.cursor()
     cur.execute("SELECT UPPER(symbol) FROM investmitra.nse_announcements WHERE ann_datetime>=NOW()-INTERVAL '12 hours' AND is_sensitive=TRUE")
@@ -769,26 +715,27 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
             SELECT isin,
                    AVG(volume) AS avg_vol,
                    AVG(close) AS avg_price,
-                   AVG(volume)*AVG(close) AS avg_traded_value,
+                   AVG(volume * close) AS avg_traded_value,
                    -- Yesterday's change %
                    (MAX(CASE WHEN trade_date=(
                         SELECT trade_date FROM investmitra.equity_prices
-                        WHERE trade_date < CURRENT_DATE GROUP BY trade_date
+                        WHERE source='NSE' AND trade_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date GROUP BY trade_date
                         ORDER BY trade_date DESC LIMIT 1) THEN close END)
                     - MAX(CASE WHEN trade_date=(
                         SELECT trade_date FROM investmitra.equity_prices
-                        WHERE trade_date < CURRENT_DATE GROUP BY trade_date
+                        WHERE source='NSE' AND trade_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date GROUP BY trade_date
                         ORDER BY trade_date DESC LIMIT 1 OFFSET 1) THEN close END))
                    / NULLIF(MAX(CASE WHEN trade_date=(
                         SELECT trade_date FROM investmitra.equity_prices
-                        WHERE trade_date < CURRENT_DATE GROUP BY trade_date
+                        WHERE source='NSE' AND trade_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date GROUP BY trade_date
                         ORDER BY trade_date DESC LIMIT 1 OFFSET 1) THEN close END), 0) * 100
                    AS prev_day_chg
             FROM investmitra.equity_prices
-            WHERE trade_date>=CURRENT_DATE-INTERVAL '30 days'
+            WHERE source='NSE' AND trade_date<(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
+              AND trade_date>=(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date-INTERVAL '30 days'
             GROUP BY isin
             HAVING AVG(close) BETWEEN 50 AND 20000
-               AND AVG(volume)*AVG(close) >= 2000000
+               AND AVG(volume * close) >= 2000000
         )
         SELECT ds.isin, ds.company_name, cm.nse_symbol, ds.sector,
                cm.market_cap_category, ds.investmitra_score, ds.signal,
@@ -806,20 +753,20 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
                    WHERE signal_date=(SELECT MAX(signal_date) FROM investmitra.screener_signals)
                    GROUP BY isin) ss ON ds.isin=ss.isin
         LEFT JOIN investmitra.value_quality vq ON ds.isin=vq.isin
-        WHERE ds.score_date=(SELECT MAX(score_date) FROM investmitra.daily_scores WHERE score_date < CURRENT_DATE)
+        WHERE ds.score_date=(SELECT MAX(score_date) FROM investmitra.daily_scores WHERE score_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date)
+          AND ds.price_contract_version = %s
           AND cm.nse_symbol IS NOT NULL
                     AND cm.market_cap_category IN ('MID','LARGE','SMALL','MICRO')
           -- All cap categories included
           -- F&O check only applied to SHORT signals (in _check_signal)
         ORDER BY ds.investmitra_score DESC
-    """)
+    """, (PRICE_CONTRACT_VERSION,))
     rows = cur.fetchall()
     cur.close(); conn.close()
 
     preopen    = ctx.get("preopen_prices", {})
     bulk_deals = ctx.get("bulk_deals", set())
-    long_list  = []
-    short_list = []
+    catalog = []
 
     for r in rows:
         symbol     = r[2]
@@ -842,15 +789,13 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
         if avg_traded < 5_000_000:  # Min ₹50L = ₹5M
             continue
 
-        inv   = float(r[5] or 0)
+        if r[5] is None:
+            logger.warning("Catalog excludes %s: missing daily score", symbol)
+            continue
+        inv   = float(r[5])
         sc    = int(r[10] or 0)
         piots = int(r[11] or 0)
         grah  = int(r[12] or 0)
-
-        quality = (
-            (inv/100)*0.50 + min(sc/20,1.0)*0.20 +
-            (piots/9)*0.15 + (grah/4)*0.15
-        ) * 100
 
         po_price    = preopen.get(symbol, 0)
         avg_price   = float(r[9] or 0)
@@ -865,92 +810,31 @@ def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
             "avg_volume": int(r[8] or 0), "avg_price": avg_price,
             "avg_traded": avg_traded,
             "screen_count": sc, "piotroski": piots, "graham": grah,
-            "quality_score": round(quality, 2),
             "preopen_gap": preopen_gap,
             "prev_day_chg": prev_chg,
             "in_bulk_deal": in_bulk,
         }
 
-        cap = stock.get("market_cap_category", "MID")
-        # Same threshold for all caps - 55 minimum
-        long_thresh  = 55
-        short_thresh = 40
-        if inv >= long_thresh:
-            stock['tier'] = 1
-            long_list.append(stock)
-        elif inv <= short_thresh:
-            short_list.append(stock)
-        elif inv >= 50:
-            short_list.append({**stock, "bearish_candidate": True})
+        try:
+            catalog.append(canonical_stock(stock))
+        except (ValueError, TypeError, KeyError):
+            logger.warning("Catalog excludes %s: invalid quality/cap inputs", symbol)
+    # A duplicate symbol means metadata joins are ambiguous. Never pick an arbitrary row.
+    counts = defaultdict(int)
+    for stock in catalog: counts[stock['symbol']] += 1
+    ambiguous = sorted(sym for sym, count in counts.items() if count > 1)
+    if ambiguous: logger.warning("Catalog excludes ambiguous symbol joins: %s", ', '.join(ambiguous))
+    return [stock for stock in catalog if counts[stock['symbol']] == 1]
 
-    # Tier 2: Add momentum stocks (high gap + high RVOL, any score)
-    try:
-        thresholds = load_signal_thresholds()
-        t2_gap   = thresholds.get('tier2_gap_min', 1.0)
-        t2_rvol  = thresholds.get('tier2_rvol_min', 3.0)
-        t2_trade = thresholds.get('tier2_traded_min', 5000000)
 
-        cur2 = conn2 = None
-        conn2 = psycopg2.connect(NEON_URL, connect_timeout=10)
-        cur2  = conn2.cursor()
-
-        # Get all liquid stocks not already in watchlist
-        existing_syms = {s['symbol'] for s in long_list + short_list}
-        cur2.execute("""
-            SELECT cm.nse_symbol, cm.market_cap_category,
-                   COALESCE(ds.investmitra_score, 45) as score,
-                   ds.sector, ep.close,
-                   AVG(ep.volume) as avg_vol,
-                   AVG(ep.volume * ep.close) as avg_traded
-            FROM investmitra.equity_prices ep
-            JOIN investmitra.company_master cm ON ep.isin = cm.isin
-            LEFT JOIN investmitra.daily_scores ds ON ep.isin = ds.isin
-                AND ds.score_date = (SELECT MAX(score_date) FROM investmitra.daily_scores WHERE score_date < CURRENT_DATE)
-            WHERE ep.trade_date = (SELECT MAX(trade_date) FROM investmitra.equity_prices WHERE trade_date < CURRENT_DATE)
-              AND ep.close BETWEEN 50 AND 20000
-              AND ep.volume * ep.close >= %s
-              AND cm.nse_symbol IS NOT NULL
-            GROUP BY cm.nse_symbol, cm.market_cap_category, ds.investmitra_score, ds.sector, ep.close
-            HAVING AVG(ep.volume * ep.close) >= %s
-            ORDER BY AVG(ep.volume * ep.close) DESC
-            LIMIT 500
-        """, (t2_trade, t2_trade))
-
-        t2_rows = cur2.fetchall()
-        cur2.close(); conn2.close()
-
-        t2_added = 0
-        for row in t2_rows:
-            sym = row[0]
-            if sym in existing_syms: continue
-            if sym in ctx.get('results_today', set()): continue
-            stock = {
-                'symbol':              sym,
-                'market_cap_category': row[1] or 'MID',
-                'investmitra_score':   float(row[2] or 45),
-                'quality_score':       float(row[2] or 45),
-                'sector':              row[3] or '',
-                'avg_price':           float(row[4] or 0),
-                'avg_vol':             float(row[5] or 0),
-                'avg_traded':          float(row[6] or 0),
-                'screen_count':        0,
-                'piotroski_score':     0,
-                'bulk_deal':           False,
-                'prev_day_chg':        0,
-                'company_name':        sym,
-                'tier':                2,  # Mark as Tier 2
-            }
-            long_list.append(stock)
-            existing_syms.add(sym)
-            t2_added += 1
-
-        logger.info("Tier 2 added %d momentum stocks (gap>%.1f%% rvol>%.1fx)", t2_added, t2_gap, t2_rvol)
-    except Exception as e:
-        logger.warning("Tier 2 load failed: %s", e)
-
-    long_list  = sorted(long_list,  key=lambda x: x["quality_score"], reverse=True)[:100]
-    short_list = sorted(short_list, key=lambda x: x["investmitra_score"])[:10]
-    return long_list, short_list
+def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
+    catalog = get_signal_catalog(ctx)
+    long_list = [dict(s, tier=1 if s['investmitra_score'] >= 55 else 2)
+                 for s in catalog if s['investmitra_score'] > 40]
+    short_list = [s for s in catalog if s['investmitra_score'] <= 40]
+    logger.info("Canonical catalog: %d liquid stocks; gap/RVOL admission remains pending", len(catalog))
+    return (sorted(long_list, key=lambda s: (-s['quality_score'], s['symbol']))[:100],
+            sorted(short_list, key=lambda s: (s['investmitra_score'], s['symbol']))[:10])
 
 
 def classify_gap(gap_pct, volume, avg_volume) -> tuple[str, float]:
@@ -967,7 +851,6 @@ def classify_gap(gap_pct, volume, avg_volume) -> tuple[str, float]:
     elif abs_gap > 0.5:                            return "fade_risk", 0.5
     elif abs_gap > 0.3:                            return "fade_risk", 0.3
     else:                                          return "small_gap", 0.2
-
 
 class DailyRiskManager:
     def __init__(self):
@@ -1089,6 +972,8 @@ class IntradayEngine:
         self.key_levels       = key_levels
         self.sector_quotes    = sector_quotes
         self._last_sector_refresh = None
+        self._opening_retry = {}
+        self.market_context = dict(status="startup_snapshot", source="startup")
         self.sentiment        = sentiment
         self.breadth          = ctx.get("breadth", {})
 
@@ -1276,9 +1161,8 @@ class IntradayEngine:
                     if not token or symbol not in levels or not self.rvol_baseline.get(symbol):
                         continue
                     self.all_stocks[symbol] = stock
-                    if self.market_direction == "BEARISH":
-                        self.short_map[symbol] = dict(stock, direction_override="SHORT")
-                        self.all_stocks[symbol] = self.short_map[symbol]
+                    if stock['investmitra_score'] <= 40:
+                        self.short_map[symbol] = stock
                     else:
                         self.long_map[symbol] = stock
                     self.token_map[symbol] = token
@@ -1378,10 +1262,50 @@ class IntradayEngine:
         except Exception:
             quotes = {}
             logger.warning("Sector context refresh failed; relative-strength points unavailable", exc_info=True)
+        breadth = get_nse_market_breadth()
+        context = index_quote_context(quotes.get('NSE:NIFTY 50'), datetime.now(IST))
         with self._state_lock:
+            self.breadth = breadth
+            self.market_context = dict(context, source='NSE:NIFTY 50', global_source='startup_snapshot')
+            if context['status'] == 'fresh':
+                change = context['change_pct']
+                global_dir = self.ctx.get('global_signal', 'NEUTRAL')
+                self.market_direction = ('BULLISH' if change > .3 and global_dir != 'BEARISH' else
+                                         'BEARISH' if change < -.3 and global_dir != 'BULLISH' else 'NEUTRAL')
             self.sector_quotes = quotes  # replace, never retain omitted/stale fields
         fresh = sum(index_quote_context(q, datetime.now(IST))["status"] == "fresh" for q in quotes.values())
         logger.info("Sector context refreshed: %d/%d fresh index quotes", fresh, len(quotes))
+
+    def _recover_opening_range(self):
+        now = datetime.now(IST)
+        if not 570 <= now.hour*60+now.minute < 900: return
+        with self._state_lock:
+            pending = []
+            for symbol in self.all_stocks:
+                span = self._shadow_opening.get(symbol)
+                complete = opening_range_context(self.or_high.get(symbol), self.or_low.get(symbol),
+                    self.or_set.get(symbol), span, self.today_open.get(symbol, 0), 1)['opening_range_complete']
+                last, tries = self._opening_retry.get(symbol, (0, 0))
+                if not complete and tries < 3 and now.timestamp()-last >= 300 and self.token_map.get(symbol):
+                    pending.append(symbol)
+            if not pending: return
+            symbol = pending[0]
+            _, tries = self._opening_retry.get(symbol, (0, 0))
+            self._opening_retry[symbol] = (now.timestamp(), tries+1)
+            token = self.token_map[symbol]
+        try:
+            bars = self.kite.historical_data(token,
+                now.replace(hour=9, minute=15, second=0, microsecond=0),
+                now.replace(hour=9, minute=29, second=0, microsecond=0), 'minute')
+            recovered = opening_candles(bars, now)
+            if recovered:
+                with self._state_lock:
+                    self.or_high[symbol], self.or_low[symbol] = recovered['high'], recovered['low']
+                    self.or_set[symbol] = True
+                    self._shadow_opening[symbol] = recovered['span']
+                logger.info("Opening range recovered: %s (15 completed minute candles)", symbol)
+        except Exception as exc:
+            logger.warning("Opening range unavailable for %s (%s); evidence remains unknown", symbol, type(exc).__name__)
 
     def _maintenance_loop(self):
         """Observe closes without WebSocket ticks and serialize all scheduled scans."""
@@ -1393,6 +1317,7 @@ class IntradayEngine:
             try:
                 self._poll_closed_trades()
                 self._refresh_sector_context()
+                self._recover_opening_range()
                 now = datetime.now(IST)
                 reason = self._scan_reason(now, done, last_scan, time.monotonic())
                 if reason:
@@ -1483,7 +1408,7 @@ class IntradayEngine:
                      true_gap_pct,gap_type,rvol,sector_rs,final_score,
                      market_direction,vix_level,session,atr,capital_deployed,
                      trade_id,trade_status,is_paper,strategy_version)
-                VALUES (CURRENT_DATE,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'CLOSED',%s,'v28')
+                VALUES ((CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'CLOSED',%s,'v28')
                 ON CONFLICT (trade_id) WHERE trade_id IS NOT NULL
                 DO UPDATE SET exit_price=EXCLUDED.exit_price,
                     gross_pnl=EXCLUDED.gross_pnl,net_pnl=EXCLUDED.net_pnl,
@@ -1745,11 +1670,8 @@ class IntradayEngine:
         if sign < 0 and low_52w and ltp <= low_52w * 1.01:
             kl_score += 15
 
-        # Breadth
-        adv = nifty_data.get("advances", 0); dec = nifty_data.get("declines", 0)
-        favourable, opposing = (adv, dec) if sign > 0 else (dec, adv)
-        ad_ratio = favourable / max(opposing, 1) if favourable + opposing else 1.0
-        breadth_score = min(ad_ratio / 3.0 * 100, 100) if ad_ratio > 1 else 30
+        breadth_context = breadth_evidence(self.breadth, now, sign)
+        breadth_score = breadth_context['breadth']
 
         # Preserve missing/partial opening-range provenance instead of calling it no breakout.
         orb_context = opening_range_context(or_h, or_l, self.or_set.get(symbol),
@@ -1798,6 +1720,13 @@ class IntradayEngine:
         ) * sess_mult
 
         details = {
+            **breadth_context,
+            "market_context": dict(self.market_context),
+            "opportunity_before_session": opp / sess_mult if sess_mult else None,
+            "session_multiplier": sess_mult, "session": session,
+            "effective_weights": dict(_w), "quality_version": stock.get('quality_version', 'unversioned'),
+            "quality_inputs": {k: stock.get(k) for k in ('investmitra_score','screen_count','piotroski','graham')},
+            "sector_mapping_basis": "broad_sector_proxy_not_verified_index_membership",
             **volume_context,
             "gap_type": gap_type, "gap_score": round(gap_score,1),
             "rvol": round(rvol,2), "rvol_score": round(rvol_score,1),
@@ -1808,21 +1737,45 @@ class IntradayEngine:
             **sector_context, **orb_context,
             "entry_extension_from_open_pct": (ltp/today_open-1)*100 if today_open > 0 else None,
             "entry_extension_from_open_atr": (ltp-today_open)*sign/kl["atr14"] if kl.get("atr14", 0) > 0 else None,
-            "breadth_source": "startup_snapshot",
+            "breadth_source": breadth_context["breadth_source"],
             "sentiment": round(sent,2), "bulk_deal": stock.get("in_bulk_deal",False),
             "today_open": round(today_open,2), "52w_high": round(high_52w,2),
         }
         return round(opp, 2), details
 
     def _reject_signal(self, symbol, reason, now):
+        self._decision_reason = reason
         if self._shadow_scored is not None:
             self._shadow_scored["reason"] = reason
         previous = self.signal_rejections.get(symbol)
-        if previous is None or previous[0] != reason or (now-previous[1]).total_seconds() >= 60:
+        if previous is None or reason_code(previous[0]) != reason_code(reason) or (now-previous[1]).total_seconds() >= 60:
             logger.info("SIGNAL REJECT %s: %s", symbol, reason)
             self.signal_rejections[symbol] = (reason, now)
 
     def _check_signal(self, symbol, ltp, volume, now, session):
+        actual_session = get_current_session(now)
+        self._diagnostic_gap_threshold = max(MIN_SIGNAL_GAP_PCT, GAP_THRESHOLDS.get(actual_session, .4))
+        if self.vix_signal == 'ELEVATED': self._diagnostic_gap_threshold *= 1.5
+        self._decision_reason = "not admitted before scoring"
+        self._decision_stage = "pre_score"
+        self._decision_sizing = None
+        self._decision_checks = {}
+        try:
+            return self._evaluate_signal(symbol, ltp, volume, now, session)
+        finally:
+            # Sampling affects evidence writes only, never eligibility or re-evaluation.
+            if self.shadow is not None and hasattr(self.shadow, 'decision'):
+                try:
+                    record = decision_record(self, symbol, ltp, volume, now,
+                                             get_current_session(now), self._decision_reason)
+                    self._last_decision = record
+                    self.shadow.decision(record)
+                except Exception:
+                    if not self._shadow_error_logged:
+                        logger.exception("Decision diagnostics unavailable; trading rules unchanged")
+                        self._shadow_error_logged = True
+
+    def _evaluate_signal(self, symbol, ltp, volume, now, session):
         self._shadow_scored = None
         session = get_current_session(now)
         if session not in ("momentum", "choppy", "afternoon"):
@@ -1836,6 +1789,7 @@ class IntradayEngine:
             blockers = [b for b in view.get("entry_blockers", []) if b != "outside entry window"]
             if not view.get("ready") or (view.get("entry_allowed") is False and blockers):
                 reason = "; ".join(blockers) or "reconciliation pending"
+                self._decision_reason = "executor deferred: " + reason
                 previous = getattr(self, "_entry_defer_status", None)
                 if previous is None or previous[0] != reason or (now-previous[1]).total_seconds() >= 60:
                     logger.info("SIGNAL EVALUATION DEFERRED: %s", reason)
@@ -1860,9 +1814,12 @@ class IntradayEngine:
                         "direction": "LONG" if trade["sign"] > 0 else "SHORT"}
                 self.traded_today.add(sym)
             if view.get("remaining", 0) < MIN_TICKET_INR:
+                self._decision_reason = "available capital below minimum ticket"
                 return
-        if symbol in self.signals: return
-        if symbol in self.traded_today: return  # No re-entry same day
+        if symbol in self.signals:
+            self._decision_reason = "existing signal"; return
+        if symbol in self.traded_today:
+            self._decision_reason = "already traded today"; return  # No re-entry same day
         if getattr(self, "_entry_blocked", False):
             logger.debug("Entry blocked for %s — restart recovery pending", symbol)
             return
@@ -1895,6 +1852,7 @@ class IntradayEngine:
         # GAP HOLD CONFIRMATION (5 minutes)
         gap_thresh = max(MIN_SIGNAL_GAP_PCT, GAP_THRESHOLDS.get(session, 0.4))
         if self.vix_signal == "ELEVATED": gap_thresh *= 1.5
+        self._diagnostic_gap_threshold = gap_thresh
 
         if abs(true_gap_pct) >= gap_thresh:
             # Check live price still confirms gap direction
@@ -1915,6 +1873,7 @@ class IntradayEngine:
             # Check if gap has held for 5 minutes
             elapsed_mins = (now - self.gap_first_seen[symbol]).total_seconds() / 60
             if elapsed_mins < GAP_HOLD_MINUTES:
+                self._decision_reason = "continuous gap hold pending"
                 return  # Wait for gap to confirm
 
             # Check gap direction hasn't flipped
@@ -1946,9 +1905,14 @@ class IntradayEngine:
         opp, details = self._compute_opportunity_score(symbol, ltp, volume, true_gap_pct, session)
 
         final = quality * 0.40 + opp * 0.60
-        if self.shadow is not None:
-            self._shadow_scored = dict(gap=true_gap_pct, quality=quality,
-                opportunity=opp, blended=final, details=details)
+        self._shadow_scored = dict(gap=true_gap_pct, quality=quality,
+            opportunity=opp, blended=final, details=details)
+        self._decision_stage = "score_policy"
+        if self.signal_weights.get('require_fresh_market_context'):
+            market = index_quote_context(self.sector_quotes.get('NSE:NIFTY 50'), now)
+            if market['status'] != 'fresh':
+                self._reject_signal(symbol, 'market context missing or stale', now)
+                return
         rejection = entry_policy_rejection(dict(true_gap=true_gap_pct,
             final_score=final, gap_threshold=gap_thresh, details=details,
             direction="SHORT" if true_gap_pct < 0 else "LONG",
@@ -1970,9 +1934,7 @@ class IntradayEngine:
         final = quality * 0.40 + opp * 0.60
         if final < MIN_FINAL_SCORE: return
 
-        direction = None
-
-        min_rvol = 8.0 if session == "choppy" else 5.0
+        min_rvol = session_policy(session, gap_thresh, MIN_PRIORITY_SCORE)["rvol_min"]
 
         volume_context = volume_evidence(self.rvol_baseline, self.rvol_provenance, symbol, volume, now)
         if volume_context["rvol_expected_volume"] is None:
@@ -1983,45 +1945,12 @@ class IntradayEngine:
             self._reject_signal(symbol, f"RVOL below session minimum {min_rvol:.1f}x", now)
             return  # Skip weak volume signals
 
-        # LONG: quality stock gapping up in neutral/bullish market
-        if (symbol in self.long_map and
-                self.market_direction in ("BULLISH","NEUTRAL") and
-                true_gap_pct >= gap_thresh and
-                ltp >= today_open * 0.998 and
-                above_vwap and
-                score >= (55 if stock.get("market_cap_category","MID") in ("MICRO","SMALL") else 60)):
-            direction = "LONG"
+        direction = direction_for(stock, symbol in self.long_map, symbol in self.short_map,
+            self.market_direction, true_gap_pct, gap_thresh, ltp, today_open, vwap,
+            self._is_fo_eligible(symbol))
 
-        # SHORT Option 1: dedicated short stock (low quality) gapping down
-        elif (symbol in self.short_map and
-                stock.get("direction_override") != "SHORT" and  # not a quality short
-                self.market_direction in ("BEARISH","NEUTRAL") and
-                true_gap_pct <= -gap_thresh and
-                ltp <= today_open * 1.002 and
-                below_vwap and score <= 40):
-            direction = "SHORT"
-
-        # SHORT Option 2: QUALITY stock with direction_override="SHORT" (bearish day routing)
-        # These are quality stocks moved to short list by main() on bearish days
-        elif (symbol in self.short_map and
-                stock.get("direction_override") == "SHORT" and
-                true_gap_pct <= -gap_thresh and
-                ltp <= today_open * 1.002 and
-                below_vwap and score >= 55 and
-                self._is_fo_eligible(symbol)):
-            direction = "SHORT"
-            logger.debug("Quality SHORT candidate: %s gap %.2f%% (bearish day F&O)", symbol, true_gap_pct)
-
-        # SHORT Option 3: quality F&O stock gapping down on a neutral/bearish day
-        elif (symbol in self.long_map and
-                self.market_direction in ("BEARISH", "NEUTRAL") and
-                true_gap_pct <= -gap_thresh and
-                ltp <= today_open * 1.002 and
-                below_vwap and score >= 65 and
-                self._is_fo_eligible(symbol)):
-            direction = "SHORT"
-            logger.debug("Bearish SHORT candidate: %s gap %.2f%% (F&O eligible)", symbol, true_gap_pct)
-
+        self._decision_stage = "direction_vwap"
+        self._decision_checks["direction_vwap"] = bool(direction)
         if not direction:
             self._reject_signal(symbol, "direction/market/score/VWAP conditions not met", now)
             return
@@ -2085,11 +2014,15 @@ class IntradayEngine:
         expected_net = (abs(target - ltp) * size * 0.5) - trade_cost
         # Minimum: expected net must exceed MIN_NET_PROFIT and 2x trade costs
         _min_net = max(MIN_NET_PROFIT, trade_cost * 2)
+        self._decision_stage = "sizing_profit"
+        self._decision_sizing = dict(qty=size, ticket=ticket_value, costs=trade_cost, net_screen=expected_net, required_net=_min_net)
+        self._decision_checks["sizing_profit"] = expected_net >= _min_net
         if expected_net < _min_net:
             self._reject_signal(symbol, "target-profit screen below required net after costs", now)
             return
 
         # Risk check AFTER sizing - includes candidate stop risk and costs
+        self._decision_stage = "portfolio_risk"
         candidate_stop_risk = abs(ltp - stop) * size
         candidate_costs     = estimate_costs(ltp, size, target)
         # Direction-aware open risk (stops that lock profit are not losses)
@@ -2103,6 +2036,7 @@ class IntradayEngine:
                 worst = (p_entry - p_stop) * p_size
             open_risk += min(0, worst)  # only count actual losses, not locked profits
         effective_pnl = self.risk.net_pnl + open_risk - candidate_stop_risk - candidate_costs
+        self._decision_checks["portfolio_risk"] = effective_pnl > -MAX_DAILY_LOSS_INR
         if effective_pnl <= -MAX_DAILY_LOSS_INR:
             self._reject_signal(symbol, "candidate stop risk plus existing risk/costs exceeds daily loss allowance", now)
             return
@@ -2150,7 +2084,7 @@ class IntradayEngine:
             logger.debug("Skip %s — max %d concurrent trades reached",
                          symbol, MAX_CONCURRENT_TRADES)
             return
-        required_priority = max(MIN_PRIORITY_SCORE, 5.0) if session == "choppy" else MIN_PRIORITY_SCORE
+        required_priority = session_policy(session, gap_thresh, MIN_PRIORITY_SCORE)["priority_min"]
         if _priority < required_priority:
             self._reject_signal(symbol, f"priority below {required_priority:.3f}", now)
             return
@@ -2159,7 +2093,9 @@ class IntradayEngine:
             # Worker owns order state, quantities and P&L. Never create a
             # simulated engine position before the broker confirms a fill.
             candidate["offered_at"] = now.timestamp()
+            self._decision_stage = "execution_queue"
             if self.execution.offer(candidate):
+                self._decision_reason = "queued_not_filled"
                 self.execution_offers[symbol] = now.timestamp()
                 if symbol not in self._candidate_logged:
                     logger.info("Execution candidate queued (not accepted/filled): %s (%s) priority=%.2f",
@@ -2317,7 +2253,7 @@ class IntradayEngine:
                          true_gap_pct, gap_type, rvol, sector_rs,
                          final_score, market_direction, vix_level, session, atr,
                          capital_deployed, trade_id, trade_status, is_paper, strategy_version)
-                    VALUES (CURRENT_DATE,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    VALUES ((CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (trade_id) WHERE trade_id IS NOT NULL
                     DO UPDATE SET
                         exit_price=EXCLUDED.exit_price, gross_pnl=EXCLUDED.gross_pnl,
@@ -2369,7 +2305,7 @@ class IntradayEngine:
                 INSERT INTO investmitra.intraday_pnl
                     (trade_date, trades, capital_deployed, gross_pnl, brokerage,
                      net_pnl, win_trades, loss_trades, market_direction, vix_level)
-                VALUES (CURRENT_DATE,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES ((CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (trade_date) DO UPDATE SET
                     trades=EXCLUDED.trades,
                     capital_deployed=EXCLUDED.capital_deployed,
@@ -2556,7 +2492,7 @@ def preflight_check() -> bool:
         import subprocess
         _conn2 = psycopg2.connect(NEON_URL, connect_timeout=5)
         _cur2  = _conn2.cursor()
-        _cur2.execute("SELECT COUNT(*) FROM investmitra.market_indices WHERE fetch_date=CURRENT_DATE")
+        _cur2.execute("SELECT COUNT(*) FROM investmitra.market_indices WHERE fetch_date=(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date")
         count = _cur2.fetchone()[0]
         _cur2.close(); _conn2.close()
         if count == 0:
@@ -2645,6 +2581,7 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
     # Load Opus-updated weights from Neon
     global GAP_THRESHOLDS
     weights = load_signal_weights()
+    weights['require_fresh_market_context'] = True
     if weights:
         GAP_THRESHOLDS["momentum"]  = weights.get("gap_threshold_momentum", 0.3)
         GAP_THRESHOLDS["choppy"]    = weights.get("gap_threshold_choppy", 0.6)
@@ -2689,14 +2626,6 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
     rvol_baseline         = get_rvol_baseline()
     long_list, short_list = get_intraday_watchlist(ctx)
 
-    if market_direction == "BULLISH":
-        short_list = []
-    elif market_direction == "BEARISH":
-        # On bearish day add quality long stocks as short candidates
-        quality_shorts = [dict(s, direction_override="SHORT") for s in long_list if s.get("quality_score",0) >= 60]
-        short_list = quality_shorts + short_list
-        long_list  = []
-
     all_stocks = long_list + short_list
     if not all_stocks:
         logger.error("No stocks in watchlist"); sys.exit(1)
@@ -2709,6 +2638,8 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
     prev_close    = {s.replace("NSE:",""): d["ohlc"]["close"]
                      for s,d in kite.quote([f"NSE:{s}" for s in token_map]).items()}
     key_levels    = get_key_levels(symbols)
+    logger.info("INPUT COVERAGE: %s", json.dumps(coverage({s['symbol']: s for s in all_stocks},
+                key_levels, SECTOR_INDEX_MAP), sort_keys=True))
     try:
         sector_quotes = get_sector_quotes(kite)
     except Exception:

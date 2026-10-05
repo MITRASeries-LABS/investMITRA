@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse, io, logging, os
 from datetime import date, datetime, timedelta, timezone
 import boto3, duckdb, pandas as pd, pyarrow as pa, pyarrow.parquet as pq
+from market_data_contract import canonical_price_ctes, VERSION as PRICE_CONTRACT_VERSION
 from dotenv import load_dotenv
 load_dotenv('.env.prod')
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -52,9 +53,9 @@ def compute_price_features(target_date: date) -> pd.DataFrame:
     logger.info("Computing price features for %s...", target_date)
 
     query = f"""
-    WITH prices AS (
+    WITH raw_prices AS (
         SELECT
-            isin,
+            isin, UPPER(CAST(source AS VARCHAR)) AS source,
             trade_date::DATE     AS trade_date,
             close::DOUBLE        AS close,
             volume::BIGINT       AS volume,
@@ -67,6 +68,8 @@ def compute_price_features(target_date: date) -> pd.DataFrame:
           AND LENGTH(CAST(isin AS VARCHAR)) = 12
           AND close IS NOT NULL AND close > 0
     ),
+
+    {canonical_price_ctes()},
 
     daily_ret AS (
         SELECT isin, trade_date, close, volume, turnover_cr, delivery_pct,
@@ -101,6 +104,7 @@ def compute_price_features(target_date: date) -> pd.DataFrame:
     SELECT
         isin,
         '{target_date}'::DATE AS feature_date,
+        '{PRICE_CONTRACT_VERSION}' AS price_contract_version,
         close AS price,
         ROUND(ret_1d*100,4)   AS ret_1d_pct,
         ROUND(ret_5d*100,4)   AS ret_5d_pct,
@@ -167,9 +171,8 @@ def feature_exists_in_r2(target_date: date) -> bool:
 
 
 def run_for_date(target_date: date) -> dict:
-    if feature_exists_in_r2(target_date):
-        logger.info("  %s already computed — skipping", target_date)
-        return {"date": str(target_date), "status": "skipped"}
+    # A same-date retry can contain corrected raw files. Recompute rather than
+    # accepting a file whose version matches but whose input fingerprint changed.
     df = compute_price_features(target_date)
     if df.empty: return {"date": str(target_date), "isins": 0, "status": "no_data"}
     path = write_features_to_r2(df, target_date)
