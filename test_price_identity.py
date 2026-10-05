@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import MagicMock, Mock, patch
 import duckdb
 import pandas as pd
+import yaml
 from market_data_contract import VERSION, canonical_price_ctes
 from price_identity import identity_map, prepare_price_inputs, load_identity_rows
 from signal_input_readiness import audit, summarise, require_ready
@@ -18,6 +19,23 @@ ROOT=Path(__file__).parent
 DAY=date(2026,10,5)
 A='INE000000001'
 B='INE000000019'
+
+
+class WorkflowConnections(unittest.TestCase):
+    def test_feature_and_coverage_steps_receive_database_connection(self):
+        workflow=yaml.safe_load((ROOT/'.github/workflows/feature_engineering.yml').read_text(encoding='utf-8'))
+        job=workflow['jobs']['compute-features']
+        for name in ('Compute price features', 'Validate classified NSE score coverage'):
+            with self.subTest(step=name):
+                step=next(s for s in job['steps'] if s.get('name')==name)
+                env={**workflow.get('env',{}), **job.get('env',{}), **step.get('env',{})}
+                self.assertEqual(env.get('CC_POSTGRES_URL'), '${{ secrets.CC_POSTGRES_URL }}')
+
+    def test_overnight_caller_passes_secrets_to_feature_workflow(self):
+        workflow=yaml.safe_load((ROOT/'.github/workflows/overnight_readiness.yml').read_text(encoding='utf-8'))
+        scores=workflow['jobs']['scores']
+        self.assertEqual(scores['uses'], './.github/workflows/feature_engineering.yml')
+        self.assertEqual(scores['secrets'], 'inherit')
 
 
 class Identities(unittest.TestCase):
