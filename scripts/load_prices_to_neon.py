@@ -18,6 +18,7 @@ import psycopg2
 from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 from pipeline_date import resolve_trade_date
+from price_identity import identity_map, load_identity_rows
 
 load_dotenv('.env.prod')
 
@@ -54,18 +55,10 @@ def get_symbol_to_isin() -> dict[str, str]:
     global _SYMBOL_TO_ISIN
     if _SYMBOL_TO_ISIN:
         return _SYMBOL_TO_ISIN
-    try:
-        conn = psycopg2.connect(NEON_URL, connect_timeout=15)
-        cur  = conn.cursor()
-        cur.execute(
-            "SELECT nse_symbol, isin FROM investmitra.company_master "
-            "WHERE nse_symbol IS NOT NULL AND isin IS NOT NULL"
-        )
-        _SYMBOL_TO_ISIN = {row[0]: row[1] for row in cur.fetchall()}
-        cur.close(); conn.close()
-        logger.info("Loaded %d symbol->ISIN mappings", len(_SYMBOL_TO_ISIN))
-    except Exception as e:
-        logger.error("Could not load symbol->ISIN map: %s", e)
+    _SYMBOL_TO_ISIN = dict(identity_map(load_identity_rows()))
+    if not _SYMBOL_TO_ISIN:
+        raise RuntimeError('NSE identity mapping unavailable; price load blocked')
+    logger.info("Loaded %d unambiguous symbol->ISIN mappings", len(_SYMBOL_TO_ISIN))
     return _SYMBOL_TO_ISIN
 
 
@@ -114,9 +107,13 @@ def write_to_neon(df: pd.DataFrame, trade_date: date, source_id: str) -> int:
 
     # ISIN enrichment for NSE full file
     if source == "NSE" and "nse_symbol" in df.columns:
-        if "isin" not in df.columns or df["isin"].isna().all():
+        if "isin" not in df.columns:
+            df['isin'] = None
+        missing_isin = df['isin'].isna() | df['isin'].astype(str).str.strip().eq('')
+        if missing_isin.any():
             symbol_map = get_symbol_to_isin()
-            df["isin"] = df["nse_symbol"].map(symbol_map)
+            symbols = df['nse_symbol'].astype(str).str.strip().str.upper()
+            df.loc[missing_isin, 'isin'] = symbols[missing_isin].map(symbol_map)
             matched = df["isin"].notna().sum()
             logger.info("  ISIN enrichment: %d/%d matched", matched, len(df))
 

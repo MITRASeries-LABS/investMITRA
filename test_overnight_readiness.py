@@ -91,7 +91,7 @@ class OvernightReadinessTests(unittest.TestCase):
     def test_database_check_is_readonly_and_requires_each_session(self):
         conn=MagicMock();cur=conn.cursor.return_value.__enter__.return_value
         from market_data_contract import VERSION
-        cur.fetchall.side_effect=[[(DAY,2404)],[('A',VERSION,'Energy','SMALL',True,True,70,'Energy')]];cur.fetchone.side_effect=[(4900,),(250000,)]
+        cur.fetchall.side_effect=[[(DAY,2404)],[('A',VERSION,'Energy','SMALL',True,True,70,'Energy',1)]];cur.fetchone.side_effect=[(4900,),(250000,)]
         fake=SimpleNamespace(connect=Mock(return_value=conn))
         with patch.dict(os.environ,{'CC_POSTGRES_URL':'fake'}),patch.dict(sys.modules,{'psycopg2':fake}):
             counts,missing=readiness.database_counts(DAY,[date(2026,9,22),DAY])

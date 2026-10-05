@@ -543,7 +543,7 @@ class ReviewFixTests(unittest.TestCase):
             (score_date,), (price_date,200000), (1,)]
         from market_data_contract import VERSION
         connection.cursor.return_value.__enter__.return_value.fetchall.return_value=[
-            ('A',VERSION,'Energy','SMALL',True,coverage_complete,70 if coverage_complete else None,'Energy')]
+            ('A',VERSION,'Energy','SMALL',True,coverage_complete,70 if coverage_complete else None,'Energy',1)]
         self.ns.update(API_KEY='test', ACCESS_TOKEN='test', NEON_URL='unused',
                        os=SimpleNamespace(getenv=lambda name:'test'),
                        psycopg2=SimpleNamespace(connect=Mock(side_effect=[index_connection,connection])),

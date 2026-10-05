@@ -756,6 +756,14 @@ def get_signal_catalog(ctx: dict) -> list[dict]:
         WHERE ds.score_date=(SELECT MAX(score_date) FROM investmitra.daily_scores WHERE score_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date)
           AND ds.price_contract_version = %s
           AND cm.nse_symbol IS NOT NULL
+          AND (SELECT COUNT(DISTINCT UPPER(TRIM(other.isin)))
+               FROM investmitra.company_master other
+               WHERE UPPER(TRIM(other.nse_symbol))=UPPER(TRIM(cm.nse_symbol))) = 1
+          AND EXISTS (SELECT 1 FROM investmitra.equity_prices ep
+                      WHERE ep.isin=ds.isin AND ep.source='NSE'
+                        AND ep.trade_date=ds.score_date AND ep.close>0)
+          AND LOWER(TRIM(COALESCE(cm.sector,''))) NOT IN ('','unknown','nan','none')
+          AND LOWER(TRIM(COALESCE(ds.sector,''))) NOT IN ('','unknown','nan','none')
                     AND cm.market_cap_category IN ('MID','LARGE','SMALL','MICRO')
           -- All cap categories included
           -- F&O check only applied to SHORT signals (in _check_signal)
@@ -2525,7 +2533,11 @@ def preflight_check() -> bool:
             cur.execute("SELECT COUNT(*) FROM investmitra.market_indices WHERE fetch_date = %s", (today,))
             indices_today = cur.fetchone()[0]
         from signal_input_readiness import audit, require_ready
-        require_ready(audit(conn, expected))
+        input_coverage = audit(conn, expected)
+        require_ready(input_coverage)
+        if input_coverage['quarantined_ambiguous_symbols']:
+            logger.warning('Identity quarantine: no entries for %s',
+                           input_coverage['quarantined_ambiguous_symbols'])
         errors = freshness_errors(today, expected, score_date, price_date, indices_today, price_rows)
         for error in errors:
             logger.error("Preflight blocked: %s", error)
