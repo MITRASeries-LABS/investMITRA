@@ -1,7 +1,7 @@
 """Versioned daily-price and stock-metadata contracts. No network or DB on import."""
 import math
 
-VERSION = "daily-venue-v1"
+VERSION = "daily-venue-v2"
 QUALITY_VERSION = "quality-four-inputs-v1"
 
 

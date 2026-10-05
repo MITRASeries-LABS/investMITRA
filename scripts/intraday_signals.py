@@ -2524,6 +2524,8 @@ def preflight_check() -> bool:
             price_date, price_rows = cur.fetchone()
             cur.execute("SELECT COUNT(*) FROM investmitra.market_indices WHERE fetch_date = %s", (today,))
             indices_today = cur.fetchone()[0]
+        from signal_input_readiness import audit, require_ready
+        require_ready(audit(conn, expected))
         errors = freshness_errors(today, expected, score_date, price_date, indices_today, price_rows)
         for error in errors:
             logger.error("Preflight blocked: %s", error)
@@ -2688,6 +2690,7 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
     engine.signal_weights = dict(weights)
     engine.strategy_id = BUILD_ID + ":" + hashlib.sha256(json.dumps({
         "weights": weights, "gap_thresholds": GAP_THRESHOLDS,
+        "price_contract": PRICE_CONTRACT_VERSION,
         "capital_model": execution.snapshot().get("capital_model") if execution else None,
         "daily_cap": MAX_DAILY_CAPITAL_INR, "max_ticket": MAX_CAPITAL_PER_TRADE,
         "max_risk": MAX_RISK_PER_TRADE_INR, "min_profit": MIN_NET_PROFIT,

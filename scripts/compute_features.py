@@ -6,6 +6,7 @@ import argparse, io, logging, os
 from datetime import date, datetime, timedelta, timezone
 import boto3, duckdb, pandas as pd, pyarrow as pa, pyarrow.parquet as pq
 from market_data_contract import canonical_price_ctes, VERSION as PRICE_CONTRACT_VERSION
+from price_identity import prepare_price_inputs
 from dotenv import load_dotenv
 load_dotenv('.env.prod')
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -61,7 +62,7 @@ def compute_price_features(target_date: date) -> pd.DataFrame:
             volume::BIGINT       AS volume,
             turnover_cr::DOUBLE  AS turnover_cr,
             delivery_pct::DOUBLE AS delivery_pct
-        FROM read_parquet({path}, union_by_name=true, hive_partitioning=true)
+        FROM feature_inputs
         WHERE trade_date >= '{start_date}'
           AND trade_date <= '{target_date}'
           AND isin IS NOT NULL
@@ -130,6 +131,7 @@ def compute_price_features(target_date: date) -> pd.DataFrame:
     """
 
     try:
+        prepare_price_inputs(con, path, start_date, target_date)
         df = con.execute(query).df()
         logger.info("  %d features for %d ISINs", len(df.columns), len(df))
         return df

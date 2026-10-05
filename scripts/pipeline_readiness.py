@@ -99,8 +99,13 @@ def database_counts(target, sessions):
             cur.execute('SELECT COUNT(*) FROM investmitra.equity_prices WHERE trade_date >= %s '
                         'AND trade_date <= %s', (target-timedelta(days=29), target))
             history = cur.fetchone()[0]
+        from signal_input_readiness import audit
+        coverage = audit(conn, target)
         missing = [d for d in sessions if prices.get(d, 0) <= 0]
-        return {'prices': prices.get(target, 0), 'scores': scores, 'history': history}, missing
+        return {'prices': prices.get(target, 0), 'scores': scores, 'history': history,
+                'signal_ready': coverage['ready'],
+                'classified_expected': coverage['expected_classified_priced_nse_symbols'],
+                'classified_eligible': coverage['eligible_classified_priced_nse_symbols']}, missing
     finally:
         conn.close()
 
@@ -111,9 +116,9 @@ def inspect(target, sessions, mark=False):
     bucket, env = os.getenv('CC_BUCKET_RAW', 'cc-raw'), os.getenv('CC_ENV', 'prod')
     key = f'{env}/pipeline_readiness/{target.isoformat()}.json'
     counts, missing = database_counts(target, sessions)
-    if missing or counts['scores'] <= 0 or counts['history'] <= 10000:
+    if missing or counts['scores'] <= 0 or counts['history'] <= 10000 or not counts.get('signal_ready', False):
         if mark:
-            raise RuntimeError('Cannot mark ready: missing daily prices, scores or history')
+            raise RuntimeError('Cannot mark ready: missing daily prices, scores, history or classified NSE score coverage')
         return False, missing
     # Validate actual date columns, not just filenames or database max dates.
     try:

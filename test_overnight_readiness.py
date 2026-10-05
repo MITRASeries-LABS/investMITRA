@@ -76,26 +76,34 @@ class OvernightReadinessTests(unittest.TestCase):
         self.assertEqual(result,(False,[DAY]));client.put_object.assert_not_called();validator.assert_not_called()
 
     def test_failed_validation_cannot_publish_receipt(self):
-        with self.assertRaises(RuntimeError): self.inspect_with({'scores':10,'prices':10,'history':20000},[],True,RuntimeError('stale'))
+        with self.assertRaises(RuntimeError): self.inspect_with({'scores':10,'prices':10,'history':20000,'signal_ready':True},[],True,RuntimeError('stale'))
 
     def test_no_receipt_means_rebuild_even_when_dates_look_current(self):
-        result,client,validator=self.inspect_with({'scores':10,'prices':10,'history':20000},[])
+        result,client,validator=self.inspect_with({'scores':10,'prices':10,'history':20000,'signal_ready':True},[])
         self.assertEqual(result,(False,[]));self.assertEqual(validator.call_count,4);client.put_object.assert_not_called()
 
     def test_success_receipt_written_only_after_validation(self):
-        result,client,validator=self.inspect_with({'scores':10,'prices':10,'history':20000},[],True)
+        result,client,validator=self.inspect_with({'scores':10,'prices':10,'history':20000,'signal_ready':True},[],True)
         self.assertEqual(result,(True,[]));self.assertEqual(validator.call_count,4)
         receipt=json.loads(client.put_object.call_args.kwargs['Body'])
         self.assertEqual(receipt['date'],str(DAY));self.assertEqual(receipt['objects'],{'key':'etag'})
 
     def test_database_check_is_readonly_and_requires_each_session(self):
         conn=MagicMock();cur=conn.cursor.return_value.__enter__.return_value
-        cur.fetchall.return_value=[(DAY,2404)];cur.fetchone.side_effect=[(4900,),(250000,)]
+        from market_data_contract import VERSION
+        cur.fetchall.side_effect=[[(DAY,2404)],[('A',VERSION,'Energy','SMALL',True,True,70,'Energy')]];cur.fetchone.side_effect=[(4900,),(250000,)]
         fake=SimpleNamespace(connect=Mock(return_value=conn))
         with patch.dict(os.environ,{'CC_POSTGRES_URL':'fake'}),patch.dict(sys.modules,{'psycopg2':fake}):
             counts,missing=readiness.database_counts(DAY,[date(2026,9,22),DAY])
         self.assertEqual(missing,[date(2026,9,22)]);self.assertEqual(counts['prices'],2404)
         conn.set_session.assert_called_once_with(readonly=True);conn.close.assert_called_once()
+
+    def test_incomplete_coverage_cannot_publish_receipt(self):
+        counts={'scores':344,'prices':2447,'history':20000,'signal_ready':False}
+        result,client,validator=self.inspect_with(counts,[])
+        self.assertEqual(result,(False,[])); client.put_object.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError,'classified NSE'):
+            self.inspect_with(counts,[],True)
 
     def test_ready_overnight_report_does_not_send_repeated_alerts(self):
         with patch.dict(os.environ,{'READY':'true','MORNING':'false','GITHUB_REPOSITORY':'test/repo','GITHUB_RUN_ID':'1','GITHUB_STEP_SUMMARY':''}),patch.object(report,'urlopen') as send,contextlib.redirect_stdout(io.StringIO()):
