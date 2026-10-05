@@ -132,12 +132,12 @@ def compute_price_features(target_date: date) -> pd.DataFrame:
     try:
         df = con.execute(query).df()
         logger.info("  %d features for %d ISINs", len(df.columns), len(df))
-        con.close()
         return df
     except Exception as e:
         logger.error("Feature computation failed: %s", e)
+        raise
+    finally:
         con.close()
-        return pd.DataFrame()
 
 
 def write_features_to_r2(df: pd.DataFrame, target_date: date) -> str:
@@ -170,11 +170,14 @@ def feature_exists_in_r2(target_date: date) -> bool:
     return len(result.get("Contents", [])) > 0
 
 
-def run_for_date(target_date: date) -> dict:
+def run_for_date(target_date: date, *, allow_empty: bool = False) -> dict:
     # A same-date retry can contain corrected raw files. Recompute rather than
     # accepting a file whose version matches but whose input fingerprint changed.
     df = compute_price_features(target_date)
-    if df.empty: return {"date": str(target_date), "isins": 0, "status": "no_data"}
+    if df.empty:
+        if allow_empty:
+            return {"date": str(target_date), "isins": 0, "status": "no_data"}
+        raise RuntimeError(f"No features for required date {target_date}; no output written")
     path = write_features_to_r2(df, target_date)
     return {"date": str(target_date), "isins": len(df), "cols": len(df.columns),
             "path": path, "status": "ok"}
@@ -184,7 +187,9 @@ def run_date_range(start: date, end: date):
     current = start; total = 0
     while current <= end:
         if current.weekday() < 5:
-            logger.info("%s: %s", current, run_for_date(current))
+            # Historical ranges may contain exchange holidays. Query failures
+            # still propagate; only a successful empty query may be skipped.
+            logger.info("%s: %s", current, run_for_date(current, allow_empty=True))
             total += 1
         current += timedelta(days=1)
     logger.info("Done: %d dates", total)

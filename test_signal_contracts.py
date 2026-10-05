@@ -47,6 +47,47 @@ class DailyPrices(unittest.TestCase):
         self.insert('NSE','2026-10-01',100); self.insert('NSE','2026-10-01',110)
         with self.assertRaisesRegex(Exception,'Conflicting'): self.prices()
 
+    def test_conflict_error_identifies_key_and_values(self):
+        self.insert('NSE','2026-10-01',100,isin='INE000000001')
+        self.insert('NSE','2026-10-01',110,isin='INE000000001')
+        with self.assertRaises(Exception) as caught: self.prices()
+        for fragment in ('Conflicting keys=1','INE000000001','2026-10-01','NSE',
+                         '"close_min":100.0','"close_max":110.0'):
+            self.assertIn(fragment,str(caught.exception))
+
+    def test_conflict_examples_bounded_and_null_differences_visible(self):
+        for i in range(12):
+            self.insert('NSE','2026-10-01',isin=f'I{i:02}')
+            self.db.execute("INSERT INTO raw_prices VALUES (?, '2026-10-01', 'NSE', 100,1000,1,NULL)",[f'I{i:02}'])
+        with self.assertRaises(Exception) as caught: self.prices()
+        message=str(caught.exception)
+        self.assertIn('Conflicting keys=12',message)
+        self.assertIn('"delivery_present":1',message)
+        self.assertIn('I09',message); self.assertNotIn('I10',message)
+
+    def test_feature_query_failure_propagates_and_closes_connection(self):
+        tree=ast.parse((ROOT/'scripts/compute_features.py').read_text(encoding='utf-8'))
+        fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='compute_price_features')
+        con=Mock(); con.execute.side_effect=RuntimeError('Conflicting fixture prices')
+        ns=dict(pd=__import__('pandas'),get_duckdb_con=lambda:con,build_path=lambda day:"'fixture.parquet'",
+                timedelta=timedelta,date=date,canonical_price_ctes=canonical_price_ctes,
+                PRICE_CONTRACT_VERSION=VERSION,logger=logging.getLogger('fixture'))
+        exec(compile(ast.Module(body=[fn],type_ignores=[]),'features','exec'),ns)
+        with self.assertRaisesRegex(RuntimeError,'Conflicting fixture'):
+            ns['compute_price_features'](date(2026,10,5))
+        con.close.assert_called_once()
+
+    def test_required_empty_date_fails_without_publishing(self):
+        tree=ast.parse((ROOT/'scripts/compute_features.py').read_text(encoding='utf-8'))
+        fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='run_for_date')
+        writer=Mock()
+        ns=dict(date=date,compute_price_features=lambda day:__import__('pandas').DataFrame(),write_features_to_r2=writer)
+        exec(compile(ast.Module(body=[fn],type_ignores=[]),'features','exec'),ns)
+        with self.assertRaisesRegex(RuntimeError,'No features for required date'):
+            ns['run_for_date'](date(2026,10,5))
+        self.assertEqual(ns['run_for_date'](date(2026,10,2),allow_empty=True)['status'],'no_data')
+        writer.assert_not_called()
+
     def test_production_atr_uses_fourteen_distinct_nse_sessions(self):
         tree=ast.parse((ROOT/'scripts/intraday_signals.py').read_text(encoding='utf-8'))
         fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='get_key_levels')
