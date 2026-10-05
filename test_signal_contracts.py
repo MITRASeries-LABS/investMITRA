@@ -18,6 +18,7 @@ from signal_diagnostics import score_gates, session_policy, summarise_decisions
 from signal_evidence import market_policy_rejection
 from shadow_validation import StudyStore, ShadowObserver
 from strategy_gate_study import selected
+from price_identity import prepare_price_inputs
 
 ROOT=Path(__file__).parent
 
@@ -100,7 +101,8 @@ class DailyPrices(unittest.TestCase):
         con=Mock(); con.execute.side_effect=RuntimeError('Conflicting fixture prices')
         ns=dict(pd=__import__('pandas'),get_duckdb_con=lambda:con,build_path=lambda day:"'fixture.parquet'",
                 timedelta=timedelta,date=date,canonical_price_ctes=canonical_price_ctes,
-                PRICE_CONTRACT_VERSION=VERSION,logger=logging.getLogger('fixture'))
+                PRICE_CONTRACT_VERSION=VERSION,logger=logging.getLogger('fixture'),
+                prepare_price_inputs=lambda *args:None)
         exec(compile(ast.Module(body=[fn],type_ignores=[]),'features','exec'),ns)
         with self.assertRaisesRegex(RuntimeError,'Conflicting fixture'):
             ns['compute_price_features'](date(2026,10,5))
@@ -148,7 +150,8 @@ class DailyPrices(unittest.TestCase):
             con=duckdb.connect()
             ns=dict(pd=__import__('pandas'),get_duckdb_con=lambda:con, build_path=lambda day:repr(str(path)),
                     timedelta=timedelta,date=date,canonical_price_ctes=canonical_price_ctes,
-                    PRICE_CONTRACT_VERSION=VERSION,logger=logging.getLogger('fixture'))
+                    PRICE_CONTRACT_VERSION=VERSION,logger=logging.getLogger('fixture'),
+                    prepare_price_inputs=lambda *args:prepare_price_inputs(*args,rows=[('A','INE000000001')]))
             exec(compile(ast.Module(body=[fn],type_ignores=[]),'features','exec'),ns)
             df=ns['compute_price_features'](date(2026,9,25))
             self.assertEqual(len(df),1)

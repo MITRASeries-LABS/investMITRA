@@ -535,12 +535,15 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(result['remaining'],35000-result['budget_used'])
         self.assertEqual(report_limits(self.f.manager.state,25000,90),(25000,90))
 
-    def run_preflight(self, score_date, price_date, *, calendar_fails=False):
+    def run_preflight(self, score_date, price_date, *, calendar_fails=False, coverage_complete=True):
         index_connection=MagicMock()
         index_connection.cursor.return_value.fetchone.return_value=(1,)
         connection=MagicMock()
         connection.cursor.return_value.__enter__.return_value.fetchone.side_effect=[
             (score_date,), (price_date,200000), (1,)]
+        from market_data_contract import VERSION
+        connection.cursor.return_value.__enter__.return_value.fetchall.return_value=[
+            ('A',VERSION,'Energy','SMALL',True,coverage_complete,70 if coverage_complete else None,'Energy')]
         self.ns.update(API_KEY='test', ACCESS_TOKEN='test', NEON_URL='unused',
                        os=SimpleNamespace(getenv=lambda name:'test'),
                        psycopg2=SimpleNamespace(connect=Mock(side_effect=[index_connection,connection])),
@@ -555,6 +558,9 @@ class ReviewFixTests(unittest.TestCase):
 
     def test_preflight_accepts_complete_previous_session(self):
         self.assertTrue(self.run_preflight(date(2026,9,9),date(2026,9,9)))
+
+    def test_preflight_blocks_incomplete_classified_score_coverage(self):
+        self.assertFalse(self.run_preflight(date(2026,9,9),date(2026,9,9),coverage_complete=False))
 
     def test_preflight_blocks_unknown_calendar(self):
         self.assertFalse(self.run_preflight(date(2026,9,9),date(2026,9,9),calendar_fails=True))

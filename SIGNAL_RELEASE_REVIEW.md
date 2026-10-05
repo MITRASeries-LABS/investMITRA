@@ -10,7 +10,7 @@ Build: `2026-10-05-canonical-evidence1`. Paper trading only.
 | Runtime daily prices | NSE-only ATR/MA/history; ATR requires fourteen true ranges with previous closes; latest NSE date required | Actual production query exercised against dual-exchange fixtures |
 | Pipeline features | One venue per ISIN history, NSE preferred; BSE-only instruments retain BSE; exact duplicate reruns collapse; conflicting revisions fail | Actual feature query and duplicate/conflict tests |
 | Pipeline retries | Features and momentum recompute rather than reuse potentially stale same-date outputs | Old outputs cannot pass the contract check |
-| Score provenance | `daily-venue-v1` propagated through features, momentum, composite and Neon; old/unverified scores cannot enter the catalog | Version validation plus dated pipeline tests |
+| Score provenance | `daily-venue-v2` propagated through features, momentum, composite and Neon; old/unverified scores cannot enter the catalog | Version validation plus dated pipeline tests |
 | Discovery | Initial watchlist and dynamic scans share liquidity, event exclusions, score components and quality formula; missing scores never invented | Actual initial/dynamic route comparison |
 | Classification | Cap aliases unified; unknown sectors reported, never guessed; ambiguous symbol joins excluded visibly | Micro-cap alias and coverage tests |
 | Opening range | At most one recovery attempt per maintenance cycle; three attempts per symbol, five-minute retry spacing; exactly 09:15–09:29 completed minute candles | Missing, conflicting, wrong-day and future-window tests; lock and gap-hold tests |
@@ -84,7 +84,35 @@ The existing optional `weight_optimizer.py` had an unterminated notification str
 The test runner requires `PyYAML`, `duckdb` and `pandas` (CI installs them).
 
 ```
-python -X utf8 -m unittest -q test_auto_trading test_review_fixes test_capital_visibility test_shadow_validation test_neon_session_upload test_session_reports test_pipeline_dates test_overnight_readiness test_server_pipeline test_entry_evidence test_signal_contracts
+python -X utf8 -m unittest -q test_auto_trading test_review_fixes test_capital_visibility test_shadow_validation test_neon_session_upload test_session_reports test_pipeline_dates test_overnight_readiness test_server_pipeline test_entry_evidence test_signal_contracts test_price_identity
 ```
 
 The original 271 tests remain included. New tests execute production SQL and discovery functions, verify canonical source selection, quality/cap consistency, completed-candle recovery, freshness, multi-gate diagnostics and evidence persistence. Offline tests do not replace the production-data checks above.
+
+
+## October 6 identity and coverage correction
+
+The October 5 recovery completed but produced only 344 master-matched NSE scores,
+all unclassified. The NSE full bhavcopy contains null ISINs; the Neon price loader
+enriches these, but the feature lake reader previously discarded them. With
+NSE-preferred history, this removed current rows for the normal NSE universe.
+
+`price_identity.py` now resolves missing NSE ISINs from unique company-master
+symbol mappings before venue selection. Native ISINs remain authoritative; BSE
+symbols are never resolved through the NSE mapping. Ambiguous mappings are reported
+and remain unresolved. The current master is used (as in the Neon loader); historic
+symbol reuse/change without a native ISIN still needs a point-in-time security
+master. No classification, exchange row or price is fabricated.
+
+The contract advances to `daily-venue-v2`, forcing a dated rebuild. Readiness now
+starts from current NSE prices joined to the company master, so absent scores
+cannot vanish from the denominator. Every priced stock with a known master sector
+and supported cap category requires a finite, current-contract score and a known
+score sector. Zero eligible rows is a failure. Unknown classifications remain
+reported exclusions and are not assigned a guessed sector. This is input coverage,
+not a guarantee that any stock passes liquidity, event, sector-proxy or entry gates.
+
+The coverage check runs after the Neon score load, before a readiness receipt is
+written, in the laptop readiness CLI, and in engine preflight. A green workflow
+alone is not enough without classified score coverage. Rebuild October 5 explicitly
+even when launching after midnight on October 6. Preserve journals and paper mode.

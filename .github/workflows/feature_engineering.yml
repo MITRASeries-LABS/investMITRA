@@ -164,6 +164,9 @@ jobs:
           CC_BUCKET_RAW: cc-raw
         run: python scripts/load_scores_to_neon.py --date "$TRADE_DATE"
 
+      - name: Validate classified NSE score coverage
+        run: python scripts/signal_input_readiness.py --date "$TRADE_DATE"
+
       - name: Compute early signals
         env:
           CC_ENV: prod

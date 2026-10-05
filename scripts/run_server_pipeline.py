@@ -31,7 +31,7 @@ def score_commands(target):
                 dated('compute_momentum_score'), validate('momentum'),
                 dated('compute_financial_stress_score'), dated('compute_management_quality_score'),
                 dated('compute_investmitra_score'), validate('composite'),
-                dated('load_scores_to_neon'), dated('compute_early_signals')]
+                dated('load_scores_to_neon'), dated('signal_input_readiness'), dated('compute_early_signals')]
     commands += [['scripts/'+name+'.py'] for name in (
         'fetch_screener_signals', 'fetch_corporate_events', 'fetch_nse_announcements',
         'fetch_sebi_rss', 'fetch_fo_stocks', 'fetch_market_indices', 'fetch_global_sentiment')]
