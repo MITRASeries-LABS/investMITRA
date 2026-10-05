@@ -101,6 +101,8 @@ def database_counts(target, sessions):
             history = cur.fetchone()[0]
         from signal_input_readiness import audit
         coverage = audit(conn, target)
+        if coverage['quarantined_ambiguous_symbols']:
+            print('Identity quarantine (excluded from entries):', coverage['quarantined_ambiguous_symbols'])
         missing = [d for d in sessions if prices.get(d, 0) <= 0]
         return {'prices': prices.get(target, 0), 'scores': scores, 'history': history,
                 'signal_ready': coverage['ready'],
@@ -160,6 +162,8 @@ def main():
         if not recovery_allowed(now):
             raise RuntimeError('Automatic rebuild cutoff reached (06:00 IST)')
         return
+    from dotenv import load_dotenv
+    load_dotenv('.env.prod')  # CLI on laptop; existing Actions environment wins.
     from signal_runtime import load_nse_holidays
     holidays = load_nse_holidays(now.date(), validate_session=False)
     target = args.date or completed_session(now, holidays)

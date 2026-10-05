@@ -106,7 +106,7 @@ master. No classification, exchange row or price is fabricated.
 
 The contract advances to `daily-venue-v2`, forcing a dated rebuild. Readiness now
 starts from current NSE prices joined to the company master, so absent scores
-cannot vanish from the denominator. Every priced stock with a known master sector
+cannot vanish from the denominator. Every uniquely identified priced stock with a known master sector
 and supported cap category requires a finite, current-contract score and a known
 score sector. Zero eligible rows is a failure. Unknown classifications remain
 reported exclusions and are not assigned a guessed sector. This is input coverage,
@@ -116,3 +116,29 @@ The coverage check runs after the Neon score load, before a readiness receipt is
 written, in the laptop readiness CLI, and in engine preflight. A green workflow
 alone is not enough without classified score coverage. Rebuild October 5 explicitly
 even when launching after midnight on October 6. Preserve journals and paper mode.
+
+## October 6 ambiguous identity containment
+
+The subsequent production rebuild loaded 5,348 scores. Validation found 1,998
+complete classified NSE stocks out of 1,999, with KIRLPNU split across two master
+ISINs; four unclassified, unpriced symbols retained older contract rows. The legacy
+Neon price loader used last-row-wins while feature enrichment rejected ambiguity.
+
+Both loaders now use the same unique-symbol identity map. Native ISINs stay intact,
+including in partially enriched input files. The entry catalog excludes symbols
+with multiple master ISINs before initial or dynamic admission, requires an NSE
+price on the score date and known master/score sectors, and still requires the
+current score contract. Preflight and readiness visibly report ambiguous symbols
+as quarantined. They cannot trade even if one duplicate has a valid score.
+
+Readiness requires complete scores for the remaining unique, classified, currently
+priced NSE universe. Missing or wrong-version scores in that universe still fail;
+zero eligible coverage still fails. Old-version rows outside it remain reported
+and excluded; they are not deleted or relabelled. This is per-symbol containment,
+not a repaired security master: dated corporate-action identities and historical
+price corrections remain outstanding. KIRLPNU stays excluded until resolved.
+
+The already rebuilt outputs may be revalidated without recomputing them using
+`python -X utf8 scripts/pipeline_readiness.py --date 2026-10-05 --mark-ready --check-only`
+after syncing this release. This checks actual lake outputs and database coverage
+before recording readiness. It neither rebuilds data nor bypasses failed checks.
