@@ -6,10 +6,12 @@ QUALITY_VERSION = "quality-four-inputs-v1"
 
 
 def canonical_price_ctes(raw="raw_prices"):
-    """DuckDB CTEs: exact reruns collapse; conflicting reruns fail the build.
+    """DuckDB CTEs: exact reruns collapse; selected-venue conflicts fail.
 
     Prefer NSE for an ISIN's entire input window, otherwise BSE. Never splice
-    BSE days into NSE history. Caller bounds the window before calling this.
+    BSE days into NSE history. Validate only the venue used in the calculation;
+    unused BSE rows cannot invalidate NSE history. BSE-only conflicts still
+    fail. Caller bounds the window before calling this.
     """
     if raw != "raw_prices":
         raise ValueError("Unexpected raw price relation")
@@ -17,6 +19,12 @@ def canonical_price_ctes(raw="raw_prices"):
     distinct_prices AS (
         SELECT DISTINCT isin, trade_date, source, close, volume, turnover_cr, delivery_pct
         FROM raw_prices WHERE source IN ('NSE','BSE')
+    ), venues AS (
+        SELECT isin, CASE WHEN MAX(CASE WHEN source='NSE' THEN 1 ELSE 0 END)=1
+                    THEN 'NSE' ELSE 'BSE' END AS source
+        FROM distinct_prices GROUP BY isin
+    ), selected_prices AS (
+        SELECT p.* FROM distinct_prices p JOIN venues v USING(isin,source)
     ), price_conflicts AS (
         SELECT isin, trade_date, source, COUNT(*) AS variants,
             MIN(close) AS close_min, MAX(close) AS close_max,
@@ -25,7 +33,7 @@ def canonical_price_ctes(raw="raw_prices"):
             MIN(delivery_pct) AS delivery_min, MAX(delivery_pct) AS delivery_max,
             COUNT(close) AS close_present, COUNT(volume) AS volume_present,
             COUNT(turnover_cr) AS turnover_present, COUNT(delivery_pct) AS delivery_present
-        FROM distinct_prices
+        FROM selected_prices
         GROUP BY isin, trade_date, source HAVING COUNT(*) > 1
     ), conflict_examples AS (
         SELECT * FROM price_conflicts ORDER BY isin, trade_date, source LIMIT 10
@@ -36,12 +44,8 @@ def canonical_price_ctes(raw="raw_prices"):
             || '; first 10 examples (present counts expose NULL differences): '
             || (SELECT CAST(to_json(list(conflict_examples)) AS VARCHAR) FROM conflict_examples))
           ELSE 1 END AS ok
-    ), venues AS (
-        SELECT isin, CASE WHEN MAX(CASE WHEN source='NSE' THEN 1 ELSE 0 END)=1
-                    THEN 'NSE' ELSE 'BSE' END AS source
-        FROM distinct_prices GROUP BY isin
     ), prices AS (
-        SELECT p.* FROM distinct_prices p JOIN venues v USING(isin,source)
+        SELECT p.* FROM selected_prices p
         CROSS JOIN price_validation WHERE ok=1
     )
     """

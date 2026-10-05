@@ -47,6 +47,35 @@ class DailyPrices(unittest.TestCase):
         self.insert('NSE','2026-10-01',100); self.insert('NSE','2026-10-01',110)
         with self.assertRaisesRegex(Exception,'Conflicting'): self.prices()
 
+    def test_unused_bse_volume_conflicts_do_not_block_nse_history(self):
+        self.insert('NSE','2026-10-01',1392.1,isin='INE002A01018')
+        for volume,turnover in [(1,.0001402),(385434,53.7654656)]:
+            self.db.execute("INSERT INTO raw_prices VALUES (?, '2025-07-25', 'BSE',1392.1,?,?,NULL)",
+                            ['INE002A01018',volume,turnover])
+        rows=self.prices()
+        self.assertEqual(len(rows),1)
+        self.assertEqual((rows[0][1],rows[0][2]),(date(2026,10,1),'NSE'))
+
+    def test_bse_only_conflicting_volume_still_fails(self):
+        self.insert('BSE','2026-10-01')
+        self.db.execute("INSERT INTO raw_prices VALUES ('I','2026-10-01','BSE',100,1,1,50)")
+        with self.assertRaisesRegex(Exception,'Conflicting'): self.prices()
+
+    def test_nse_conflicting_volume_still_fails_with_clean_bse(self):
+        self.insert('NSE','2026-10-01'); self.insert('BSE','2026-10-01')
+        self.db.execute("INSERT INTO raw_prices VALUES ('I','2026-10-01','NSE',100,1,1,50)")
+        with self.assertRaisesRegex(Exception,'Conflicting'): self.prices()
+
+    def test_ignored_bse_conflicts_do_not_mask_selected_conflicts(self):
+        self.insert('NSE','2026-10-01',isin='NSE_STOCK')
+        for close in (100,110):
+            self.insert('BSE','2026-10-01',close,isin='NSE_STOCK')
+            self.insert('BSE','2026-10-01',close,isin='BSE_ONLY')
+        with self.assertRaises(Exception) as caught: self.prices()
+        message=str(caught.exception)
+        self.assertIn('Conflicting keys=1',message)
+        self.assertIn('BSE_ONLY',message); self.assertNotIn('NSE_STOCK',message)
+
     def test_conflict_error_identifies_key_and_values(self):
         self.insert('NSE','2026-10-01',100,isin='INE000000001')
         self.insert('NSE','2026-10-01',110,isin='INE000000001')
@@ -111,6 +140,8 @@ class DailyPrices(unittest.TestCase):
             for i in range(25):
                 for venue in ('NSE','BSE'):
                     self.insert(venue,date(2026,9,1)+timedelta(days=i),100+i+(venue=='BSE'),isin='INE000000001')
+            # Production feature SQL must ignore unused BSE conflicts too.
+            self.db.execute("INSERT INTO raw_prices VALUES ('INE000000001','2026-09-01','BSE',101,1,1,NULL)")
             self.db.execute('COPY raw_prices TO ? (FORMAT PARQUET)',[str(path)])
             tree=ast.parse((ROOT/'scripts/compute_features.py').read_text())
             fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='compute_price_features')
