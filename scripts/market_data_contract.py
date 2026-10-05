@@ -18,11 +18,23 @@ def canonical_price_ctes(raw="raw_prices"):
         SELECT DISTINCT isin, trade_date, source, close, volume, turnover_cr, delivery_pct
         FROM raw_prices WHERE source IN ('NSE','BSE')
     ), price_conflicts AS (
-        SELECT isin, trade_date, source FROM distinct_prices
+        SELECT isin, trade_date, source, COUNT(*) AS variants,
+            MIN(close) AS close_min, MAX(close) AS close_max,
+            MIN(volume) AS volume_min, MAX(volume) AS volume_max,
+            MIN(turnover_cr) AS turnover_min, MAX(turnover_cr) AS turnover_max,
+            MIN(delivery_pct) AS delivery_min, MAX(delivery_pct) AS delivery_max,
+            COUNT(close) AS close_present, COUNT(volume) AS volume_present,
+            COUNT(turnover_cr) AS turnover_present, COUNT(delivery_pct) AS delivery_present
+        FROM distinct_prices
         GROUP BY isin, trade_date, source HAVING COUNT(*) > 1
+    ), conflict_examples AS (
+        SELECT * FROM price_conflicts ORDER BY isin, trade_date, source LIMIT 10
     ), price_validation AS (
         SELECT CASE WHEN EXISTS(SELECT 1 FROM price_conflicts)
-          THEN error('Conflicting same-venue daily prices; resolve source revisions before scoring')
+          THEN error('Conflicting same-venue daily prices; resolve source revisions before scoring. '
+            || 'Conflicting keys=' || CAST((SELECT COUNT(*) FROM price_conflicts) AS VARCHAR)
+            || '; first 10 examples (present counts expose NULL differences): '
+            || (SELECT CAST(to_json(list(conflict_examples)) AS VARCHAR) FROM conflict_examples))
           ELSE 1 END AS ok
     ), venues AS (
         SELECT isin, CASE WHEN MAX(CASE WHEN source='NSE' THEN 1 ELSE 0 END)=1
