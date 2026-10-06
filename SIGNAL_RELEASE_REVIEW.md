@@ -1,5 +1,83 @@
 # Canonical signal evidence release
 
+## October 6 controlled strategy comparison
+
+Build `2026-10-06-controlled-comparison1` adds prospective input capture and an
+isolated, execution-aware comparison. Existing active entry thresholds and score
+weights remain unchanged. It does not claim that the alternatives are profitable.
+
+The existing minute diagnostics cannot reconstruct stops, partial exits or the
+price path after rejected candidates. New runs therefore record every received
+engine tick batch (including REST scan ticks), its pre-evaluation stock/index,
+volume, quality and opening-range inputs, frozen configuration and source hashes.
+This covers only the monitored universe. It cannot invent new discoveries that a
+counterfactual post-exit scan might have found. Every simulated candidate is
+rescored through `IntradayEngine`; each portfolio runs `AutoOrderManager` with
+its actual sizing, partial/target/trailing/reversal/dead-trade/square-off rules,
+capital reuse, priority queue and combined daily loss protection.
+
+Five hypotheses are frozen before the next session:
+
+| Variant | Daily volume baseline | Priority | Normal / lunch RVOL floor |
+|---|---|---|---|
+| mean_gated (control) | Mean | Existing gate and ranking | 5 / 8 |
+| median_gated | Median | Existing gate and ranking | 5 / 8 |
+| mean_rank | Mean | Ranking only | 5 / 8 |
+| median_rank | Median | Ranking only | 5 / 8 |
+| median_rank_rvol2 | Median | Ranking only | 2 / 3 |
+
+The 2/3 floors are an explicit experimental hypothesis, not tuned or recommended
+settings. Median substitution recalculates RVOL, gap classification, opportunity,
+blended score and priority. It does not simply relabel an old gate outcome. All
+variants keep sector/identity/freshness/direction/hold/profit/risk controls and the
+same captured capital limits (currently Rs35,000, Rs10,000/ticket, three open
+positions, Rs1,500 combined loss trigger). Stops and loss triggers cannot guarantee
+a maximum realised loss when prices gap.
+
+Prior NSE history is fetched once on the background capture thread with read-only
+access and bounded timeouts. Mean/median use the same prior 30-calendar-day window.
+Comparison requires at least ten valid sessions, no conflicting source days, and
+a mean matching the engine's captured baseline. Missing or revised history is a
+reported common-universe exclusion in every variant, with no median fallback.
+Corporate actions are not automatically adjusted. The linear elapsed-time RVOL
+model remains a separate unvalidated assumption.
+
+Each variant runs two separate portfolios: base Rs80/filled trade + 5bps adverse
+slippage per fill, and stress Rs160 + 10bps. Cost changes affect reservations and
+risk admission as well as final P&L. Quotes must have actual exchange timestamps;
+no fills at stale/missing prices, no synthetic circuit bounds for shorts, and no
+invented end-of-tape exits. These are full-size observed-LTP fill assumptions, not
+an order-book/liquidity model. The control is a simulation, not a guaranteed exact
+reproduction of the live paper worker's timing. Reports include fills, mean closed
+net, observed marked-equity drawdown, exposure, costs, coverage and full snapshots.
+Unknown marks and unfinished positions make the portfolio comparison incomplete.
+
+Capture starts automatically in auto-paper (`INVESTMITRA_COMPARISON_CAPTURE=0`
+disables research only). It uses a bounded queue and a 512MiB per-run tape quota;
+queue overflow, disk failure, source mismatch and abrupt shutdown invalidate the
+tape. New files go under `data/comparison/`; nothing is uploaded periodically to
+Neon, and no existing journal or shadow rows are rewritten. Source hashes are
+newline-normalized for Windows/Linux. Replay requires the same captured source
+revision. Preserve that checkout along with tapes if changing research code.
+
+After the normal flat, stopped session and existing reports, the comparison runs
+automatically in an isolated child process, with a ten-minute timeout. A timeout
+retains the tape for a manual rerun. Outputs are printed and saved beside the tape
+as `.comparison.json`. No extra morning terminal, server, pipeline rebuild or
+schema migration is required for this change. Manual retry:
+
+```powershell
+python -X utf8 scripts/strategy_comparison.py --tape 'data/comparison/EXACT_FILE_FROM_LOG.sqlite3'
+```
+
+Validation protocol: October 6 remains hypothesis-development evidence. Keep this
+five-variant family fixed for subsequent complete sessions. Compare paired daily
+portfolio outcomes, not correlated tick counts; stratify later analysis by market
+regime. Report missing inputs, no-trade days and cost stress. No variant is promoted
+automatically. If evidence suggests a winner, freeze that choice and confirm it
+on a further untouched period before changing the active engine. A two-week
+observation window or a positive small sample is not proof of an edge.
+
 ## October 6 RVOL and priority audit
 
 `scripts/rvol_priority_audit.py --date YYYY-MM-DD` now runs automatically with
@@ -132,10 +210,11 @@ The existing optional `weight_optimizer.py` had an unterminated notification str
 
 ## Regression command
 
-The test runner requires `PyYAML`, `duckdb` and `pandas` (CI installs them).
+The test runner requires `PyYAML`, `duckdb`, `pandas`, `kiteconnect`,
+`psycopg2-binary` and `python-dotenv` (CI installs them).
 
 ```
-python -X utf8 -m unittest -q test_auto_trading test_review_fixes test_capital_visibility test_shadow_validation test_neon_session_upload test_session_reports test_pipeline_dates test_overnight_readiness test_server_pipeline test_entry_evidence test_signal_contracts test_price_identity
+python -X utf8 -m unittest -q test_auto_trading test_review_fixes test_capital_visibility test_shadow_validation test_neon_session_upload test_session_reports test_pipeline_dates test_overnight_readiness test_server_pipeline test_entry_evidence test_signal_contracts test_price_identity test_rvol_priority_audit test_strategy_comparison
 ```
 
 The original 271 tests remain included. New tests execute production SQL and discovery functions, verify canonical source selection, quality/cap consistency, completed-candle recovery, freshness, multi-gate diagnostics and evidence persistence. Offline tests do not replace the production-data checks above.

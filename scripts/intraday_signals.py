@@ -1021,11 +1021,18 @@ class IntradayEngine:
         self._last_heartbeat_at = None
         self._last_scan_status = None
         self._candidate_logged = set()
+        self.comparison_tape = None  # bounded, asynchronous research capture only
         self.shadow = None  # optional observer: never involved in trading decisions
         self._shadow_scored = None
         self._shadow_opening = {}
         self._shadow_error_logged = False
 
+
+    def _now(self):
+        return datetime.now(IST)
+
+    def _admission_policy(self, session, gap_threshold):
+        return session_policy(session, gap_threshold, MIN_PRIORITY_SCORE)
 
     def on_tick(self, ws, ticks):
         if ticks:
@@ -1034,7 +1041,9 @@ class IntradayEngine:
             self._on_tick_locked(ws, ticks)
 
     def _on_tick_locked(self, ws, ticks):
-        now     = datetime.now(IST)
+        now     = self._now()
+        if self.comparison_tape is not None:
+            self.comparison_tape.capture(self, ticks, now)
         session = get_current_session(now)
         for tick in ticks:
             token  = tick["instrument_token"]
@@ -1642,7 +1651,7 @@ class IntradayEngine:
         sector     = stock.get("sector", "")
         kl         = self.key_levels.get(symbol, {})
 
-        now = datetime.now(IST)
+        now = self._now()
         volume_context = volume_evidence(self.rvol_baseline, self.rvol_provenance, symbol, volume, now)
         expected_vol_now = volume_context["rvol_expected_volume"] or 0
         rvol = volume_context["rvol"]
@@ -1960,7 +1969,7 @@ class IntradayEngine:
             self._reject_signal(symbol, f"blended score {final:.2f} below {MIN_FINAL_SCORE:.2f}", now)
             return
 
-        min_rvol = session_policy(session, gap_thresh, MIN_PRIORITY_SCORE)["rvol_min"]
+        min_rvol = self._admission_policy(session, gap_thresh)["rvol_min"]
 
         volume_context = volume_evidence(self.rvol_baseline, self.rvol_provenance, symbol, volume, now)
         if volume_context["rvol_expected_volume"] is None:
@@ -2075,7 +2084,7 @@ class IntradayEngine:
             self._reject_signal(symbol, "capital ceiling exceeded by candidate", now)
             return
 
-        _entry_at = datetime.now(IST)
+        _entry_at = self._now()
         _trade_id = f"{_entry_at.date().isoformat()}_{symbol}_{_entry_at.strftime('%H%M%S')}"
         candidate = dict(
             symbol=symbol, direction=direction, entry=ltp, market_direction=self.market_direction,
@@ -2113,7 +2122,7 @@ class IntradayEngine:
             logger.debug("Skip %s — max %d concurrent trades reached",
                          symbol, MAX_CONCURRENT_TRADES)
             return
-        required_priority = session_policy(session, gap_thresh, MIN_PRIORITY_SCORE)["priority_min"]
+        required_priority = self._admission_policy(session, gap_thresh)["priority_min"]
         if _priority < required_priority:
             self._reject_signal(symbol, f"priority below {required_priority:.3f}", now)
             return
@@ -2877,6 +2886,14 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
                 logger.info("Shadow candidate observation enabled: %s; entry rules unchanged", VERSION)
             except Exception:
                 logger.exception("Shadow observation unavailable; trading configuration unchanged")
+        if os.getenv("INVESTMITRA_COMPARISON_CAPTURE", "1") == "1":
+            try:
+                from comparison_capture import ComparisonTape
+                engine.comparison_tape = ComparisonTape.start(engine, instruments)
+                execution.comparison_tape = engine.comparison_tape
+                logger.info("Controlled comparison capture: %s", engine.comparison_tape.path)
+            except Exception:
+                logger.exception("Comparison capture unavailable; active strategy unchanged")
         ticker.connect(threaded=True)
         maintenance = threading.Thread(target=engine._maintenance_loop, daemon=True)
         maintenance.start()
@@ -2920,6 +2937,8 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
         ticker.close()
         if engine.shadow is not None:
             engine.shadow.close()
+        if engine.comparison_tape is not None:
+            engine.comparison_tape.close()
 
 
 def main():
@@ -2966,6 +2985,11 @@ def main():
                         run_session_reports(execution)
                     except Exception:
                         logger.exception("Automatic session reports unavailable; local journals retained")
+                    try:
+                        from comparison_capture import run_comparison_report
+                        run_comparison_report(execution)
+                    except Exception:
+                        logger.exception("Controlled comparison report unavailable; captured tape retained")
             finally:
                 execution.journal.close()
         else:

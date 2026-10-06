@@ -27,7 +27,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 logger = logging.getLogger(__name__)
 TERMINAL = {"COMPLETE", "CANCELLED", "REJECTED"}
 PREFIX = "IM3"
-BUILD_ID = "2026-10-06-decision-visibility1"
+BUILD_ID = "2026-10-06-controlled-comparison1"
 MAX_PENDING_CANDIDATES = 100
 CANDIDATE_TTL_SECONDS = 10
 MIN_SIGNAL_GAP_PCT = 0.30
