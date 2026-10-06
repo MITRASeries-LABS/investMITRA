@@ -119,3 +119,33 @@ def summarise_decisions(records):
         unknown.update(k for k,v in row['gates'].items() if v['status']=='UNKNOWN')
     return dict(symbol_sessions=len(unique), failures=dict(blockers), unknown=dict(unknown),
                 outcomes=dict(stages))
+
+
+def nearest_decisions(records, limit=10):
+    """Rank latest sampled scored observation per stock/session by failed gates.
+
+    Do not pick each stock's best historical moment or use future markouts.
+    Unknown scored inputs are reported separately, never treated as passes.
+    Later unscored evaluations remain visible alongside the scored snapshot.
+    """
+    latest, scored = {}, {}
+    for row in sorted(records, key=lambda r: r['observed_at']):
+        key = row['day'], row['strategy_id'], row['symbol'], row['session']
+        latest[key] = row
+        if row.get('gates'):
+            scored[key] = row
+    known, unknown = [], []
+    for key, row in scored.items():
+        gates = row['gates']
+        failures = {k: v for k, v in gates.items() if v['status'] == 'FAIL'}
+        missing = {k: v for k, v in gates.items() if v['status'] == 'UNKNOWN'}
+        item = dict(symbol=row['symbol'], observed_at=row['observed_at'],
+                    outcome=row['outcome'], stage=row.get('authoritative_stage', 'unrecorded'),
+                    failures=failures, unknown=missing,
+                    not_evaluated=[k for k,v in gates.items() if v['status']=='NOT_EVALUATED'],
+                    latest_outcome=latest[key]['outcome'], latest_at=latest[key]['observed_at'])
+        (unknown if missing else known).append(item)
+    order = lambda r: (len(r['failures']), r['symbol'], r['observed_at'])
+    return dict(known=sorted(known,key=order)[:limit],
+                unknown=sorted(unknown,key=order)[:limit],
+                known_count=len(known), unknown_count=len(unknown))

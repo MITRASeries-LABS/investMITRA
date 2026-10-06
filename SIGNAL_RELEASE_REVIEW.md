@@ -1,5 +1,29 @@
 # Canonical signal evidence release
 
+## October 6 decision visibility update
+
+Build `2026-10-06-decision-visibility1` adds explicit early-return reasons (gap
+confirmation loss/reset, recovery, cooldown, risk/capital/position limits,
+session timing, fade-risk controls and rounded stop distance). Evaluation
+exceptions retain their type in research evidence and still propagate.
+Admission rules and order handling are unchanged.
+
+The existing automatic decision report now lists up to ten closest candidates
+per session by failed-gate count, using each stock's latest sampled scored
+observation. This is not an entry recommendation or a full eligibility ranking.
+Unknown evidence is listed separately, checks never reached remain NOT_EVALUATED,
+and any later unscored outcome is displayed rather than hidden. No future price
+outcome is used for ranking. Existing first-observation coverage totals remain.
+
+The automatic shadow report reconciles mean gross markout, fixed cost allowance,
+modelled slippage and net on the same completed cohort, for base and stress
+assumptions. These are research costs, not confirmed broker charges.
+
+No data rebuild, journal reset, schema migration or parameter changes are needed
+for this update. Re-running reports can explain existing stored score/cost
+evidence; previously generic rejection reasons cannot be reconstructed. Explicit
+early-return reasons are collected only by the updated engine on future runs.
+
 Prepared against main `e4842e0eba90b943920a7b252abbe0cf852eb94b`.
 Build: `2026-10-05-canonical-evidence1`. Paper trading only.
 

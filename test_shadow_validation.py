@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 
 import test_auto_trading as fixtures  # adds scripts to sys.path; no production imports
 from shadow_validation import StudyStore, ShadowObserver, IST, SPEC, VERSION, filters, capture_features
-from shadow_validation_report import compare, summarise, read_report
+from shadow_validation_report import compare, summarise, read_report, cost_decomposition
 
 
 class ShadowTests(unittest.TestCase):
@@ -54,6 +54,32 @@ class ShadowTests(unittest.TestCase):
         self.assertAlmostEqual(r['stress_net'], 300 - 160 - 20300 * .001)
         self.store.quote('A', 80, f['observed_at'] + 1810, f['observed_at'] + 1810)
         self.assertEqual(self.rows()[0]['exit_price'], 103)
+
+    def test_cost_report_reconciles_long_and_short_without_incomplete_rows(self):
+        self.complete(self.features(),103)
+        self.complete(self.features(symbol='B',direction='SHORT'),101)
+        self.store.candidate(self.features(symbol='C'))
+        rows=self.rows()
+        before=json.dumps(rows,sort_keys=True)
+        result=cost_decomposition(rows,SPEC)
+        self.assertEqual(result['n'],2)
+        self.assertEqual(result['gross_positive'],1)
+        self.assertAlmostEqual(result['gross_mean'],100)
+        self.assertAlmostEqual(result['base_slippage'],10.10)
+        self.assertAlmostEqual(result['base_net'],9.90)
+        self.assertAlmostEqual(result['stress_slippage'],20.20)
+        self.assertAlmostEqual(result['stress_net'],-80.20)
+        self.assertEqual(before,json.dumps(rows,sort_keys=True))
+        self.assertIsNone(cost_decomposition([dict(status='PENDING')],SPEC))
+
+    def test_rendered_report_shows_gross_cost_and_slippage_separately(self):
+        self.complete(self.features(),103)
+        self.store.db.commit()
+        output=io.StringIO()
+        with contextlib.redirect_stdout(output):
+            summarise(self.path,'2026-09-25','2026-09-25')
+        for expected in ('gross Rs+300.00','fixed allowance Rs80.00','modelled slippage Rs10.15','net Rs+209.85'):
+            self.assertIn(expected,output.getvalue())
 
     def test_short_sign_and_filter_symmetry(self):
         f = self.features(direction='SHORT', vwap=101, or_high=103, or_low=100.5)

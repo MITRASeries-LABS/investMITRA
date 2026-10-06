@@ -1770,6 +1770,9 @@ class IntradayEngine:
         self._decision_checks = {}
         try:
             return self._evaluate_signal(symbol, ltp, volume, now, session)
+        except Exception as exc:
+            self._decision_reason = "evaluation exception: " + type(exc).__name__
+            raise
         finally:
             # Sampling affects evidence writes only, never eligibility or re-evaluation.
             if self.shadow is not None and hasattr(self.shadow, 'decision'):
@@ -1787,6 +1790,7 @@ class IntradayEngine:
         self._shadow_scored = None
         session = get_current_session(now)
         if session not in ("momentum", "choppy", "afternoon"):
+            self._decision_reason = "outside configured signal session"
             return
         if self.execution is None:
             self._entry_blocked = True
@@ -1804,6 +1808,7 @@ class IntradayEngine:
                     self._entry_defer_status = (reason, now)
                 return
             if now.timestamp() - self.execution_offers.get(symbol, 0) < 5:
+                self._decision_reason = "candidate offer cooldown"
                 return
             # Sizing reads the last confirmed execution view; the worker performs
             # the authoritative budget/risk check again before submitting.
@@ -1829,18 +1834,22 @@ class IntradayEngine:
         if symbol in self.traded_today:
             self._decision_reason = "already traded today"; return  # No re-entry same day
         if getattr(self, "_entry_blocked", False):
+            self._decision_reason = "engine restart recovery pending"
             logger.debug("Entry blocked for %s — restart recovery pending", symbol)
             return
         if self.risk.daily_budget_remaining < MIN_TICKET_INR:
+            self._decision_reason = "risk view available capital below minimum ticket"
             logger.debug("Daily budget exhausted: Rs%.2f used", self.risk.daily_capital_used)
             return
         # Risk checks - checked again after sizing below
         if self.risk.net_pnl <= -MAX_DAILY_LOSS_INR:
+            self._decision_reason = "daily loss limit reached"
             logger.debug("Daily loss limit hit: Rs%.0f", self.risk.net_pnl)
             return
         # Position cap - explicit paper/live limits
         pos_limit = PAPER_MAX_POSITIONS if PAPER_TRADING else MAX_POSITIONS
         if len(self.risk.positions) >= pos_limit:
+            self._decision_reason = "maximum open positions reached"
             logger.debug("Max positions reached: %d/%d", len(self.risk.positions), pos_limit)
             return
 
@@ -1868,6 +1877,7 @@ class IntradayEngine:
             live_confirms = (gap_is_long and ltp > prev * 1.001) or                            (not gap_is_long and ltp < prev * 0.999)
             
             if not live_confirms:
+                self._decision_reason = "live price no longer confirms opening gap"
                 # Price has filled the gap - reset timer
                 if symbol in self.gap_first_seen:
                     del self.gap_first_seen[symbol]
@@ -1887,13 +1897,16 @@ class IntradayEngine:
             # Check gap direction hasn't flipped
             current_dir = "LONG" if true_gap_pct > 0 else "SHORT"
             if current_dir != self.gap_direction.get(symbol):
+                self._decision_reason = "gap direction changed; hold reset"
                 del self.gap_first_seen[symbol]
                 return
             # Reset if live price has filled the gap (price back at prev close)
             if current_dir == "LONG" and ltp < prev * 1.001:
+                self._decision_reason = "long gap filled; hold reset"
                 del self.gap_first_seen[symbol]
                 return
             if current_dir == "SHORT" and ltp > prev * 0.999:
+                self._decision_reason = "short gap filled; hold reset"
                 del self.gap_first_seen[symbol]
                 return
         else:
@@ -1904,6 +1917,7 @@ class IntradayEngine:
             return
 
         if now.hour * 60 + now.minute < 575:
+            self._decision_reason = "before earliest entry time"
             return
 
         above_vwap = ltp > vwap * 1.001
@@ -1934,13 +1948,17 @@ class IntradayEngine:
         # Otherwise skip — Sonnet confirmed fade_risk consistently loses
         if details["gap_type"] == "fade_risk":
             if self.signal_weights.get("skip_fade_risk"):
+                self._decision_reason = "fade-risk entries disabled by configuration"
                 return
             if details["rvol"] < 2.5 or quality < 65:
+                self._decision_reason = "fade-risk quality/RVOL requirements not met"
                 logger.debug("Skip %s — fade_risk with weak RVOL %.1fx", symbol, details["rvol"])
                 return
 
         final = quality * 0.40 + opp * 0.60
-        if final < MIN_FINAL_SCORE: return
+        if final < MIN_FINAL_SCORE:
+            self._reject_signal(symbol, f"blended score {final:.2f} below {MIN_FINAL_SCORE:.2f}", now)
+            return
 
         min_rvol = session_policy(session, gap_thresh, MIN_PRIORITY_SCORE)["rvol_min"]
 
@@ -1975,7 +1993,9 @@ class IntradayEngine:
         stop   = round(ltp - atr*ATR_STOP_MULT, 2) if direction=="LONG" else round(ltp + atr*ATR_STOP_MULT, 2)
         target = round(ltp + atr*ATR_TARGET_MULT, 2) if direction=="LONG" else round(ltp - atr*ATR_TARGET_MULT, 2)
         stop_dist = abs(ltp - stop)
-        if stop_dist == 0: return
+        if stop_dist == 0:
+            self._decision_reason = "zero stop distance after rounding"
+            return
 
         # Available capital = starting equity minus realised losses and committed capital
         # Equity after realised P&L and costs (negative net_pnl reduces available capital)
@@ -2089,6 +2109,7 @@ class IntradayEngine:
         # Reject weak signals when positions already running
         _open_count = len(self.risk.positions) if hasattr(self, 'risk') else 0
         if _open_count >= MAX_CONCURRENT_TRADES:
+            self._decision_reason = "maximum concurrent trades reached"
             logger.debug("Skip %s — max %d concurrent trades reached",
                          symbol, MAX_CONCURRENT_TRADES)
             return
