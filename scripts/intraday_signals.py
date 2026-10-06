@@ -716,7 +716,7 @@ def get_signal_catalog(ctx: dict) -> list[dict]:
                    AVG(volume) AS avg_vol,
                    AVG(close) AS avg_price,
                    AVG(volume * close) AS avg_traded_value,
-                   -- Yesterday's change %
+                   -- Yesterday's percentage change
                    (MAX(CASE WHEN trade_date=(
                         SELECT trade_date FROM investmitra.equity_prices
                         WHERE source='NSE' AND trade_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date GROUP BY trade_date
