@@ -38,6 +38,22 @@ def compare(rows, field="net"):
     return result
 
 
+def cost_decomposition(rows, spec):
+    """Use the same completed cohort and its frozen costs; never broker charges."""
+    complete = [r for r in rows if r['status'] == 'COMPLETE']
+    if not complete:
+        return None
+    n = len(complete)
+    mean = lambda key: sum(r[key] for r in complete) / n
+    gross, base, stress = mean('gross'), mean('net'), mean('stress_net')
+    return dict(n=n, gross_mean=gross,
+                gross_positive=sum(r['gross'] > 0 for r in complete),
+                base_allowance=spec['cost_allowance'],
+                base_slippage=gross-base-spec['cost_allowance'], base_net=base,
+                stress_allowance=spec['stress_cost_allowance'],
+                stress_slippage=gross-stress-spec['stress_cost_allowance'], stress_net=stress)
+
+
 def read_report(path, start, end):
     # mode=ro prevents accidental creation/reset of a missing journal.
     db = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
@@ -79,6 +95,15 @@ def summarise(path, start, end):
         if version != VERSION or json.loads(specs.get(version, "{}")) != SPEC:
             print("Unsupported specification; use matching report version. Comparison skipped.")
             continue
+        costs = cost_decomposition(rows, json.loads(specs[version]))
+        if costs:
+            print(f"  SAME COMPLETED COHORT: n={costs['n']}; positive gross markouts={costs['gross_positive']} (before costs/slippage)")
+            for case in ('base', 'stress'):
+                print(f"  {case.upper()} mean: gross Rs{costs['gross_mean']:+.2f} "
+                      f"- fixed allowance Rs{costs[case+'_allowance']:.2f} "
+                      f"- modelled slippage Rs{costs[case+'_slippage']:.2f} "
+                      f"= net Rs{costs[case+'_net']:+.2f}")
+            print('  Allowances are frozen research assumptions, not measured broker charges. No cost settings changed.')
         for field, label in (("net", "BASE COSTS"), ("stress_net", "STRESS COSTS")):
             result = compare(rows, field)
             base = result["all"]

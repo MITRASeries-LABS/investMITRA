@@ -14,7 +14,7 @@ import duckdb
 import test_auto_trading as fixtures
 from market_data_contract import canonical_price_ctes, canonical_stock, quality_score, coverage, VERSION
 from signal_recovery import opening_candles, breadth_evidence, IST
-from signal_diagnostics import score_gates, session_policy, summarise_decisions
+from signal_diagnostics import score_gates, session_policy, summarise_decisions, nearest_decisions
 from signal_evidence import market_policy_rejection
 from shadow_validation import StudyStore, ShadowObserver
 from strategy_gate_study import selected
@@ -235,6 +235,57 @@ class DecisionEvidence(unittest.TestCase):
     def setUp(self):
         self.f=fixtures.ExecutionTests();self.f.setUp();self.addCleanup(self.f.tearDown)
         self.e=self.f._make_signal_engine()
+
+    def test_gap_fill_records_reason_and_resets_hold_without_queuing(self):
+        self.e.shadow=SimpleNamespace(decision=Mock())
+        self.e._check_signal('A',self.e.prev_close['A'],1000,self.f.now,'momentum')
+        row=self.e.shadow.decision.call_args.args[0]
+        self.assertEqual(row['outcome'],'live price no longer confirms opening gap')
+        self.assertEqual(row['gates'],{})
+        self.assertNotIn('A',self.e.gap_first_seen)
+        self.assertTrue(self.f.manager.inbox.empty())
+
+    def test_recovery_and_offer_cooldown_have_distinct_reasons(self):
+        self.e.shadow=SimpleNamespace(decision=Mock())
+        self.e._entry_blocked=True
+        self.e._check_signal('A',100,1000,self.f.now,'momentum')
+        self.assertEqual(self.e.shadow.decision.call_args.args[0]['outcome'],'engine restart recovery pending')
+        self.e._entry_blocked=False
+        self.e.execution_offers['A']=self.f.now.timestamp()
+        self.e._check_signal('A',100,1000,self.f.now,'momentum')
+        self.assertEqual(self.e.shadow.decision.call_args.args[0]['outcome'],'candidate offer cooldown')
+        self.assertTrue(self.f.manager.inbox.empty())
+
+    def test_evaluation_exception_is_recorded_and_still_propagates(self):
+        self.e.shadow=SimpleNamespace(decision=Mock())
+        self.e._compute_opportunity_score=Mock(side_effect=ValueError('fixture'))
+        with self.assertRaisesRegex(ValueError,'fixture'):
+            self.e._check_signal('A',100,1000,self.f.now,'momentum')
+        self.assertEqual(self.e.shadow.decision.call_args.args[0]['outcome'],'evaluation exception: ValueError')
+        self.assertTrue(self.f.manager.inbox.empty())
+
+    def test_nearest_uses_latest_scored_snapshot_and_separates_unknowns(self):
+        row=dict(day='2026-10-06',strategy_id='test',symbol='A',session='momentum',observed_at=1,
+                 outcome='first',gates={'rvol':dict(status='PASS'), 'sizing_profit':dict(status='NOT_EVALUATED')})
+        later=dict(row,observed_at=2,outcome='rvol low',gates={'rvol':dict(status='FAIL',actual=2,required=5)})
+        blocked=dict(row,observed_at=3,outcome='live price no longer confirms opening gap',gates={})
+        unknown=dict(row,symbol='B',gates={'sector':dict(status='UNKNOWN')})
+        better=dict(row,symbol='C')
+        report=nearest_decisions([blocked,unknown,row,better,later])
+        self.assertEqual([r['symbol'] for r in report['known']],['C','A'])
+        self.assertEqual([r['symbol'] for r in report['unknown']],['B'])
+        a=report['known'][1]
+        self.assertEqual(a['observed_at'],2)
+        self.assertEqual(a['failures']['rvol']['actual'],2)
+        self.assertEqual(a['latest_outcome'],blocked['outcome'])
+        self.assertIn('sizing_profit',report['known'][0]['not_evaluated'])
+
+    def test_nearest_never_mixes_sessions_and_limits_output(self):
+        row=dict(day='2026-10-06',strategy_id='test',symbol='A',session='momentum',observed_at=1,
+                 outcome='reject',gates={'rvol':dict(status='FAIL')})
+        report=nearest_decisions([row,dict(row,session='afternoon',observed_at=2)],limit=1)
+        self.assertEqual(report['known_count'],2)
+        self.assertEqual(len(report['known']),1)
 
     def test_numeric_score_changes_do_not_spam_but_evaluation_continues(self):
         calls=[]

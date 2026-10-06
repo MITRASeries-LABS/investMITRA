@@ -1,11 +1,11 @@
 """Read-only gate coverage report; no claims about counterfactual executions."""
 import argparse
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
-from signal_diagnostics import summarise_decisions
+from signal_diagnostics import summarise_decisions, nearest_decisions
 
 
 def summarise(path, day):
@@ -29,6 +29,18 @@ def summarise(path, day):
         print('  Independent failures:',json.dumps(result['failures'],sort_keys=True))
         print('  Unknown evidence:',json.dumps(result['unknown'],sort_keys=True))
         print('  First terminal outcomes:',json.dumps(result['outcomes'],sort_keys=True))
+        nearest = nearest_decisions(records)
+        print('  Closest by failed-gate count: latest sampled scored observation per stock/session; not entry recommendations.')
+        print(f"  Known scored evidence: {nearest['known_count']}; unknown scored evidence: {nearest['unknown_count']}; showing up to 10 each.")
+        for label in ('known', 'unknown'):
+            for row in nearest[label]:
+                stamp = lambda t: datetime.fromtimestamp(t, timezone(timedelta(hours=5, minutes=30))).strftime('%H:%M:%S')
+                print(f"    {row['symbol']} [{label}] scored@{stamp(row['observed_at'])}: {row['outcome']} (stage={row['stage']})")
+                print('      Failed gates:',json.dumps(row['failures'],sort_keys=True))
+                print('      Unknown gates:',json.dumps(row['unknown'],sort_keys=True))
+                print('      Not evaluated:', ', '.join(row['not_evaluated']) or 'none')
+                if row['latest_at'] != row['observed_at']:
+                    print(f"      Later sampled evaluation@{stamp(row['latest_at'])}: {row['latest_outcome']}")
     print('Sizing, hold continuity and portfolio competition not reached are NOT_EVALUATED, never assumed passed.')
 
 
