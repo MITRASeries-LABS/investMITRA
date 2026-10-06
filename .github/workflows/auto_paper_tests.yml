@@ -15,6 +15,8 @@ on:
       - 'scripts/market_data_contract.py'
       - 'scripts/signal_recovery.py'
       - 'scripts/signal_diagnostics.py'
+      - 'scripts/rvol_priority_audit.py'
+      - 'test_rvol_priority_audit.py'
       - 'scripts/signal_decision_report.py'
       - 'scripts/signal_input_readiness.py'
       - 'scripts/strategy_gate_study.py'
@@ -77,6 +79,6 @@ jobs:
         if: runner.os == 'Linux'
         run: bash -n deploy/install_pipeline_server.sh
       - name: Check syntax
-        run: python -m py_compile scripts/price_identity.py scripts/weight_optimizer.py scripts/compute_features.py scripts/compute_momentum_score.py scripts/compute_investmitra_score.py scripts/load_prices_to_neon.py scripts/load_scores_to_neon.py scripts/market_data_contract.py scripts/signal_recovery.py scripts/signal_diagnostics.py scripts/signal_decision_report.py scripts/signal_input_readiness.py scripts/strategy_gate_study.py scripts/intraday_signals.py scripts/order_manager.py scripts/execution_capital.py scripts/signal_runtime.py scripts/signal_evidence.py scripts/trade_research.py scripts/auto_paper_summary.py scripts/shadow_validation.py scripts/shadow_validation_report.py scripts/session_reports.py intraday_signals.py
+        run: python -m py_compile scripts/price_identity.py scripts/weight_optimizer.py scripts/compute_features.py scripts/compute_momentum_score.py scripts/compute_investmitra_score.py scripts/load_prices_to_neon.py scripts/load_scores_to_neon.py scripts/market_data_contract.py scripts/signal_recovery.py scripts/signal_diagnostics.py scripts/rvol_priority_audit.py scripts/signal_decision_report.py scripts/signal_input_readiness.py scripts/strategy_gate_study.py scripts/intraday_signals.py scripts/order_manager.py scripts/execution_capital.py scripts/signal_runtime.py scripts/signal_evidence.py scripts/trade_research.py scripts/auto_paper_summary.py scripts/shadow_validation.py scripts/shadow_validation_report.py scripts/session_reports.py intraday_signals.py
       - name: Run offline lifecycle and review regressions
-        run: python -m unittest -v test_auto_trading test_review_fixes test_capital_visibility test_shadow_validation test_neon_session_upload test_session_reports test_pipeline_dates test_overnight_readiness test_server_pipeline test_entry_evidence test_signal_contracts test_price_identity
+        run: python -m unittest -v test_auto_trading test_review_fixes test_capital_visibility test_shadow_validation test_neon_session_upload test_session_reports test_pipeline_dates test_overnight_readiness test_server_pipeline test_entry_evidence test_signal_contracts test_price_identity test_rvol_priority_audit

@@ -1,5 +1,32 @@
 # Canonical signal evidence release
 
+## October 6 RVOL and priority audit
+
+`scripts/rvol_priority_audit.py --date YYYY-MM-DD` now runs automatically with
+the post-close reports, using the saved observer path and execution date. It
+examines all saved minute samples, grouped by strategy and session; reports first
+crossings per symbol of eight diagnostic gates; and compares four fixed cases:
+baseline, without RVOL, without priority, and without both. Every other recorded
+gate (including direction/VWAP) is retained, and comparisons use a common-known
+sample. These are admission diagnostics, not backtests: continuous hold, sizing,
+executions and capital competition are not replayed, and no earlier markout is
+reused as P&L for a different timestamp. No trading threshold or score is changed.
+
+The audit checks recorded volume operands, elapsed fraction, NSE provenance,
+baseline dates and cumulative volume decreases. Optional `--verify-neon` opens a
+read-only connection using existing `.env.prod`, recomputes prior-session daily
+baselines, compares them with captured values and reports concentration/conflicts.
+Current DB history may contain revisions. Consistent arithmetic is not proof of
+exchange accuracy or an intraday seasonal volume model; no historical minute
+volume or corporate-action adjustment is invented. No DB writes or data rebuild.
+
+Read-only Neon investigation on October 6 confirmed NAUKRI, ROUTE, TIPSMUSIC and
+INDUSTOWER have `Communication Services` in both company master and October 5
+scores. The engine has no configured proxy for that broad sector. This is an
+unmapped sector, not a missing score field. An index must be justified by the
+business/constituents before changing this gate; this release does not assign
+these disparate companies to an arbitrary index.
+
 ## October 6 decision visibility update
 
 Build `2026-10-06-decision-visibility1` adds explicit early-return reasons (gap

@@ -49,6 +49,11 @@ def run_session_reports(execution):
     if observer.failed:
         LOG.warning("Shadow capture failed during this run; any results below have incomplete coverage")
     try:
+        from rvol_priority_audit import summarise as volume_summary
+        volume_summary(observer.path, day)
+    except Exception as exc:
+        LOG.warning("RVOL/priority audit unavailable (%s); remaining reports continue", type(exc).__name__)
+    try:
         from shadow_validation_report import summarise
         summarise(observer.path, day, day)
         result["shadow"] = "ok"
