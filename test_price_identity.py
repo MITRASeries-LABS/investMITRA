@@ -170,6 +170,25 @@ class Coverage(unittest.TestCase):
 
 
 class EntryIdentity(unittest.TestCase):
+    def test_engine_parameterized_sql_has_no_bare_percent_characters(self):
+        # psycopg2 parses placeholders before PostgreSQL sees SQL comments.
+        # DuckDB query fixtures alone do not exercise that adaptation layer.
+        import re
+        tree=ast.parse((ROOT/'scripts/intraday_signals.py').read_text(encoding='utf-8'))
+        checked=0
+        for node in ast.walk(tree):
+            if not (isinstance(node,ast.Call) and isinstance(node.func,ast.Attribute)
+                    and node.func.attr in ('execute','executemany') and len(node.args)>1
+                    and isinstance(node.args[0],ast.Constant)
+                    and isinstance(node.args[0].value,str)):
+                continue
+            checked+=1
+            sql=node.args[0].value
+            # Consume valid placeholders and escaped literal percents first.
+            remainder=re.sub(r'%%|%s|%\([^)]+\)s','',sql)
+            with self.subTest(line=node.lineno):self.assertNotIn('%',remainder)
+        self.assertGreater(checked,0)
+
     def test_laptop_revalidation_loads_env_before_database_and_lake_checks(self):
         import pipeline_readiness as readiness
         from datetime import datetime
