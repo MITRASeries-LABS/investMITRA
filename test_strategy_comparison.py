@@ -171,6 +171,18 @@ class ComparisonTests(unittest.TestCase):
                      dict(source_hashes={}),dict(initial_execution_trades=1)]:
             with self.assertRaises(ValueError): validate_tape(dict(meta,**edit))
 
+    def test_metadata_reader_closes_connection_on_success_and_error(self):
+        connection=Mock()
+        connection.execute.return_value.fetchone.return_value=('{}',)
+        with patch('comparison_capture.sqlite3.connect',return_value=connection):
+            self.assertEqual(read_metadata(Path(self.tmp.name)/'test.sqlite3'),{})
+        connection.close.assert_called_once()
+        connection.reset_mock()
+        connection.execute.side_effect=sqlite3.OperationalError('missing table')
+        with patch('comparison_capture.sqlite3.connect',return_value=connection):
+            with self.assertRaises(sqlite3.OperationalError):read_metadata(Path(self.tmp.name)/'test.sqlite3')
+        connection.close.assert_called_once()
+
     def test_disk_quota_marks_capture_incomplete(self):
         path = Path(self.tmp.name)/'limited.sqlite3'
         tape = ComparisonTape(path,self.meta,lambda:self.baselines,max_bytes=1)

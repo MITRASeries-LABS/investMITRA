@@ -183,8 +183,11 @@ class ComparisonTape:
 
 
 def read_metadata(path):
-    with sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True) as db:
+    db = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True)
+    try:
         return json.loads(db.execute('SELECT body FROM metadata WHERE id=1').fetchone()[0], object_hook=decode)
+    finally:
+        db.close()
 
 
 def read_frames(path):
