@@ -40,9 +40,16 @@ class SessionReportsTests(unittest.TestCase):
         self.assertEqual(result, {'execution': 'ok', 'shadow': 'ok'})
         self.assertIn('AUTO-PAPER SUMMARY — 2026-09-10', text)
         self.assertIn('SHADOW CANDIDATE STUDY 2026-09-10 to 2026-09-10', text)
+        self.assertIn('RVOL / PRIORITY AUDIT — 2026-09-10', text)
         self.assertIn('No observations in this date range', text)
         self.assertEqual(self.execution.state, state)
         self.assertEqual(self.f.journal.db.execute('SELECT body FROM state WHERE id=1').fetchone()[0], raw)
+
+    def test_rvol_audit_failure_does_not_skip_other_reports(self):
+        with patch('rvol_priority_audit.summarise',side_effect=ValueError('fixture')):
+            result,text=self.capture()
+        self.assertEqual(result,{'execution':'ok','shadow':'ok'})
+        self.assertIn('SHADOW CANDIDATE STUDY',text)
 
     def test_actual_configured_paths_and_session_date_are_used(self):
         with patch('auto_paper_summary.summarise') as trade:
