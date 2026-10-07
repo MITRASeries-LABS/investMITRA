@@ -44,6 +44,7 @@ jobs:
       ready: ${{ steps.check.outputs.ready }}
       recover: ${{ steps.check.outputs.recover }}
       dates: ${{ steps.check.outputs.dates }}
+      reason: ${{ steps.check.outputs.reason }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -118,6 +119,7 @@ jobs:
           READY: ${{ needs.readiness.outputs.ready == 'true' || needs.confirm.result == 'success' }}
           TRADE_DATE: ${{ needs.readiness.outputs.date }}
           MORNING: ${{ github.event.schedule == '37 1 * * 1-5' }}
+          READINESS_REASON: ${{ needs.readiness.outputs.reason }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scripts/pipeline_readiness_report.py

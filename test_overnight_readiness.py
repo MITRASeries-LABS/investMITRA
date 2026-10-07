@@ -65,10 +65,10 @@ class OvernightReadinessTests(unittest.TestCase):
         client.get_paginator.return_value.paginate.side_effect=lambda **kw:[{'Contents':[{'Key':kw['Prefix']+'file.parquet' if kw['Prefix'].endswith('/') else kw['Prefix'],'ETag':'abc'}]}]
         self.assertEqual(len(readiness.lake_fingerprint(client,'bucket','prod',DAY)),4)
 
-    def inspect_with(self,counts,missing,mark=False,verify_error=None,receipt=None):
+    def inspect_with(self,counts,missing,mark=False,verify_error=None,receipt=None,details=None):
         client=Mock();validator=Mock(side_effect=verify_error)
         with patch.object(readiness,'lake_client',return_value=client), patch.object(readiness,'database_counts',return_value=(counts,missing)), patch.object(readiness,'lake_fingerprint',return_value={'key':'etag'}), patch.object(readiness,'read_receipt',return_value=receipt), patch.dict(sys.modules,{'verify_pipeline_data':SimpleNamespace(verify=validator)}):
-            result=readiness.inspect(DAY,[DAY],mark)
+            result=readiness.inspect(DAY,[DAY],mark,details=details)
         return result,client,validator
 
     def test_missing_sessions_request_recovery_not_ready(self):
@@ -87,6 +87,79 @@ class OvernightReadinessTests(unittest.TestCase):
         self.assertEqual(result,(True,[]));self.assertEqual(validator.call_count,4)
         receipt=json.loads(client.put_object.call_args.kwargs['Body'])
         self.assertEqual(receipt['date'],str(DAY));self.assertEqual(receipt['objects'],{'key':'etag'})
+
+    def test_manual_finalization_makes_following_check_ready_without_rebuild(self):
+        counts={'scores':10,'prices':10,'history':20000,'signal_ready':True}
+        result,client,_=self.inspect_with(counts,[],True)
+        receipt=json.loads(client.put_object.call_args.kwargs['Body'])
+        details={}
+        result,client,validator=self.inspect_with(counts,[],receipt=receipt,details=details)
+        self.assertEqual(result,(True,[]))
+        self.assertIn('receipt matches',details['reason'])
+        client.put_object.assert_not_called()
+        self.assertEqual(validator.call_count,4)
+
+    def test_manual_finalization_after_cutoff_validates_without_starting_rebuild(self):
+        now=datetime(2026,9,25,8,30,tzinfo=IST)
+        def inspected(target,sessions,mark=False,details=None):
+            self.assertTrue(mark)
+            details['reason']='data validated and completion receipt published'
+            return True,[]
+        with patch.object(readiness,'datetime') as clock,\
+                patch.object(readiness,'inspect',side_effect=inspected),\
+                patch('signal_runtime.load_nse_holidays',return_value=HOLIDAYS),\
+                patch.object(readiness,'output') as output,\
+                patch.object(sys,'argv',['pipeline_readiness.py','--date',str(DAY),'--mark-ready','--check-only']):
+            clock.now.return_value=now
+            readiness.main()
+        self.assertEqual(output.call_args.args[0]['ready'],'true')
+        self.assertEqual(output.call_args.args[0]['recover'],'false')
+
+    def test_missing_receipt_identified_without_claiming_prices_missing(self):
+        details={}
+        result,client,_=self.inspect_with({'scores':10,'prices':10,'history':20000,'signal_ready':True},[],details=details)
+        self.assertFalse(result[0]); self.assertIn('completion receipt missing',details['reason'])
+        self.assertNotIn('missing NSE prices',details['reason'])
+        client.put_object.assert_not_called()
+
+    def test_changed_receipt_still_blocks_and_is_not_silently_reissued(self):
+        counts={'scores':10,'prices':10,'history':20000,'signal_ready':True}
+        receipt=dict(version=1,date=str(DAY),objects={'key':'old'},counts=counts)
+        details={}
+        result,client,_=self.inspect_with(counts,[],receipt=receipt,details=details)
+        self.assertFalse(result[0]);self.assertIn('differs',details['reason'])
+        client.put_object.assert_not_called()
+
+    def test_validation_failure_identifies_stage_without_exception_secret(self):
+        details={}
+        result,client,_=self.inspect_with({'scores':10,'prices':10,'history':20000,'signal_ready':True},[],
+            verify_error=RuntimeError('secret-signed-url'),details=details)
+        self.assertFalse(result[0]);self.assertIn('prices validation failed',details['reason'])
+        self.assertNotIn('secret-signed-url',details['reason']);client.put_object.assert_not_called()
+
+    def test_missing_database_inputs_report_dates_and_coverage(self):
+        details={}
+        self.inspect_with({'scores':0,'prices':0,'history':0,'signal_ready':False},[DAY],details=details)
+        self.assertIn(str(DAY),details['reason']); self.assertIn('dated scores missing',details['reason'])
+        self.assertIn('classified NSE',details['reason'])
+
+    def test_manual_success_alert_explains_that_engine_needs_restart(self):
+        response=MagicMock();response.__enter__.return_value.read.return_value=b'{"ok":true}'
+        with patch.dict(os.environ,{'READY':'true','MORNING':'true','TRADE_DATE':str(DAY),
+                'TELEGRAM_BOT_TOKEN':'fixture','TELEGRAM_CHAT_ID':'123','GITHUB_STEP_SUMMARY':''}),\
+                patch.object(report,'urlopen',return_value=response) as send,contextlib.redirect_stdout(io.StringIO()):
+            report.main()
+        message=json.loads(send.call_args.args[0].data)['text']
+        self.assertIn('EOD DATA READY',message);self.assertIn('NOT started automatically',message)
+        self.assertIn('rerun the paper launcher',message)
+
+    def test_failure_alert_contains_specific_reason(self):
+        response=MagicMock();response.__enter__.return_value.read.return_value=b'{"ok":true}'
+        with patch.dict(os.environ,{'READY':'false','MORNING':'false','READINESS_REASON':'completion receipt missing',
+                'TELEGRAM_BOT_TOKEN':'fixture','TELEGRAM_CHAT_ID':'123','GITHUB_STEP_SUMMARY':''}),\
+                patch.object(report,'urlopen',return_value=response) as send,contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):report.main()
+        self.assertIn('Reason: completion receipt missing',json.loads(send.call_args.args[0].data)['text'])
 
     def test_database_check_is_readonly_and_requires_each_session(self):
         conn=MagicMock();cur=conn.cursor.return_value.__enter__.return_value
@@ -145,6 +218,23 @@ class WorkflowWiringTests(unittest.TestCase):
             matches=[step for job in workflow['jobs'].values() for step in job.get('steps',[]) if '--check-cutoff' in step.get('run','')]
             self.assertEqual(len(matches),1)
             self.assertEqual(matches[0]['if'],'inputs.automatic')
+
+    def test_feature_workflow_finalizes_only_after_success_then_confirms_manual_run(self):
+        steps=self.load('feature_engineering.yml')['jobs']['compute-features']['steps']
+        finalize=steps[-2];notify=steps[-1]
+        self.assertIn('--date "$TRADE_DATE" --mark-ready --check-only',finalize['run'])
+        self.assertNotIn('if',finalize);self.assertNotIn('continue-on-error',finalize)
+        for key in ('CC_POSTGRES_URL','AWS_ENDPOINT_URL','AWS_ACCESS_KEY_ID','AWS_SECRET_ACCESS_KEY'):
+            self.assertIn('secrets.',finalize['env'][key])
+        self.assertIn('workflow_dispatch',notify['if']);self.assertIn('!inputs.automatic',notify['if'])
+        self.assertNotIn('always()',notify['if']);self.assertEqual(notify['env']['READY'],'true')
+        self.assertEqual(notify['env']['MORNING'],'true')
+
+    def test_overnight_passes_failure_reason_to_report(self):
+        jobs=self.load('overnight_readiness.yml')['jobs']
+        self.assertEqual(jobs['readiness']['outputs']['reason'],'${{ steps.check.outputs.reason }}')
+        step=jobs['report']['steps'][-1]
+        self.assertEqual(step['env']['READINESS_REASON'],'${{ needs.readiness.outputs.reason }}')
 
 
 if __name__=='__main__':unittest.main()

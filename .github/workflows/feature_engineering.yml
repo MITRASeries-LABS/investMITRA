@@ -233,3 +233,22 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scripts/trade_analyzer.py
+
+      - name: Validate completed session and publish readiness receipt
+        env:
+          CC_ENV: prod
+          CC_POSTGRES_URL: ${{ secrets.CC_POSTGRES_URL }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CC_BUCKET_RAW: cc-raw
+        run: python scripts/pipeline_readiness.py --date "$TRADE_DATE" --mark-ready --check-only
+
+      - name: Confirm manual recovery to the operator
+        if: github.event_name == 'workflow_dispatch' && !inputs.automatic
+        env:
+          READY: 'true'
+          MORNING: 'true'
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/pipeline_readiness_report.py

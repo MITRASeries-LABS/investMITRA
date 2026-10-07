@@ -112,22 +112,40 @@ def database_counts(target, sessions):
         conn.close()
 
 
-def inspect(target, sessions, mark=False):
+def inspect(target, sessions, mark=False, details=None):
     from verify_pipeline_data import verify
     client = lake_client()
     bucket, env = os.getenv('CC_BUCKET_RAW', 'cc-raw'), os.getenv('CC_ENV', 'prod')
     key = f'{env}/pipeline_readiness/{target.isoformat()}.json'
     counts, missing = database_counts(target, sessions)
+    def status(reason):
+        print(f'Pipeline readiness {target}: {reason}')
+        if details is not None:
+            details.update(reason=reason, counts=counts)
     if missing or counts['scores'] <= 0 or counts['history'] <= 10000 or not counts.get('signal_ready', False):
+        problems = []
+        if missing:
+            problems.append('missing NSE prices for ' + ', '.join(map(str, missing)))
+        if counts['scores'] <= 0:
+            problems.append('dated scores missing')
+        if counts['history'] <= 10000:
+            problems.append('insufficient price history')
+        if not counts.get('signal_ready', False):
+            problems.append('classified NSE score coverage incomplete')
+        reason = '; '.join(problems)
+        status(reason)
         if mark:
-            raise RuntimeError('Cannot mark ready: missing daily prices, scores, history or classified NSE score coverage')
+            raise RuntimeError('Cannot mark ready: ' + reason)
         return False, missing
     # Validate actual date columns, not just filenames or database max dates.
     try:
         for stage in ('prices', 'features', 'momentum', 'composite'):
             verify(target, stage)
+        stage = 'output fingerprint'
         fingerprint = lake_fingerprint(client, bucket, env, target)
-    except Exception:
+    except Exception as exc:
+        # Exception messages can contain signed URLs or connection details.
+        status(f'{stage} validation failed ({type(exc).__name__}); inspect the producer job')
         if mark:
             raise
         return False, missing
@@ -137,8 +155,17 @@ def inspect(target, sessions, mark=False):
                        run_id=os.getenv('GITHUB_RUN_ID'), commit=os.getenv('GITHUB_SHA'))
         client.put_object(Bucket=bucket, Key=key, Body=json.dumps(receipt).encode('utf-8'),
                           ContentType='application/json')
+        status('data validated and completion receipt published')
         return True, []
-    return receipt_matches(read_receipt(client, bucket, key), target, fingerprint, counts), missing
+    receipt = read_receipt(client, bucket, key)
+    ready = receipt_matches(receipt, target, fingerprint, counts)
+    if ready:
+        status('data validated and completion receipt matches')
+    elif not receipt:
+        status('data checks passed; completion receipt missing; finalize the successful dated rebuild')
+    else:
+        status('completion receipt differs from current data; rerun dated producers and finalization')
+    return ready, missing
 
 
 def output(values):
@@ -170,13 +197,15 @@ def main():
     if target > completed_session(now, holidays) or target.weekday() >= 5 or target in holidays:
         raise ValueError('Requested date is not a completed regular NSE session')
     sessions = recent_sessions(target, holidays)
-    ready, missing = inspect(target, sessions, mark=args.mark_ready)
+    details = {}
+    ready, missing = inspect(target, sessions, mark=args.mark_ready, details=details)
     recover = not ready and not args.check_only and recovery_allowed(now)
     output({'date': target.isoformat(), 'ready': str(ready).lower(),
-            'recover': str(recover).lower(),
+            'recover': str(recover).lower(), 'reason': details.get('reason', 'validation incomplete'),
             'dates': json.dumps([d.isoformat() for d in (missing or [target])])})
     if not ready and not recover:
-        raise RuntimeError('DATA NOT READY; automated rebuild cutoff reached or check-only requested')
+        raise RuntimeError('DATA NOT READY: ' + details.get('reason', 'validation incomplete')
+                           + '; automated rebuild cutoff reached or check-only requested')
 
 
 if __name__ == '__main__':

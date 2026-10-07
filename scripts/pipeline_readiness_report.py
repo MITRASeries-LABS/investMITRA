@@ -14,8 +14,14 @@ def main():
         url = os.getenv('PIPELINE_LOG_HINT', 'Server logs: journalctl -u investmitra-data.service')
     message = f'investMITRA: {status}\nSession: {day}\n{url}'
     if ready:
-        message += '\nData preparation only; Kite login and engine preflight are still required.'
+        message += ('\nDated inputs validated; completion receipt confirmed.'
+                    '\nThe laptop engine is NOT started automatically.'
+                    '\nIf it stopped during preflight, rerun the paper launcher before the entry window closes; '
+                    'Kite login and engine preflight still apply.')
     else:
+        reason = os.getenv('READINESS_REASON')
+        if reason:
+            message += '\nReason: ' + reason
         message += '\nOvernight retries are bounded; trading remains blocked until data is valid.'
     print(message)
     if os.getenv('GITHUB_STEP_SUMMARY'):
