@@ -1,5 +1,32 @@
 # Canonical signal evidence release
 
+## October 7 manual recovery completion
+
+The standalone feature workflow now finishes by validating dated prices,
+features, momentum, composite output, recent NSE history and classified score
+coverage, then publishing the same completion receipt as overnight recovery.
+It cannot report successful completion if final validation or receipt writing
+fails. A manual run then sends the existing operations channel an explicit data
+ready confirmation, including that the stopped laptop engine must be restarted.
+The ordinary overnight path retains its existing confirmation/report sequence.
+
+Readiness output and failure alerts distinguish database input gaps, the failed
+lake validation stage, a missing completion receipt and a changed receipt.
+Check-only runs never mint receipts. Changed receipts still require producer
+rebuild/finalization; current dates alone do not authorize acceptance.
+
+For an already completed, successful manual rebuild that predates this patch,
+finalize its exact date once with `python -X utf8 scripts/pipeline_readiness.py
+--date YYYY-MM-DD --mark-ready --check-only`. This reruns all validation before
+writing a receipt; it neither recomputes features nor starts trading. Existing
+R2 and Neon configuration is required. A historical-date confirmation does not
+establish readiness for a later trading session.
+
+No entry rules, risk limits, freshness checks, automatic 06:00 rebuild cutoff or
+paper-only execution settings change. Source failures and hosted-runner delays
+can still prevent timely readiness; notifications report failure rather than
+promising overnight recovery always succeeds.
+
 ## October 6 controlled strategy comparison
 
 Build `2026-10-06-controlled-comparison1` adds prospective input capture and an

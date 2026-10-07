@@ -29,7 +29,9 @@ class ServerPipelineTests(unittest.TestCase):
         workflow=yaml.load((ROOT/'.github/workflows/feature_engineering.yml').read_text(encoding='utf-8'),Loader=yaml.BaseLoader)
         import re
         programs=set(re.findall(r'python (scripts/\w+\.py)', '\n'.join(s.get('run','') for s in workflow['jobs']['compute-features']['steps'])))
-        programs-={'scripts/pipeline_date.py','scripts/pipeline_readiness.py'}
+        # The server invokes these orchestration/report functions directly in main.
+        programs-={'scripts/pipeline_date.py','scripts/pipeline_readiness.py',
+                   'scripts/pipeline_readiness_report.py'}
         self.assertTrue(programs <= {c[0] for c in runner.score_commands(DAY)}, programs)
         commands=runner.score_commands(DAY)
         self.assertEqual(sum(c[0]=='scripts/daily_top_picks.py' for c in commands),2)
