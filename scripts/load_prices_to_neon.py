@@ -85,8 +85,8 @@ def load_date(target_date: date) -> dict:
                 results["nse_rows"] = written
             else:
                 results["bse_rows"] = written
-        except Exception as e:
-            logger.warning("  No data for %s — %s", source, e)
+        except Exception:
+            logger.exception("  Source load failed for %s on %s", source, target_date)
 
     con.close()
     logger.info("Loaded %s — NSE: %d BSE: %d",
@@ -109,6 +109,10 @@ def write_to_neon(df: pd.DataFrame, trade_date: date, source_id: str) -> int:
     if source == "NSE" and "nse_symbol" in df.columns:
         if "isin" not in df.columns:
             df['isin'] = None
+        # All-null Parquet ISIN columns may become nullable integers in pandas.
+        # Declare text before assigning master identities; preserve nulls and
+        # native ISINs, and leave ambiguous/unmapped symbols unresolved.
+        df['isin'] = df['isin'].astype('string')
         missing_isin = df['isin'].isna() | df['isin'].astype(str).str.strip().eq('')
         if missing_isin.any():
             symbol_map = get_symbol_to_isin()

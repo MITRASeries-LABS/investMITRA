@@ -257,5 +257,32 @@ class EntryIdentity(unittest.TestCase):
         self.assertEqual(fn(df,DAY,'bse_eod'),0)
         mapper.assert_not_called()
 
+    def test_price_loader_enriches_all_null_numeric_isin_from_parquet(self):
+        # All-null Parquet columns can arrive as pandas nullable integers.
+        # Exercise the real DuckDB -> pandas boundary, including an unmapped row.
+        from test_pipeline_dates import load_function
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'nse.parquet'
+            db=duckdb.connect()
+            try:
+                db.execute("COPY (SELECT NULL::INTEGER AS isin, symbol AS nse_symbol, "
+                    "100 AS open,101 AS high,99 AS low,100 AS close,1000 AS volume "
+                    "FROM (VALUES (' a '),('UNMAPPED')) t(symbol)) TO ? (FORMAT PARQUET)",[str(path)])
+                frame=db.execute('SELECT * FROM read_parquet(?)',[str(path)]).df()
+            finally: db.close()
+        self.assertEqual(str(frame['isin'].dtype),'Int32')
+        original=frame.copy(deep=True)
+        conn=MagicMock();writer=Mock()
+        fn=load_function('load_prices_to_neon.py','write_to_neon',pd=pd,
+            get_symbol_to_isin=lambda:{'A':A},psycopg2=Mock(connect=Mock(return_value=conn)),
+            NEON_URL='fixture',execute_values=writer)
+        self.assertEqual(fn(frame,DAY,'nse_bhavcopy'),1)
+        rows=writer.call_args.args[2]
+        self.assertEqual(rows[0][0],A)
+        self.assertEqual(rows[0][3:7],(100.0,101.0,99.0,100.0))
+        self.assertEqual(rows[0][8],1000)
+        conn.commit.assert_called_once()
+        pd.testing.assert_frame_equal(frame,original)
+
 
 if __name__=='__main__':unittest.main()
