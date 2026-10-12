@@ -3,6 +3,8 @@ import ast
 import copy
 from datetime import date, datetime, timedelta
 import json
+import io
+from contextlib import redirect_stdout
 from pathlib import Path
 import sys
 import tempfile
@@ -31,6 +33,7 @@ def metadata(count=101):
 
 class StartupTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(redirect_stdout(io.StringIO()))
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name)
 
