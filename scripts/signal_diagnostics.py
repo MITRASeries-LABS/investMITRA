@@ -65,7 +65,7 @@ def score_gates(signal, now, policy):
     check("priority", priority, lambda x: x >= policy['priority_min'], policy['priority_min'])
     typ = details.get('gap_type')
     gates['gap_type'] = dict(status='UNKNOWN' if typ is None else 'PASS' if typ in
-        {'continuation', 'continuation_strong', 'fade_risk'} else 'FAIL', actual=typ)
+        {'continuation', 'continuation_strong'} else 'FAIL', actual=typ)
     sector = sector_policy_rejection(signal, now)
     gates['sector'] = dict(status='PASS' if not sector else 'UNKNOWN' if details.get('sector_status') != 'fresh'
                            else 'FAIL', reason=sector, actual=details.get('sector_chg'))
@@ -149,3 +149,18 @@ def nearest_decisions(records, limit=10):
     return dict(known=sorted(known,key=order)[:limit],
                 unknown=sorted(unknown,key=order)[:limit],
                 known_count=len(known), unknown_count=len(unknown))
+
+
+
+DEPRECATED_WEIGHT_KEYS = frozenset({'rvol_min_continuation', 'tier1_rvol_min', 'tier2_rvol_min', 'skip_fade_risk'})
+
+
+def effective_weights(weights, logger):
+    """Do not imply that legacy classification settings control active admission."""
+    result = dict(weights)
+    ignored = sorted(DEPRECATED_WEIGHT_KEYS.intersection(result))
+    if ignored:
+        logger.warning('Deprecated settings ignored: %s; admission RVOL is session_policy (5x/8x); fade-risk is disabled', ', '.join(ignored))
+    for key in ignored:
+        result.pop(key)
+    return result

@@ -24,6 +24,8 @@ from signal_diagnostics import session_policy, reason_code
 # hypothesis, rather than searching a grid against the same outcomes.
 VARIANTS = {
     'mean_gated': dict(baseline='mean', priority_gate=True, rvol=None),
+    'mean_gated_rvol2': dict(baseline='mean', priority_gate=True,
+                            rvol={'momentum': 2., 'choppy': 3., 'afternoon': 2.}),
     'median_gated': dict(baseline='median', priority_gate=True, rvol=None),
     'mean_rank': dict(baseline='mean', priority_gate=False, rvol=None),
     'median_rank': dict(baseline='median', priority_gate=False, rvol=None),
@@ -317,3 +319,4 @@ def main():
 
 
 if __name__ == '__main__': main()
+

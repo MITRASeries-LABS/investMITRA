@@ -160,7 +160,7 @@ class ComparisonTests(unittest.TestCase):
              patch('psycopg2.connect', side_effect=AssertionError('database')), \
              patch('order_manager.notify', side_effect=AssertionError('alert')):
             result = run(path,engine_module)
-        self.assertEqual(len(result['results']),10)
+        self.assertEqual(len(result['results']),12)
         self.assertFalse(result['full_session_span'])
         self.assertTrue(all(r['filled']==0 for r in result['results'].values()))
 
@@ -307,3 +307,4 @@ class ComparisonTests(unittest.TestCase):
 
 
 if __name__ == '__main__': unittest.main()
+

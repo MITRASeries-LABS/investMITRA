@@ -27,7 +27,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 logger = logging.getLogger(__name__)
 TERMINAL = {"COMPLETE", "CANCELLED", "REJECTED"}
 PREFIX = "IM3"
-BUILD_ID = "2026-10-12-kite-startup1"
+BUILD_ID = "2026-10-12-policy-audit1"
 MAX_PENDING_CANDIDATES = 100
 CANDIDATE_TTL_SECONDS = 10
 MIN_SIGNAL_GAP_PCT = 0.30
@@ -45,7 +45,7 @@ def entry_policy_rejection(signal, now=None):
             return "invalid numeric signal metadata"
         if abs(gap) < threshold:
             return f"gap {gap:.5f}% below {threshold:.5f}%"
-        if gap_type not in {"continuation", "continuation_strong", "fade_risk"}:
+        if gap_type not in {"continuation", "continuation_strong"}:
             return f"blocked gap type: {gap_type}"
         if score < MIN_FINAL_SCORE:
             return f"blended score {score:.2f} below {MIN_FINAL_SCORE:.2f}"

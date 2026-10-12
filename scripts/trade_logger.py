@@ -120,9 +120,7 @@ def ensure_tables():
             "gap_threshold_momentum":  0.30,
             "gap_threshold_choppy":    0.60,
             "gap_threshold_afternoon": 0.40,
-            "rvol_min_continuation":   1.50,
             "skip_choppy_session":     False,
-            "skip_fade_risk":          False,
             "min_sector_chg_long":     -0.50,
             "max_sector_chg_short":    0.50,
         }
@@ -261,3 +259,4 @@ if __name__ == "__main__":
     print("Trade log tables created successfully")
     weights = get_current_weights()
     print(f"Current weights loaded: {len(weights)} parameters")
+

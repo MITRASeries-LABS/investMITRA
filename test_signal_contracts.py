@@ -187,7 +187,7 @@ class CatalogContract(unittest.TestCase):
         nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names]
         stock=canonical_stock(self.stock())
         now=datetime(2026,10,5,10,tzinfo=IST)
-        ns=dict(get_signal_catalog=lambda ctx:[stock],get_nse_gainers_losers=lambda:(['A'],[]),
+        ns=dict(UNIVERSE_COVERAGE=None,get_signal_catalog=lambda ctx:[stock],get_nse_gainers_losers=lambda:(['A'],[]),
                 get_rvol_baseline=lambda:{'A':1000},datetime=SimpleNamespace(now=lambda tz:now),
                 IST=IST,GAP_THRESHOLDS={'momentum':.3},logger=logging.getLogger('fixture'))
         exec(compile(ast.Module(body=nodes,type_ignores=[]),'routes','exec'),ns)
@@ -351,3 +351,4 @@ class DecisionEvidence(unittest.TestCase):
 
 
 if __name__=='__main__': unittest.main()
+

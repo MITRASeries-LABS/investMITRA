@@ -639,3 +639,45 @@ Inputs and validation:
 No live execution is enabled by this change. Capital reuse, ticket limits, the
 Rs1,500 combined daily loss threshold, exits, journaling, Neon session upload and
 end-of-day research reports retain their existing rules.
+
+## Policy consistency and coverage — 2026-10-12
+
+Build `2026-10-12-policy-audit1` retains the active RVOL floors: 5x in momentum
+and afternoon, 8x in choppy. `classify_gap` still labels gap types; its 1.5x/2.5x
+boundaries are not admission floors. Legacy `rvol_min_continuation`, tier RVOL
+weight keys and `skip_fade_risk` are ignored with a startup warning and omitted
+from effective weights. Existing Neon rows are not modified. The legacy
+`load_signal_thresholds()` diagnostic API warns that its values are inactive.
+New default rows no longer advertise the dead continuation/fade options.
+
+Fade-risk is explicitly rejected by the shared engine/executor gate and by
+independent decision diagnostics. The contradictory old secondary requirements
+have been removed. The label remains useful as rejection evidence; this release
+does not open a new fade strategy. Stops, targets, capital and loss limits,
+score/priority gates and direction rules are unchanged.
+
+Controlled comparison now includes six variants. `mean_gated_rvol2` changes
+only the session RVOL floor to 2x/3x/2x; mean volume, priority gating, exits,
+costs and capital limits match `mean_gated`. Two cost cases produce twelve
+portfolio results. No alternate threshold is applied to paper admission.
+Compatible captured sessions may be studied retrospectively, but source-hash
+checks remain enforced: do not edit old tape hashes to force compatibility.
+Results cannot establish an edge outside the observed universe or replace a
+later untouched validation period.
+
+`UNIVERSE COVERAGE` lines accompany completed scans. At summary/shutdown the
+engine saves `data/coverage/<date>_<run-id>.json` with unique symbol lists/counts
+for startup-valid inputs, catalog eligibility, initial watchlist, discovery,
+REST requests/responses, subscription requests, actual WebSocket observations
+and engine evaluations. Exclusion lists expose event/liquidity/price filters,
+the top-200-plus-movers discovery boundary, missing evidence, the 20-addition
+limit and subscription failures. Catalog symbols never evaluated/requested are
+listed explicitly. These are process-lifetime sets, not an additive funnel:
+reasons can overlap or later resolve. A subscription request is not proof of
+tick delivery; evaluations are not a count of durable SQLite decision rows.
+The strict overnight source reports startup coverage as unknown.
+
+Universe selection is **not broadened** in this release. Wider scanning requires
+its own rate-limit, freshness and coverage design and comparison. This release
+makes the existing restriction measurable instead of attributing all missing
+trades to rejection filters.
