@@ -58,6 +58,7 @@ from kiteconnect import KiteConnect, KiteTicker
 API_KEY      = os.getenv("KITE_API_KEY")
 ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN")
 NEON_URL     = os.getenv("CC_POSTGRES_URL")
+STARTUP_INPUTS = None  # One validated, frozen input snapshot shared by startup and rescans.
 IST          = timezone(timedelta(hours=5, minutes=30))
 
 # ── Risk Parameters ────────────────────────────────────────────────────────────
@@ -301,6 +302,9 @@ def get_nse_market_breadth() -> dict:
 
 def get_key_levels(symbols: list[str]) -> dict[str, dict]:
     if not symbols: return {}
+    snapshot = globals().get("STARTUP_INPUTS")
+    if snapshot is not None:
+        return {s: dict(snapshot["levels"][s]) for s in symbols if s in snapshot["levels"]}
     try:
         conn = psycopg2.connect(NEON_URL, connect_timeout=10)
         cur  = conn.cursor()
@@ -658,6 +662,10 @@ def get_dynamic_gappers(kite, existing_symbols: set, ctx: dict) -> list[dict]:
 
 
 def get_rvol_baseline() -> dict[str, float]:
+    snapshot = globals().get("STARTUP_INPUTS")
+    if snapshot is not None:
+        from kite_startup import baselines
+        return baselines(snapshot)
     conn = None
     try:
         conn = psycopg2.connect(NEON_URL, connect_timeout=10,
@@ -709,6 +717,11 @@ def get_signal_catalog(ctx: dict) -> list[dict]:
     cur  = conn.cursor()
     cur.execute("SELECT UPPER(symbol) FROM investmitra.nse_announcements WHERE ann_datetime>=NOW()-INTERVAL '12 hours' AND is_sensitive=TRUE")
     sensitive = {r[0] for r in cur.fetchall()}
+    snapshot = globals().get("STARTUP_INPUTS")
+    if snapshot is not None:
+        cur.close(); conn.close()
+        from kite_startup import catalog
+        return catalog(snapshot, ctx, sensitive)
 
     cur.execute("""
         WITH avg_stats AS (
@@ -1865,6 +1878,12 @@ class IntradayEngine:
         prev  = self.prev_close.get(symbol, 0)
         vwap  = self.vwap.get(symbol, ltp)
         stock = self.all_stocks.get(symbol, {})
+        if stock.get("input_version"):
+            from kite_startup import price_rejection
+            mismatch = price_rejection(stock, prev)
+            if mismatch:
+                self._reject_signal(symbol, mismatch, now)
+                return
         score = stock.get("investmitra_score", 50)
         kl    = self.key_levels.get(symbol, {})
         today_open = self.today_open.get(symbol, 0)
@@ -2511,7 +2530,7 @@ def save_daily_pnl(risk_manager, signals: dict, market_direction: str, vix: floa
         logger.warning("P&L save failed: %s", e)
 
 
-def preflight_check() -> bool:
+def preflight_check(kite=None, instruments=None) -> bool:
     """Run pre-flight checks before market opens."""
     print(f"\n{'='*65}")
     print(f"  investMITRA PRE-FLIGHT CHECK — {date.today()}")
@@ -2548,30 +2567,45 @@ def preflight_check() -> bool:
         except: pass
 
     # 2. Require the prior exchange session, not merely any rows in 30 days.
+    global STARTUP_INPUTS
+    STARTUP_INPUTS = None
     conn = None
     try:
         today = datetime.now(IST).date()
-        expected = previous_session(today, load_nse_holidays(today))
-        conn = psycopg2.connect(NEON_URL, connect_timeout=5,
-                                options="-c statement_timeout=5000")
-        with conn.cursor() as cur:
-            cur.execute("SELECT MAX(score_date) FROM investmitra.daily_scores WHERE score_date < %s", (today,))
-            score_date = cur.fetchone()[0]
-            cur.execute("SELECT MAX(trade_date), COUNT(*) FROM investmitra.equity_prices "
-                        "WHERE trade_date >= %s AND trade_date < %s", (today - timedelta(days=30), today))
-            price_date, price_rows = cur.fetchone()
-            cur.execute("SELECT COUNT(*) FROM investmitra.market_indices WHERE fetch_date = %s", (today,))
-            indices_today = cur.fetchone()[0]
-        from signal_input_readiness import audit, require_ready
-        input_coverage = audit(conn, expected)
-        require_ready(input_coverage)
-        if input_coverage['quarantined_ambiguous_symbols']:
-            logger.warning('Identity quarantine: no entries for %s',
-                           input_coverage['quarantined_ambiguous_symbols'])
-        errors = freshness_errors(today, expected, score_date, price_date, indices_today, price_rows)
-        for error in errors:
-            logger.error("Preflight blocked: %s", error)
-        all_ok = all_ok and not errors
+        source = os.getenv("INVESTMITRA_STARTUP_SOURCE", "kite") if kite is not None else "overnight"
+        if source not in {"kite", "overnight"}:
+            raise ValueError("Unknown startup source; use kite or overnight")
+        if source == "kite":
+            if EXECUTION_MODE != "auto_paper":
+                raise RuntimeError("Kite startup snapshot is paper-only")
+            from kite_startup import build_snapshot
+            conn = psycopg2.connect(NEON_URL, connect_timeout=10,
+                                    options="-c statement_timeout=15000")
+            conn.set_session(readonly=True)
+            STARTUP_INPUTS = build_snapshot(kite, instruments, conn, today)
+            print("  Kite completed-session inputs validated: " + STARTUP_INPUTS["snapshot_id"])
+        else:
+            expected = previous_session(today, load_nse_holidays(today))
+            conn = psycopg2.connect(NEON_URL, connect_timeout=5,
+                                    options="-c statement_timeout=5000")
+            with conn.cursor() as cur:
+                cur.execute("SELECT MAX(score_date) FROM investmitra.daily_scores WHERE score_date < %s", (today,))
+                score_date = cur.fetchone()[0]
+                cur.execute("SELECT MAX(trade_date), COUNT(*) FROM investmitra.equity_prices "
+                            "WHERE trade_date >= %s AND trade_date < %s", (today - timedelta(days=30), today))
+                price_date, price_rows = cur.fetchone()
+                cur.execute("SELECT COUNT(*) FROM investmitra.market_indices WHERE fetch_date = %s", (today,))
+                indices_today = cur.fetchone()[0]
+            from signal_input_readiness import audit, require_ready
+            input_coverage = audit(conn, expected)
+            require_ready(input_coverage)
+            if input_coverage['quarantined_ambiguous_symbols']:
+                logger.warning('Identity quarantine: no entries for %s',
+                               input_coverage['quarantined_ambiguous_symbols'])
+            errors = freshness_errors(today, expected, score_date, price_date, indices_today, price_rows)
+            for error in errors:
+                logger.error("Preflight blocked: %s", error)
+            all_ok = all_ok and not errors
     except Exception as e:
         logger.error("Calendar/data validation unavailable; entries blocked: %s", e)
         all_ok = False
@@ -2611,13 +2645,13 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
     if not API_KEY or not ACCESS_TOKEN:
         print("❌ Run: python scripts/kite_login.py first"); sys.exit(1)
 
-    # Pre-flight check
-    if not preflight_check():
-        sys.exit(1)
-
     if kite is None:
         kite = KiteConnect(api_key=API_KEY)
         kite.set_access_token(ACCESS_TOKEN)
+    instruments = instruments if instruments is not None else kite.instruments("NSE")
+    # Both input paths validate their own full contract; no freshness bypass.
+    if not preflight_check(kite, instruments):
+        sys.exit(1)
 
     ctx = get_premarket_context()
     market_direction, nifty_change = get_market_direction(kite, ctx)
@@ -2729,10 +2763,12 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
                             market_direction, ctx, rvol_baseline,
                             key_levels, sector_quotes, sentiment)
     engine.kite = kite
+    engine.startup_snapshot = globals().get("STARTUP_INPUTS")
     engine.signal_weights = dict(weights)
     engine.strategy_id = BUILD_ID + ":" + hashlib.sha256(json.dumps({
         "weights": weights, "gap_thresholds": GAP_THRESHOLDS,
         "price_contract": PRICE_CONTRACT_VERSION,
+        "startup_input_version": (globals().get("STARTUP_INPUTS") or {}).get("manifest", {}).get("version", "overnight"),
         "capital_model": execution.snapshot().get("capital_model") if execution else None,
         "daily_cap": MAX_DAILY_CAPITAL_INR, "max_ticket": MAX_CAPITAL_PER_TRADE,
         "max_risk": MAX_RISK_PER_TRADE_INR, "min_profit": MIN_NET_PROFIT,
@@ -2998,3 +3034,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

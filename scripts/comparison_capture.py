@@ -23,7 +23,7 @@ VERSION = 'execution-compare-v1'
 SOURCE_FILES = ('intraday_signals.py', 'order_manager.py', 'signal_evidence.py',
                 'signal_runtime.py', 'signal_recovery.py', 'signal_diagnostics.py',
                 'execution_capital.py', 'trade_research.py', 'strategy_comparison.py',
-                'comparison_capture.py', 'rvol_priority_audit.py', 'market_data_contract.py')
+                'comparison_capture.py', 'rvol_priority_audit.py', 'market_data_contract.py', 'kite_startup.py')
 CONFIG_NAMES = ('GAP_THRESHOLDS', 'SESSIONS', 'SECTOR_INDEX_MAP', 'MAX_RISK_PER_TRADE_INR',
                 'MAX_CAPITAL_PER_TRADE', 'MAX_CONCURRENT_TRADES', 'MIN_PRIORITY_SCORE',
                 'MAX_DAILY_LOSS_INR', 'MAX_POSITIONS', 'ATR_STOP_MULT', 'ATR_TARGET_MULT',
@@ -104,7 +104,12 @@ class ComparisonTape:
             initial_execution_flat=engine.execution.snapshot().get('flat', False),
             initial_execution_trades=len(engine.execution.snapshot().get('trades', {})))
         symbols = list(engine.rvol_baseline)
+        startup = getattr(engine, 'startup_snapshot', None)
+        metadata['startup_inputs'] = ({'snapshot_id': startup['snapshot_id'], 'manifest': startup['manifest']}
+                                      if startup else {'version': 'overnight'})
         def loader():
+            if startup is not None:
+                return copy.deepcopy(startup['research'])
             import psycopg2
             from rvol_priority_audit import verify_neon
             # Connection settings are used only here, never put in tape metadata.
@@ -217,3 +222,4 @@ def run_comparison_report(execution):
         LOG.warning('Comparison report incomplete (%s); tape retained at %s; retry offline',
                     type(exc).__name__, tape.path)
         return 'failed'
+
