@@ -23,7 +23,7 @@ VERSION = 'execution-compare-v1'
 SOURCE_FILES = ('intraday_signals.py', 'order_manager.py', 'signal_evidence.py',
                 'signal_runtime.py', 'signal_recovery.py', 'signal_diagnostics.py',
                 'execution_capital.py', 'trade_research.py', 'strategy_comparison.py',
-                'comparison_capture.py', 'rvol_priority_audit.py', 'market_data_contract.py', 'kite_startup.py')
+                'comparison_capture.py', 'rvol_priority_audit.py', 'market_data_contract.py', 'kite_startup.py', 'universe_coverage.py')
 CONFIG_NAMES = ('GAP_THRESHOLDS', 'SESSIONS', 'SECTOR_INDEX_MAP', 'MAX_RISK_PER_TRADE_INR',
                 'MAX_CAPITAL_PER_TRADE', 'MAX_CONCURRENT_TRADES', 'MIN_PRIORITY_SCORE',
                 'MAX_DAILY_LOSS_INR', 'MAX_POSITIONS', 'ATR_STOP_MULT', 'ATR_TARGET_MULT',

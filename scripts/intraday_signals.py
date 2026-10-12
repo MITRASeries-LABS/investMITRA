@@ -26,7 +26,7 @@ from signal_runtime import (RateLimitedKite, load_nse_holidays, previous_session
                             SECTOR_REFRESH_SECONDS)
 from signal_evidence import load_volume_baselines, volume_evidence, SECTOR_POLICY_DEFAULTS
 from signal_recovery import opening_candles, breadth_evidence
-from signal_diagnostics import reason_code, session_policy, decision_record, direction_for
+from signal_diagnostics import reason_code, session_policy, decision_record, direction_for, effective_weights
 from market_data_contract import canonical_stock, coverage, VERSION as PRICE_CONTRACT_VERSION
 import psycopg2
 from dotenv import load_dotenv
@@ -58,6 +58,7 @@ from kiteconnect import KiteConnect, KiteTicker
 API_KEY      = os.getenv("KITE_API_KEY")
 ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN")
 NEON_URL     = os.getenv("CC_POSTGRES_URL")
+UNIVERSE_COVERAGE = None
 STARTUP_INPUTS = None  # One validated, frozen input snapshot shared by startup and rescans.
 IST          = timezone(timedelta(hours=5, minutes=30))
 
@@ -192,7 +193,7 @@ def load_signal_weights() -> dict:
                     if not isinstance(value, (float, int)) or not math.isfinite(value) or value < 0:
                         raise ValueError('Invalid signal weight: ' + key)
             logger.info("Loaded signal weights effective %s", w.get("effective_date","?"))
-            return {**SECTOR_POLICY_DEFAULTS, **w}
+            return effective_weights({**SECTOR_POLICY_DEFAULTS, **w}, logger)
     except Exception as e:
         logger.warning("Load weights failed: %s ? using defaults", e)
     return dict(SECTOR_POLICY_DEFAULTS)
@@ -597,6 +598,10 @@ def get_dynamic_gappers(kite, existing_symbols: set, ctx: dict) -> list[dict]:
         universe = set(nse_gainers + nse_losers + [c['symbol'] for c in top200])
         candidates = [dict(c) for c in catalog
                       if c['symbol'] in universe and c['symbol'] not in existing_symbols]
+        cov = UNIVERSE_COVERAGE
+        if cov is not None:
+            cov.add('discovery_considered',[c['symbol'] for c in candidates])
+            cov.exclude('discovery:outside_top200_and_movers',[c['symbol'] for c in catalog if c['symbol'] not in universe and c['symbol'] not in existing_symbols])
         logger.info("Combined universe: %d canonical stocks", len(universe))
         if not candidates:
             return []
@@ -609,8 +614,11 @@ def get_dynamic_gappers(kite, existing_symbols: set, ctx: dict) -> list[dict]:
             batch = candidates[i:i+50]
             batch_syms = [c['symbol'] for c in batch]
             try:
-                quotes = kite.quote([f"NSE:{s}" for s in batch_syms])
+                if cov is not None: cov.add('quote_requested',batch_syms)
+                quotes = kite.quote([f'NSE:{s}' for s in batch_syms])
+                if cov is not None: cov.add('quote_received',[s.removeprefix('NSE:') for s in quotes])
             except:
+                if cov is not None: cov.exclude('discovery:quote_request_failed',batch_syms)
                 continue
 
             for c in batch:
@@ -622,11 +630,14 @@ def get_dynamic_gappers(kite, existing_symbols: set, ctx: dict) -> list[dict]:
                 prev   = float(ohlc.get("close", 0)) or c.get('prev_close', 0)
                 ltp    = float(q.get("last_price", 0))
                 vol    = int(q.get("volume", 0))
-                if not open_p or not prev or not ltp: continue
+                if not open_p or not prev or not ltp:
+                    if cov is not None: cov.exclude('discovery:missing_quote_prices',[sym])
+                    continue
 
                 gap_pct = (open_p - prev) / prev * 100
                 avg_daily = rvol_baselines.get(sym, 0)
                 if avg_daily <= 0:
+                    if cov is not None: cov.exclude('discovery:missing_volume_baseline',[sym])
                     continue
                 scan_now = datetime.now(IST)
                 fraction = max((scan_now.hour * 60 + scan_now.minute - 555) / 375, .05)
@@ -643,6 +654,8 @@ def get_dynamic_gappers(kite, existing_symbols: set, ctx: dict) -> list[dict]:
                     c['ltp']      = ltp
                     dynamic_gappers.append(c)
                     logger.info("Dynamic gapper: %s gap=%.2f%% (%s)", sym, gap_pct, gap_type)
+                elif cov is not None:
+                    cov.exclude('discovery:gap_or_classification',[sym])
 
         # Deduplicate by symbol
         seen = set()
@@ -654,6 +667,9 @@ def get_dynamic_gappers(kite, existing_symbols: set, ctx: dict) -> list[dict]:
         # Sort by gap size descending - best first
         unique.sort(key=lambda x: abs(x.get("gap_pct",0)), reverse=True)
         logger.info("Dynamic scan: %d unique gappers", len(unique))
+        if cov is not None:
+            cov.add('discovery_selected',[c['symbol'] for c in unique[:20]])
+            cov.exclude('discovery:twenty_per_scan_limit',[c['symbol'] for c in unique[20:]])
         return unique[:20]
 
     except Exception as e:
@@ -680,6 +696,8 @@ def get_rvol_baseline() -> dict[str, float]:
 
 
 def load_signal_thresholds() -> dict:
+    """Legacy diagnostic API only; not used for engine admission."""
+    logger.warning("load_signal_thresholds is deprecated: returned tiers are not active entry policy; see session_policy")
     try:
         conn = psycopg2.connect(NEON_URL, connect_timeout=10)
         cur  = conn.cursor()
@@ -721,7 +739,19 @@ def get_signal_catalog(ctx: dict) -> list[dict]:
     if snapshot is not None:
         cur.close(); conn.close()
         from kite_startup import catalog
-        return catalog(snapshot, ctx, sensitive)
+        result = catalog(snapshot, ctx, sensitive)
+        if UNIVERSE_COVERAGE is not None:
+            UNIVERSE_COVERAGE.add('catalog_eligible', [r['symbol'] for r in result])
+            for stock in snapshot['stocks'].values():
+                sym = stock['symbol']
+                reasons = []
+                if sym in sensitive: reasons.append('sensitive_announcement')
+                if sym in ctx.get('results_3days',set()): reasons.append('results_window')
+                if abs(stock['prev_day_chg'])>5: reasons.append('previous_day_move')
+                if stock['avg_traded']<5_000_000: reasons.append('traded_value')
+                if not 50<=stock['avg_price']<=20000: reasons.append('price_range')
+                for reason in reasons: UNIVERSE_COVERAGE.exclude('catalog:'+reason,[sym])
+        return result
 
     cur.execute("""
         WITH avg_stats AS (
@@ -845,7 +875,11 @@ def get_signal_catalog(ctx: dict) -> list[dict]:
     for stock in catalog: counts[stock['symbol']] += 1
     ambiguous = sorted(sym for sym, count in counts.items() if count > 1)
     if ambiguous: logger.warning("Catalog excludes ambiguous symbol joins: %s", ', '.join(ambiguous))
-    return [stock for stock in catalog if counts[stock['symbol']] == 1]
+    result = [stock for stock in catalog if counts[stock['symbol']] == 1]
+    if UNIVERSE_COVERAGE is not None:
+        UNIVERSE_COVERAGE.add('catalog_eligible', [r['symbol'] for r in result])
+        UNIVERSE_COVERAGE.exclude('catalog:ambiguous_join', ambiguous)
+    return result
 
 
 def get_intraday_watchlist(ctx: dict) -> tuple[list[dict], list[dict]]:
@@ -1034,6 +1068,7 @@ class IntradayEngine:
         self._last_heartbeat_at = None
         self._last_scan_status = None
         self._candidate_logged = set()
+        self.universe_coverage = None
         self.comparison_tape = None  # bounded, asynchronous research capture only
         self.shadow = None  # optional observer: never involved in trading decisions
         self._shadow_scored = None
@@ -1048,6 +1083,8 @@ class IntradayEngine:
         return session_policy(session, gap_threshold, MIN_PRIORITY_SCORE)
 
     def on_tick(self, ws, ticks):
+        if ticks and self.universe_coverage is not None:
+            self.universe_coverage.add('websocket_seen', [self.rev_tokens[t['instrument_token']] for t in ticks if t.get('instrument_token') in self.rev_tokens])
         if ticks:
             self._last_ws_tick_at = datetime.now(IST)  # REST scan quotes never update this
         with self._state_lock:
@@ -1189,6 +1226,8 @@ class IntradayEngine:
                     symbol = stock["symbol"]
                     token = self.instrument_tokens.get(symbol)
                     if not token or symbol not in levels or not self.rvol_baseline.get(symbol):
+                        if self.universe_coverage is not None:
+                            self.universe_coverage.exclude('monitoring:missing_token_levels_or_volume',[symbol])
                         continue
                     self.all_stocks[symbol] = stock
                     if stock['investmitra_score'] <= 40:
@@ -1203,7 +1242,11 @@ class IntradayEngine:
                 try:
                     self.ticker.subscribe(new_tokens)
                     self.ticker.set_mode(self.ticker.MODE_FULL, new_tokens)
+                    if self.universe_coverage is not None:
+                        self.universe_coverage.add('subscription_requested', [self.rev_tokens[t] for t in new_tokens])
                 except Exception:
+                    if self.universe_coverage is not None:
+                        self.universe_coverage.exclude('monitoring:subscription_call_failed',[self.rev_tokens[t] for t in new_tokens])
                     logger.warning("Rescan subscriptions unavailable; retry on reconnect", exc_info=True)
             queued = 0
             for offset in range(0, len(symbols), 100):
@@ -1211,11 +1254,16 @@ class IntradayEngine:
                     break
                 batch = symbols[offset:offset + 100]
                 try:
-                    quotes = self.kite.quote(["NSE:" + symbol for symbol in batch])
+                    if self.universe_coverage is not None:
+                        self.universe_coverage.add('quote_requested', batch)
+                    quotes = self.kite.quote(['NSE:' + symbol for symbol in batch])
+                    if self.universe_coverage is not None:
+                        self.universe_coverage.add('quote_received', [s.removeprefix('NSE:') for s in quotes])
                 except Exception:
                     logger.warning("%s quote batch unavailable", reason, exc_info=True)
                     continue
                 queued += self._process_scan_quotes(quotes)
+            self._report_universe_coverage()
             logger.info("%s scan complete: %d candidates queued (not confirmed fills)", reason, queued)
             return queued
         finally:
@@ -1783,6 +1831,8 @@ class IntradayEngine:
             self.signal_rejections[symbol] = (reason, now)
 
     def _check_signal(self, symbol, ltp, volume, now, session):
+        if self.universe_coverage is not None:
+            self.universe_coverage.add('evaluated', [symbol])
         actual_session = get_current_session(now)
         self._diagnostic_gap_threshold = max(MIN_SIGNAL_GAP_PCT, GAP_THRESHOLDS.get(actual_session, .4))
         if self.vix_signal == 'ELEVATED': self._diagnostic_gap_threshold *= 1.5
@@ -1971,17 +2021,6 @@ class IntradayEngine:
         if rejection:
             self._reject_signal(symbol, rejection, now)
             return
-
-        # fade_risk: only allow if RVOL > 2.5x AND quality > 65
-        # Otherwise skip — Sonnet confirmed fade_risk consistently loses
-        if details["gap_type"] == "fade_risk":
-            if self.signal_weights.get("skip_fade_risk"):
-                self._decision_reason = "fade-risk entries disabled by configuration"
-                return
-            if details["rvol"] < 2.5 or quality < 65:
-                self._decision_reason = "fade-risk quality/RVOL requirements not met"
-                logger.debug("Skip %s — fade_risk with weak RVOL %.1fx", symbol, details["rvol"])
-                return
 
         final = quality * 0.40 + opp * 0.60
         if final < MIN_FINAL_SCORE:
@@ -2389,7 +2428,20 @@ class IntradayEngine:
         except Exception as e:
             logger.warning("Auto-save trades failed: %s", e)
 
+    def _report_universe_coverage(self, persist=False):
+        if self.universe_coverage is None:
+            return
+        try:
+            report = self.universe_coverage.snapshot()
+            logger.info('UNIVERSE COVERAGE: %s; catalog never evaluated=%d',
+                        json.dumps(report['counts'], sort_keys=True), len(report['catalog_never_evaluated']))
+            if persist:
+                logger.info('Universe coverage saved: %s', self.universe_coverage.save())
+        except Exception:
+            logger.exception('Universe coverage report unavailable; trading policy unchanged')
+
     def print_summary(self):
+        self._report_universe_coverage(persist=True)
         if self.execution is not None:
             print(self.execution.report())
             return
@@ -2653,6 +2705,10 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
     if not preflight_check(kite, instruments):
         sys.exit(1)
 
+    global UNIVERSE_COVERAGE
+    from universe_coverage import UniverseCoverage
+    UNIVERSE_COVERAGE = UniverseCoverage(datetime.now(IST).date(),
+        list(STARTUP_INPUTS['stocks']) if STARTUP_INPUTS is not None else None)
     ctx = get_premarket_context()
     market_direction, nifty_change = get_market_direction(kite, ctx)
 
@@ -2672,8 +2728,7 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
         if weights.get("skip_choppy_session"):
             SESSIONS.pop("choppy", None)
             logger.info("Choppy session DISABLED by Opus")
-        if weights.get("skip_fade_risk"):
-            logger.info("fade_risk gaps DISABLED by Opus")
+        logger.info("Admission policy: RVOL 5x morning/afternoon, 8x choppy; fade-risk disabled")
 
     # Morning brief uses the executor notification owner.
     try:
@@ -2705,6 +2760,7 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
     long_list, short_list = get_intraday_watchlist(ctx)
 
     all_stocks = long_list + short_list
+    UNIVERSE_COVERAGE.add('watchlist_selected', [s['symbol'] for s in all_stocks])
     if not all_stocks:
         logger.error("No stocks in watchlist"); sys.exit(1)
 
@@ -2713,8 +2769,10 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
     token_map     = {i["tradingsymbol"]: i["instrument_token"]
                      for i in instruments
                      if i.get("tradingsymbol") in symbols and i.get("segment")=="NSE"}
-    prev_close    = {s.replace("NSE:",""): d["ohlc"]["close"]
-                     for s,d in kite.quote([f"NSE:{s}" for s in token_map]).items()}
+    UNIVERSE_COVERAGE.add('quote_requested', token_map)
+    startup_quotes = kite.quote([f"NSE:{s}" for s in token_map])
+    UNIVERSE_COVERAGE.add('quote_received', [s.removeprefix('NSE:') for s in startup_quotes])
+    prev_close = {s.replace("NSE:",""): d["ohlc"]["close"] for s,d in startup_quotes.items()}
     key_levels    = get_key_levels(symbols)
     logger.info("INPUT COVERAGE: %s", json.dumps(coverage({s['symbol']: s for s in all_stocks},
                 key_levels, SECTOR_INDEX_MAP), sort_keys=True))
@@ -2763,6 +2821,7 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
                             market_direction, ctx, rvol_baseline,
                             key_levels, sector_quotes, sentiment)
     engine.kite = kite
+    engine.universe_coverage = UNIVERSE_COVERAGE
     engine.startup_snapshot = globals().get("STARTUP_INPUTS")
     engine.signal_weights = dict(weights)
     engine.strategy_id = BUILD_ID + ":" + hashlib.sha256(json.dumps({
@@ -2829,6 +2888,7 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
             current_tokens = list(engine.token_map.values())
         ws.subscribe(current_tokens)
         ws.set_mode(ws.MODE_FULL, current_tokens)
+        engine.universe_coverage.add('subscription_requested', [s for s,t in engine.token_map.items() if t in current_tokens])
         # Subscribe tokens for positions restored after restart
         # Entries stay blocked until ALL restored positions are monitored
         restored = getattr(engine, "_restored_symbols", [])
@@ -2867,6 +2927,7 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
             if restored_tokens:
                 ws.subscribe(restored_tokens)
                 ws.set_mode(ws.MODE_FULL, restored_tokens)
+                engine.universe_coverage.add('subscription_requested', [s for s,t in engine.token_map.items() if t in restored_tokens])
                 logger.info("Subscribed %d restored position tokens", len(restored_tokens))
 
             if still_unresolved:
@@ -2968,6 +3029,7 @@ def _run_signals(kite=None, instruments=None, execution=None, execution_worker=N
 
     finally:
         engine._scan_stop.set()
+        engine._report_universe_coverage(persist=True)
         if "maintenance" in locals():
             maintenance.join(timeout=15)
         ticker.close()
