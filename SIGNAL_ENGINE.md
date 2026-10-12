@@ -579,3 +579,63 @@ Offline verification now also includes `test_entry_evidence`:
 ```powershell
 python -X utf8 -m unittest -q test_auto_trading test_review_fixes test_capital_visibility test_shadow_validation test_neon_session_upload test_session_reports test_pipeline_dates test_overnight_readiness test_server_pipeline test_entry_evidence
 ```
+
+
+## Paper startup data separation — 2026-10-12
+
+The default `auto_paper` startup source is now `kite` (`INVESTMITRA_STARTUP_SOURCE`).
+It no longer requires the previous session's Neon prices, R2 features/momentum,
+or overnight completion receipt. The overnight pipeline remains the publisher
+for the long-term product and the slow score snapshot.
+
+After the existing Kite login, run the normal engine once:
+
+```powershell
+$env:INVESTMITRA_STARTUP_SOURCE = 'kite'
+python -X utf8 -u scripts\intraday_signals.py
+```
+
+Optional early preparation, without starting an executor:
+
+```powershell
+python -X utf8 -u scripts\kite_startup.py
+```
+
+The engine revalidates on startup and reuses same-session candle caches. A cold
+start fetches up to 500 calendar days for every mapped, classified score symbol,
+not only the final watchlist. Allow substantial preparation time: requests are
+paced below three per second plus network latency; thousands of symbols can
+require tens of minutes. Historical API permission must work on the logged-in
+account. Authentication failure aborts; there is no stale-price fallback.
+
+Inputs and validation:
+
+- Official NSE calendar, three bounded attempts, then an official response cached
+  locally for at most seven days. No weekday-only freshness bypass.
+- Exact previous-session Kite daily OHLCV; no current-day candles; at least 21
+  completed bars and complete recent regular-session coverage. Missing history,
+  invalid OHLCV, duplicate conflicts and large discontinuities exclude a symbol.
+  At least 100 symbols and 95% history coverage are required for the ranking cohort.
+- ATR14, prior OHLC, MA20/50, daily-volume baseline and momentum features are
+  recomputed from that history. Linear intraday RVOL and entry/exit thresholds
+  are unchanged. Corporate-action adjustment is not certified; an observed quote
+  previous close differing from history blocks new entries for that symbol.
+- The compatible composite score and screener snapshot may be at most three
+  trading sessions older than the required price session. The old 25% momentum
+  contribution is removed and replaced with newly ranked momentum. The other
+  75% is a bounded-age residual, not a claim that underlying filings are fresh.
+- Ranking uses the mapped, classified NSE cohort (`kite-startup-nse-v1`), which
+  differs from the EOD NSE/BSE cohort. Scores and picks can therefore change;
+  this is a separately versioned **paper-only** input contract. Existing neutral
+  momentum fallback for insufficient long history is labelled explicitly.
+- Sector/cap and unique symbol/ISIN metadata, announcement exclusions and slow
+  scores still require Neon. This separation does not make startup database-free.
+- Startup, dynamic scans and comparison tape baselines share one frozen snapshot.
+  Provenance and exclusions are saved under `data/startup`; the snapshot ID is
+  included in comparison metadata. No database schema or overnight scores are
+  overwritten. Network outages stop after five consecutive symbols exhaust retries.
+
+`INVESTMITRA_STARTUP_SOURCE=overnight` retains the strict original startup path.
+No live execution is enabled by this change. Capital reuse, ticket limits, the
+Rs1,500 combined daily loss threshold, exits, journaling, Neon session upload and
+end-of-day research reports retain their existing rules.
