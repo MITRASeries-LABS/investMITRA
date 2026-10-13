@@ -1091,9 +1091,13 @@ class IntradayEngine:
             self._on_tick_locked(ws, ticks)
 
     def _on_tick_locked(self, ws, ticks):
+        # Recorder evidence brackets the existing wall read; strategy time is unchanged.
+        capture_before = time.monotonic_ns() if self.comparison_tape is not None else None
         now     = self._now()
         if self.comparison_tape is not None:
-            self.comparison_tape.capture(self, ticks, now)
+            capture_after = time.monotonic_ns()
+            self.comparison_tape.capture(self, ticks, now,
+                                         clock_sample=(capture_before, capture_after))
         session = get_current_session(now)
         for tick in ticks:
             token  = tick["instrument_token"]

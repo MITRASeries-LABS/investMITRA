@@ -217,6 +217,13 @@ def validate_tape(meta):
     if meta.get('version') != VERSION: raise ValueError('Unsupported comparison tape version')
     if not meta.get('closed') or meta.get('dropped') or meta.get('error'):
         raise ValueError('Incomplete capture: open writer, dropped events or capture error')
+    if meta.get('clock_schema') is not None:
+        from capture_segments import CLOCK_SCHEMA
+        if meta.get('clock_schema') != CLOCK_SCHEMA:
+            raise ValueError('Unsupported capture clock schema')
+        if (meta.get('clock_replay_eligible') is not True or meta.get('clock_discontinuities') != 0
+                or meta.get('clock_uncertain_samples') != 0 or meta.get('raw_wall_regressions') != 0):
+            raise ValueError('Clock discontinuity or sampling uncertainty: tape retained for audit; strategy timing replay unsupported')
     if meta.get('source_hashes') != source_hashes():
         raise ValueError('Replay source differs from capture; use the exact captured code revision')
     if not meta.get('initial_execution_flat') or meta.get('initial_execution_trades'):
@@ -240,6 +247,9 @@ def run(tape, module=None):
             for frame in read_frames(tape):
                 count += 1
                 at = frame['at']
+                if any(frame.get('capture_order', {}).get(k) for k in
+                       ('clock_discontinuity', 'sampling_uncertain', 'raw_wall_regression')):
+                    raise ValueError('Clock discontinuity or sampling uncertainty: strategy timing replay unsupported')
                 if at.tzinfo is None or at.astimezone(IST).date().isoformat() != meta['day']:
                     raise ValueError('Frame date/timezone mismatch')
                 if last is not None and at < last: raise ValueError('Capture clock moved backwards')
