@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import zlib
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).parent / 'scripts'))
@@ -170,6 +171,25 @@ class ComparisonTests(unittest.TestCase):
         for edit in [dict(closed=False),dict(dropped=1),dict(error='disk'),
                      dict(source_hashes={}),dict(initial_execution_trades=1)]:
             with self.assertRaises(ValueError): validate_tape(dict(meta,**edit))
+
+    def test_multisegment_and_legacy_full_runner_agree(self):
+        frames=[self.frame(),self.frame(self.now+timedelta(seconds=5))]
+        segment_bytes=max(len(zlib.compress(dumps(f).encode(),1))+12 for f in frames)
+        path=Path(self.tmp.name)/'segmented.sqlite3'
+        tape=ComparisonTape(path,self.meta,lambda:self.baselines,segment_bytes=segment_bytes)
+        for frame in frames:tape.queue.put(frame)
+        tape.close()
+        self.assertEqual(len(read_metadata(path)['segments']),2)
+        legacy=Path(self.tmp.name)/'legacy.sqlite3'
+        db=sqlite3.connect(legacy)
+        db.execute('CREATE TABLE metadata(id INTEGER,body TEXT)')
+        db.execute('CREATE TABLE frames(seq INTEGER,body BLOB)')
+        meta=dict(self.meta,closed=True,frames=2,dropped=0,error=None)
+        db.execute('INSERT INTO metadata VALUES (1,?)',(dumps(meta),))
+        for i,frame in enumerate(frames):db.execute('INSERT INTO frames VALUES (?,?)',(i+1,zlib.compress(dumps(frame).encode())))
+        db.commit();db.close()
+        a,b=run(path,engine_module),run(legacy,engine_module)
+        self.assertEqual(a['results'],b['results'])
 
     def test_metadata_reader_closes_connection_on_success_and_error(self):
         connection=Mock()
