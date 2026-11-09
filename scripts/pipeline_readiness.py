@@ -192,11 +192,20 @@ def main():
     from dotenv import load_dotenv
     load_dotenv('.env.prod')  # CLI on laptop; existing Actions environment wins.
     from signal_runtime import load_nse_holidays
-    holidays = load_nse_holidays(now.date(), validate_session=False)
-    target = args.date or completed_session(now, holidays)
-    if target > completed_session(now, holidays) or target.weekday() >= 5 or target in holidays:
-        raise ValueError('Requested date is not a completed regular NSE session')
-    sessions = recent_sessions(target, holidays)
+    try:
+        holidays = load_nse_holidays(now.date(), validate_session=False)
+        target = args.date or completed_session(now, holidays)
+        if target > completed_session(now, holidays) or target.weekday() >= 5 or target in holidays:
+            raise ValueError('Requested date is not a completed regular NSE session')
+        sessions = recent_sessions(target, holidays)
+    except Exception as exc:
+        # The report job runs even when this job fails. Emit fail-closed outputs
+        # rather than leaving it with an empty reason or an unvalidated date.
+        # Never include exception text: provider errors can contain private URLs.
+        reason = f'Calendar/session validation failed ({type(exc).__name__}); no recovery started'
+        output({'date': '', 'ready': 'false', 'recover': 'false',
+                'reason': reason, 'dates': '[]'})
+        raise RuntimeError(reason) from None
     details = {}
     ready, missing = inspect(target, sessions, mark=args.mark_ready, details=details)
     recover = not ready and not args.check_only and recovery_allowed(now)

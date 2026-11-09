@@ -188,6 +188,83 @@ class OvernightReadinessTests(unittest.TestCase):
             self.assertNotIn('secret-token',str(error.exception))
 
 
+class CalendarAvailabilityTests(unittest.TestCase):
+    def calendar(self, payload=None, error=None, today=DAY, validate_session=True):
+        import signal_runtime
+        response = Mock()
+        response.raise_for_status.side_effect = error
+        response.json.return_value = payload if payload is not None else {
+            'CM': [{'tradingDate': '26-Jan-2026'}, {'tradingDate': '23-Sep-2026'}]}
+        session = MagicMock()
+        session.__enter__.return_value = session
+        session.get.return_value = response
+        with patch('requests.Session', return_value=session):
+            result = signal_runtime.load_nse_holidays(today, validate_session=validate_session)
+        return result, session, response
+
+    def test_calendar_api_does_not_depend_on_homepage_warmup(self):
+        holidays, session, response = self.calendar()
+        self.assertEqual(holidays, HOLIDAYS)
+        session.get.assert_called_once_with(
+            'https://www.nseindia.com/api/holiday-master?type=trading', timeout=10)
+        response.raise_for_status.assert_called_once_with()
+
+    def test_calendar_http_failure_still_blocks(self):
+        import requests
+        for error in (requests.HTTPError('403'), requests.Timeout('timeout')):
+            with self.subTest(error=type(error).__name__), self.assertRaises(type(error)):
+                self.calendar(error=error)
+
+    def test_invalid_missing_or_wrong_year_calendar_still_blocks(self):
+        for payload in ({}, {'CM': []}, {'CM': [{'tradingDate': 'bad-date'}]},
+                        {'CM': [{'tradingDate': '26-Jan-2025'}]}):
+            with self.subTest(payload=payload), self.assertRaises((KeyError, ValueError)):
+                self.calendar(payload=payload)
+
+    def test_calendar_does_not_authorize_holiday_startup(self):
+        with self.assertRaisesRegex(ValueError, 'not a regular NSE'):
+            self.calendar(today=date(2026, 9, 23))
+        holidays, _, _ = self.calendar(today=date(2026, 9, 23), validate_session=False)
+        self.assertIn(date(2026, 9, 23), holidays)
+
+    def test_calendar_does_not_authorize_weekend_startup(self):
+        with self.assertRaisesRegex(ValueError, 'not a regular NSE'):
+            self.calendar(today=date(2026, 9, 26))
+
+    def test_calendar_failure_reports_safe_fail_closed_outputs_even_with_override(self):
+        import requests
+        for extra in ([], ['--date', str(DAY), '--mark-ready']):
+            with self.subTest(extra=extra), \
+                    patch('signal_runtime.load_nse_holidays', side_effect=requests.HTTPError('private-signed-url')), \
+                    patch.object(readiness, 'inspect') as inspect, \
+                    patch.object(readiness, 'output') as output, \
+                    patch.object(sys, 'argv', ['pipeline_readiness.py'] + extra):
+                with self.assertRaises(RuntimeError) as error:
+                    readiness.main()
+                values = output.call_args.args[0]
+                self.assertEqual(values['ready'], 'false')
+                self.assertEqual(values['recover'], 'false')
+                self.assertEqual(values['date'], '')
+                self.assertEqual(json.loads(values['dates']), [])
+                self.assertIn('HTTPError', values['reason'])
+                self.assertNotIn('private-signed-url', values['reason'])
+                self.assertNotIn('private-signed-url', str(error.exception))
+                inspect.assert_not_called()
+
+    def test_uncovered_previous_year_cannot_request_recovery(self):
+        with patch.object(readiness, 'datetime') as clock, \
+                patch('signal_runtime.load_nse_holidays', return_value=HOLIDAYS), \
+                patch.object(readiness, 'inspect') as inspect, \
+                patch.object(readiness, 'output') as output, \
+                patch.object(sys, 'argv', ['pipeline_readiness.py']):
+            clock.now.return_value = datetime(2026, 1, 2, 4, tzinfo=IST)
+            with self.assertRaises(RuntimeError):
+                readiness.main()
+        self.assertEqual(output.call_args.args[0]['recover'], 'false')
+        self.assertIn('ValueError', output.call_args.args[0]['reason'])
+        inspect.assert_not_called()
+
+
 class WorkflowWiringTests(unittest.TestCase):
     def load(self,name):
         return yaml.load((ROOT/'.github/workflows'/name).read_text(encoding='utf-8'),Loader=yaml.BaseLoader)
