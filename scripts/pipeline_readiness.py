@@ -77,10 +77,30 @@ def read_receipt(client, bucket, key):
 
 
 def receipt_matches(receipt, target, fingerprint, counts):
-    return bool(receipt and receipt.get('version') == 1
-                and receipt.get('date') == target.isoformat()
-                and receipt.get('objects') == fingerprint
-                and receipt.get('counts') == counts)
+    if not (receipt and receipt.get('version') == 1
+            and receipt.get('date') == target.isoformat()
+            and receipt.get('objects') == fingerprint):
+        return False
+    previous = receipt.get('counts')
+    if previous == counts:
+        return True
+    if not isinstance(previous, dict) or not isinstance(counts, dict):
+        return False
+    # These two values describe today's company-master classification, not the
+    # dated producer outputs. A master refresh can change the eligible universe
+    # without changing any prices/scores. inspect() still audits current coverage
+    # before reaching this comparison; independently require complete, nonempty
+    # coverage in both snapshots before accepting this narrow metadata drift.
+    coverage_keys = {'classified_expected', 'classified_eligible'}
+    for snapshot in (previous, counts):
+        expected = snapshot.get('classified_expected')
+        eligible = snapshot.get('classified_eligible')
+        if (snapshot.get('signal_ready') is not True
+                or type(expected) is not int or expected <= 0
+                or type(eligible) is not int or eligible != expected):
+            return False
+    return ({key: value for key, value in previous.items() if key not in coverage_keys}
+            == {key: value for key, value in counts.items() if key not in coverage_keys})
 
 
 def database_counts(target, sessions):
