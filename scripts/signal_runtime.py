@@ -69,7 +69,10 @@ def load_nse_holidays(today, *, validate_session=True):
     with requests.Session() as session:
         session.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json",
                                 "Referer": "https://www.nseindia.com/"})
-        session.get("https://www.nseindia.com/", timeout=10).raise_for_status()
+        # The public calendar API is the authority. The unrelated homepage
+        # can reject hosted runners (403) even while this API remains available.
+        # Do not make a successful homepage warm-up a prerequisite, and never
+        # replace an unavailable calendar with weekday-only assumptions.
         response = session.get("https://www.nseindia.com/api/holiday-master?type=trading", timeout=10)
         response.raise_for_status()
         holidays = {datetime.strptime(row["tradingDate"], "%d-%b-%Y").date()

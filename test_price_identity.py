@@ -60,6 +60,15 @@ class Identities(unittest.TestCase):
         self.assertEqual(db.execute('SELECT COUNT(*) FROM feature_inputs WHERE isin=?',[B]).fetchone()[0],1)
         self.assertEqual(db.execute('SELECT COUNT(*) FROM feature_inputs WHERE isin IS NULL').fetchone()[0],2)
 
+    def test_fully_resolved_inputs_release_the_registered_mapping(self):
+        db,path=self.fixture([(None,'A','NSE',DAY,100,1000,1,50)])
+        prepare_price_inputs(db,path,DAY,DAY,rows=[('A',A)])
+        # The aggregate has one row even when unresolved_target_nse_rows is zero.
+        # Its result must be fully consumed before DuckDB 2 permits unregister.
+        with self.assertRaises(duckdb.CatalogException):
+            db.execute('SELECT * FROM nse_identity_map').fetchall()
+        self.assertEqual(db.execute('SELECT isin FROM feature_inputs').fetchall(),[(A,)])
+
     def test_mapping_unavailable_fails_not_empty_success(self):
         with self.assertRaisesRegex(RuntimeError,'mapping unavailable'):
             prepare_price_inputs(Mock(),"'unused'",DAY,DAY,rows=[])

@@ -63,9 +63,12 @@ def prepare_price_inputs(con, path, start, target, rows=None):
         FROM feature_lake p LEFT JOIN nse_identity_map m ON {symbol}=m.nse_symbol
         WHERE p.trade_date::DATE BETWEEN ? AND ? AND p.close IS NOT NULL AND p.close > 0''',
         [start, target])
+    # Exhaust the one-row aggregate result before unregistering the mapping.
+    # DuckDB 2 requires no pending result for registration changes; fetchone()
+    # alone leaves the result open when there are no unresolved symbols.
     stats = con.execute('''SELECT COUNT(*), COUNT(*) FILTER(WHERE identity_enriched),
         COUNT(*) FILTER(WHERE source='NSE' AND trade_date=? AND isin IS NULL)
-        FROM feature_inputs''', [target]).fetchone()
+        FROM feature_inputs''', [target]).fetchall()[0]
     logger.info('Price identities: input_rows=%d enriched_nse_rows=%d unresolved_target_nse_rows=%d', *stats)
     if stats[2]:
         unknown = con.execute('''SELECT DISTINCT nse_symbol FROM feature_inputs
